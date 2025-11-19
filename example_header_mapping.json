@@ -1,0 +1,65 @@
+{
+  "fields": {
+    "trace_sequence_file": {
+      "name": "trace_sequence_file",
+      "byte_position": 5,
+      "format": "i",
+      "description": "Trace sequence number within file"
+    },
+    "cdp": {
+      "name": "cdp",
+      "byte_position": 21,
+      "format": "i",
+      "description": "CDP ensemble number"
+    },
+    "offset": {
+      "name": "offset",
+      "byte_position": 37,
+      "format": "i",
+      "description": "Distance from source to receiver"
+    },
+    "inline": {
+      "name": "inline",
+      "byte_position": 189,
+      "format": "i",
+      "description": "Inline number (3D)"
+    },
+    "crossline": {
+      "name": "crossline",
+      "byte_position": 193,
+      "format": "i",
+      "description": "Crossline number (3D)"
+    },
+    "sample_count": {
+      "name": "sample_count",
+      "byte_position": 115,
+      "format": "h",
+      "description": "Number of samples in trace"
+    },
+    "sample_interval": {
+      "name": "sample_interval",
+      "byte_position": 117,
+      "format": "h",
+      "description": "Sample interval (microseconds)"
+    },
+    "scalar_coord": {
+      "name": "scalar_coord",
+      "byte_position": 71,
+      "format": "h",
+      "description": "Scalar for coordinates"
+    },
+    "source_x": {
+      "name": "source_x",
+      "byte_position": 73,
+      "format": "i",
+      "description": "Source coordinate X"
+    },
+    "source_y": {
+      "name": "source_y",
+      "byte_position": 77,
+      "format": "i",
+      "description": "Source coordinate Y"
+    }
+  },
+  "ensemble_keys": ["cdp"]
+}

@@ -1,0 +1,596 @@
+"""
+FK (Frequency-Wavenumber) Filter Processor
+
+Implements velocity-based filtering in the FK domain for removing
+coherent linear noise (ground roll, air wave, etc.) from seismic gathers.
+"""
+import numpy as np
+from scipy import fft
+from typing import Optional, Tuple, Dict
+from processors.base_processor import BaseProcessor
+from models.seismic_data import SeismicData
+
+
+class FKFilter(BaseProcessor):
+    """
+    FK domain velocity or dip filter.
+
+    Filters seismic gathers based on apparent velocity or dip in the frequency-wavenumber
+    domain. Uses 2D FFT to transform from time-space to frequency-wavenumber,
+    applies filter, then inverse 2D FFT back to time-space.
+
+    Parameters:
+        filter_type: 'velocity' or 'dip' (default: 'velocity')
+        v_min: Minimum velocity to pass (m/s) - used in velocity mode
+        v_max: Maximum velocity to pass (m/s) - used in velocity mode
+        v_min_enabled: Enable minimum velocity limit (default: True)
+        v_max_enabled: Enable maximum velocity limit (default: True)
+        dip_min: Minimum dip to pass (s/m) - used in dip mode
+        dip_max: Maximum dip to pass (s/m) - used in dip mode
+        dip_min_enabled: Enable minimum dip limit (default: True)
+        dip_max_enabled: Enable maximum dip limit (default: True)
+        taper_width: Cosine taper width (m/s for velocity, s/m for dip)
+        mode: 'pass' or 'reject'
+        trace_spacing: Spatial distance between traces (m)
+    """
+
+    def _validate_params(self):
+        """Validate FK filter parameters."""
+        required = ['taper_width', 'trace_spacing']
+        for param in required:
+            if param not in self.params:
+                raise ValueError(f"Missing required parameter: {param}")
+
+        # Get filter type
+        self.filter_type = self.params.get('filter_type', 'velocity')
+
+        # Common parameters
+        self.taper_width = float(self.params['taper_width'])
+        self.trace_spacing = float(self.params['trace_spacing'])
+        self.mode = self.params.get('mode', 'pass')  # 'pass' or 'reject'
+
+        # Velocity mode parameters
+        self.v_min = float(self.params.get('v_min', 2000.0))
+        self.v_max = float(self.params.get('v_max', 6000.0))
+        self.v_min_enabled = bool(self.params.get('v_min_enabled', True))
+        self.v_max_enabled = bool(self.params.get('v_max_enabled', True))
+
+        # Dip mode parameters
+        self.dip_min = float(self.params.get('dip_min', -0.01))
+        self.dip_max = float(self.params.get('dip_max', 0.01))
+        self.dip_min_enabled = bool(self.params.get('dip_min_enabled', True))
+        self.dip_max_enabled = bool(self.params.get('dip_max_enabled', True))
+
+        # Validation
+        if self.taper_width < 0:
+            raise ValueError(f"taper_width must be non-negative, got {self.taper_width}")
+
+        if self.trace_spacing <= 0:
+            raise ValueError(f"trace_spacing must be positive, got {self.trace_spacing}")
+
+        if self.mode not in ['pass', 'reject']:
+            raise ValueError(f"mode must be 'pass' or 'reject', got {self.mode}")
+
+        if self.filter_type not in ['velocity', 'dip']:
+            raise ValueError(f"filter_type must be 'velocity' or 'dip', got {self.filter_type}")
+
+        # Velocity mode validation (only if at least one limit is enabled)
+        if self.filter_type == 'velocity':
+            if self.v_min_enabled and self.v_min <= 0:
+                raise ValueError(f"v_min must be positive, got {self.v_min}")
+
+            if self.v_min_enabled and self.v_max_enabled and self.v_max <= self.v_min:
+                raise ValueError(
+                    f"v_max ({self.v_max}) must be > v_min ({self.v_min})"
+                )
+
+    def process(self, data: SeismicData) -> SeismicData:
+        """
+        Apply FK filter to seismic data.
+
+        Args:
+            data: Input seismic data (single gather expected)
+
+        Returns:
+            Filtered seismic data
+        """
+        n_samples, n_traces = data.traces.shape
+
+        # Check minimum trace count
+        if n_traces < 8:
+            raise ValueError(
+                f"FK filtering requires at least 8 traces, got {n_traces}. "
+                f"Current gather has too few traces for meaningful FK analysis."
+            )
+
+        # Apply FK filter
+        filtered_traces = self._apply_fk_filter(
+            data.traces,
+            data.sample_rate,
+            self.trace_spacing
+        )
+
+        # Create output with metadata
+        metadata = data.metadata.copy()
+        if 'processing_history' not in metadata:
+            metadata['processing_history'] = []
+        metadata['processing_history'].append(self.get_description())
+
+        return SeismicData(
+            traces=filtered_traces,
+            sample_rate=data.sample_rate,
+            headers=data.headers,
+            metadata=metadata
+        )
+
+    def _apply_fk_filter(
+        self,
+        traces: np.ndarray,
+        sample_rate: float,
+        trace_spacing: float
+    ) -> np.ndarray:
+        """
+        Apply FK domain filtering.
+
+        Args:
+            traces: 2D array (n_samples, n_traces)
+            sample_rate: Sample rate in Hz
+            trace_spacing: Distance between traces in meters
+
+        Returns:
+            Filtered traces (n_samples, n_traces)
+        """
+        n_samples, n_traces = traces.shape
+
+        # Step 1: Forward 2D FFT
+        fk_spectrum = fft.fft2(traces)
+
+        # Step 2: Create frequency and wavenumber axes
+        dt = 1.0 / sample_rate
+        freqs = fft.fftfreq(n_samples, dt)  # Temporal frequency (Hz)
+        wavenumbers = fft.fftfreq(n_traces, trace_spacing)  # Spatial wavenumber (cycles/m)
+
+        # Create 2D grids
+        f_grid, k_grid = np.meshgrid(freqs, wavenumbers, indexing='ij')
+
+        # Step 3: Create filter weights based on filter type
+        if self.filter_type == 'velocity':
+            weights = self._create_velocity_filter(f_grid, k_grid)
+        elif self.filter_type == 'dip':
+            weights = self._create_dip_filter(f_grid, k_grid)
+        else:
+            raise ValueError(f"Unknown filter_type: {self.filter_type}")
+
+        # Step 4: Apply filter in FK domain
+        fk_filtered = fk_spectrum * weights
+
+        # Step 5: Inverse 2D FFT
+        filtered_traces = fft.ifft2(fk_filtered).real
+
+        return filtered_traces
+
+    def _create_velocity_filter(
+        self,
+        f_grid: np.ndarray,
+        k_grid: np.ndarray
+    ) -> np.ndarray:
+        """
+        Create velocity-based filter weights with cosine taper.
+        Supports optional min/max velocity limits.
+
+        Args:
+            f_grid: 2D frequency grid (Hz)
+            k_grid: 2D wavenumber grid (cycles/m)
+
+        Returns:
+            Filter weights (0-1), same shape as input grids
+        """
+        print("\n" + "=" * 80)
+        print("FK FILTER WEIGHT CALCULATION DEBUG")
+        print("=" * 80)
+        print(f"Grid shape: {f_grid.shape}")
+        print(f"Frequency range: {f_grid.min():.6f} to {f_grid.max():.6f} Hz")
+        print(f"Wavenumber range: {k_grid.min():.6f} to {k_grid.max():.6f} cycles/unit")
+        print(f"Filter mode: {self.mode}")
+        print(f"v_min_enabled: {self.v_min_enabled}, v_min: {self.v_min if self.v_min_enabled else 'N/A'}")
+        print(f"v_max_enabled: {self.v_max_enabled}, v_max: {self.v_max if self.v_max_enabled else 'N/A'}")
+        print(f"Taper width: {self.taper_width}")
+
+        # Calculate apparent velocity at each FK point
+        # v_app = f / k
+        # Avoid division by zero
+        with np.errstate(divide='ignore', invalid='ignore'):
+            v_app = np.abs(f_grid / k_grid)
+            # Handle k=0 (infinite velocity)
+            v_app[k_grid == 0] = np.inf
+
+        # Debug apparent velocity
+        v_app_finite = v_app[np.isfinite(v_app)]
+        print(f"\nApparent velocity (v_app = |f| / |k|):")
+        print(f"  Finite values: {len(v_app_finite)} / {v_app.size}")
+        if len(v_app_finite) > 0:
+            print(f"  Range: {v_app_finite.min():.1f} to {v_app_finite.max():.1f}")
+            print(f"  Mean: {v_app_finite.mean():.1f}, Median: {np.median(v_app_finite):.1f}")
+
+            # Sample v_app at a few key locations
+            mid_f = f_grid.shape[0] // 2
+            mid_k = f_grid.shape[1] // 2
+            print(f"  Sample at [0, mid_k]: f={f_grid[0, mid_k]:.3f}, k={k_grid[0, mid_k]:.6f}, v_app={v_app[0, mid_k]:.1f}")
+            print(f"  Sample at [mid_f, mid_k]: f={f_grid[mid_f, mid_k]:.3f}, k={k_grid[mid_f, mid_k]:.6f}, v_app={v_app[mid_f, mid_k]:.1f}")
+            print(f"  Sample at [-1, -1]: f={f_grid[-1, -1]:.3f}, k={k_grid[-1, -1]:.6f}, v_app={v_app[-1, -1]:.1f}")
+
+        # Initialize weights based on mode
+        if self.mode == 'pass':
+            # Start with all pass (will be masked by enabled limits)
+            weights = np.ones_like(v_app)
+        else:  # 'reject'
+            # Start with all reject (will be masked by enabled limits)
+            weights = np.zeros_like(v_app)
+
+        print(f"\nInitial weights: min={weights.min()}, max={weights.max()}, mean={weights.mean():.3f}")
+
+        # Define taper zones for enabled limits
+        if self.v_min_enabled:
+            v1 = self.v_min - self.taper_width
+            v2 = self.v_min + self.taper_width
+            print(f"\nv_min taper zone: v1={v1:.1f}, v_min={self.v_min:.1f}, v2={v2:.1f}")
+        if self.v_max_enabled:
+            v3 = self.v_max - self.taper_width
+            v4 = self.v_max + self.taper_width
+            print(f"v_max taper zone: v3={v3:.1f}, v_max={self.v_max:.1f}, v4={v4:.1f}")
+
+        if self.mode == 'pass':
+            # Pass band: keep velocities between v_min and v_max (if enabled)
+            print(f"\nApplying PASS mode filter:")
+
+            # Apply minimum velocity limit (if enabled)
+            if self.v_min_enabled:
+                # Full reject: v < v1
+                n_reject_below = np.sum(v_app < v1)
+                weights[v_app < v1] = 0.0
+                print(f"  v_min cutoff: {n_reject_below} points with v < {v1:.1f} set to 0.0")
+
+                # Taper up: v1 <= v < v2
+                mask = (v_app >= v1) & (v_app < v2)
+                n_taper_min = np.sum(mask)
+                if self.taper_width > 0:
+                    weights[mask] = 0.5 * (1.0 - np.cos(
+                        np.pi * (v_app[mask] - v1) / (2.0 * self.taper_width)
+                    ))
+                    if n_taper_min > 0:
+                        print(f"  v_min taper: {n_taper_min} points in [{v1:.1f}, {v2:.1f}], weights {weights[mask].min():.3f} to {weights[mask].max():.3f}")
+                # If v_min_enabled but taper_width=0, already set to 1.0 (pass all >= v_min)
+
+            # Apply maximum velocity limit (if enabled)
+            if self.v_max_enabled:
+                # Full reject: v > v4
+                n_reject_above = np.sum(v_app > v4)
+                weights[v_app > v4] = 0.0
+                print(f"  v_max cutoff: {n_reject_above} points with v > {v4:.1f} set to 0.0")
+
+                # Taper down: v3 < v <= v4
+                mask = (v_app > v3) & (v_app <= v4)
+                n_taper_max = np.sum(mask)
+                if self.taper_width > 0:
+                    weights[mask] = 0.5 * (1.0 + np.cos(
+                        np.pi * (v_app[mask] - v3) / (2.0 * self.taper_width)
+                    ))
+                    if n_taper_max > 0:
+                        print(f"  v_max taper: {n_taper_max} points in ({v3:.1f}, {v4:.1f}], weights {weights[mask].min():.3f} to {weights[mask].max():.3f}")
+                # If v_max_enabled but taper_width=0, already set to 1.0 (pass all <= v_max)
+
+            # Count passband
+            if self.v_min_enabled and self.v_max_enabled:
+                n_passband = np.sum((v_app >= v2) & (v_app <= v3))
+                print(f"  Passband: {n_passband} points with {v2:.1f} <= v <= {v3:.1f} (weight = 1.0)")
+            elif self.v_min_enabled:
+                n_passband = np.sum(v_app >= v2)
+                print(f"  Passband: {n_passband} points with v >= {v2:.1f} (weight = 1.0)")
+            elif self.v_max_enabled:
+                n_passband = np.sum(v_app <= v3)
+                print(f"  Passband: {n_passband} points with v <= {v3:.1f} (weight = 1.0)")
+
+        else:  # mode == 'reject'
+            # Reject band: remove velocities between v_min and v_max (if enabled)
+
+            # If both limits disabled, pass everything (weights = 0 from init, but we want 1)
+            if not self.v_min_enabled and not self.v_max_enabled:
+                weights = np.ones_like(v_app)
+            else:
+                # Start with pass all
+                weights = np.ones_like(v_app)
+
+                # Build rejection zone based on enabled limits
+                if self.v_min_enabled and self.v_max_enabled:
+                    # Standard reject band between v_min and v_max
+
+                    # Taper down: v1 <= v < v2
+                    mask = (v_app >= v1) & (v_app < v2)
+                    if self.taper_width > 0:
+                        weights[mask] = 0.5 * (1.0 + np.cos(
+                            np.pi * (v_app[mask] - v1) / (2.0 * self.taper_width)
+                        ))
+                    else:
+                        weights[mask] = 0.0
+
+                    # Full reject: v2 <= v <= v3
+                    weights[(v_app >= v2) & (v_app <= v3)] = 0.0
+
+                    # Taper up: v3 < v <= v4
+                    mask = (v_app > v3) & (v_app <= v4)
+                    if self.taper_width > 0:
+                        weights[mask] = 0.5 * (1.0 - np.cos(
+                            np.pi * (v_app[mask] - v3) / (2.0 * self.taper_width)
+                        ))
+                    else:
+                        weights[mask] = 0.0
+
+                elif self.v_min_enabled:
+                    # Only reject v < v_min
+
+                    # Taper down: v1 <= v < v2
+                    mask = (v_app >= v1) & (v_app < v2)
+                    if self.taper_width > 0:
+                        weights[mask] = 0.5 * (1.0 - np.cos(
+                            np.pi * (v_app[mask] - v1) / (2.0 * self.taper_width)
+                        ))
+                    else:
+                        weights[mask] = 1.0
+
+                    # Full reject: v < v1
+                    weights[v_app < v1] = 0.0
+
+                elif self.v_max_enabled:
+                    # Only reject v > v_max
+
+                    # Taper down: v3 < v <= v4
+                    mask = (v_app > v3) & (v_app <= v4)
+                    if self.taper_width > 0:
+                        weights[mask] = 0.5 * (1.0 - np.cos(
+                            np.pi * (v_app[mask] - v3) / (2.0 * self.taper_width)
+                        ))
+                    else:
+                        weights[mask] = 1.0
+
+                    # Full reject: v > v4
+                    weights[v_app > v4] = 0.0
+
+        # Handle DC component (f=0, k=0)
+        weights[0, 0] = 1.0  # Always preserve DC
+
+        # Final weight statistics
+        print(f"\nFinal filter weights:")
+        print(f"  Shape: {weights.shape}")
+        print(f"  Range: {weights.min():.3f} to {weights.max():.3f}")
+        print(f"  Mean: {weights.mean():.3f}")
+        n_zero = np.sum(weights == 0.0)
+        n_one = np.sum(weights == 1.0)
+        n_taper = np.sum((weights > 0.0) & (weights < 1.0))
+        print(f"  Zero weights (full reject): {n_zero} ({100*n_zero/weights.size:.1f}%)")
+        print(f"  One weights (full pass): {n_one} ({100*n_one/weights.size:.1f}%)")
+        print(f"  Taper weights (0 < w < 1): {n_taper} ({100*n_taper/weights.size:.1f}%)")
+        print("=" * 80 + "\n")
+
+        return weights
+
+    def _create_dip_filter(
+        self,
+        f_grid: np.ndarray,
+        k_grid: np.ndarray
+    ) -> np.ndarray:
+        """
+        Create dip-based filter weights with cosine taper.
+        Supports optional min/max dip limits.
+
+        Dip is defined as dt/dx (s/m). In FK domain: dip = k/f
+        - Negative dip: k < 0 (left-dipping events)
+        - Positive dip: k > 0 (right-dipping events)
+
+        Args:
+            f_grid: 2D frequency grid (Hz)
+            k_grid: 2D wavenumber grid (cycles/m)
+
+        Returns:
+            Filter weights (0-1), same shape as input grids
+        """
+        # Calculate apparent dip at each FK point
+        # dip = k / f (units: (cycles/m) / Hz = s/m)
+        # Avoid division by zero
+        with np.errstate(divide='ignore', invalid='ignore'):
+            dip_app = k_grid / f_grid
+            # Handle f=0 (infinite dip) - set to large value
+            dip_app[f_grid == 0] = np.inf
+            # Keep sign of k for distinguishing left/right dipping events
+
+        # Initialize weights based on mode
+        if self.mode == 'pass':
+            # Start with all pass
+            weights = np.ones_like(dip_app)
+        else:  # 'reject'
+            # Start with all reject
+            weights = np.zeros_like(dip_app)
+
+        # Define taper zones for enabled limits
+        # Note: dip_min is typically negative (left-dipping), dip_max is positive (right-dipping)
+        if self.dip_min_enabled:
+            d1 = self.dip_min - self.taper_width  # More negative
+            d2 = self.dip_min + self.taper_width  # Less negative (toward zero)
+        if self.dip_max_enabled:
+            d3 = self.dip_max - self.taper_width  # Less positive (toward zero)
+            d4 = self.dip_max + self.taper_width  # More positive
+
+        if self.mode == 'pass':
+            # Pass band: keep dips between dip_min and dip_max (if enabled)
+
+            # Apply minimum dip limit (if enabled) - typically negative
+            if self.dip_min_enabled:
+                # Full reject: dip < d1 (more negative than limit)
+                weights[dip_app < d1] = 0.0
+
+                # Taper up: d1 <= dip < d2
+                mask = (dip_app >= d1) & (dip_app < d2)
+                if self.taper_width > 0:
+                    weights[mask] = 0.5 * (1.0 - np.cos(
+                        np.pi * (dip_app[mask] - d1) / (2.0 * self.taper_width)
+                    ))
+
+            # Apply maximum dip limit (if enabled) - typically positive
+            if self.dip_max_enabled:
+                # Full reject: dip > d4 (more positive than limit)
+                weights[dip_app > d4] = 0.0
+
+                # Taper down: d3 < dip <= d4
+                mask = (dip_app > d3) & (dip_app <= d4)
+                if self.taper_width > 0:
+                    weights[mask] = 0.5 * (1.0 + np.cos(
+                        np.pi * (dip_app[mask] - d3) / (2.0 * self.taper_width)
+                    ))
+
+        else:  # mode == 'reject'
+            # Reject band: remove dips between dip_min and dip_max (if enabled)
+
+            # If both limits disabled, pass everything
+            if not self.dip_min_enabled and not self.dip_max_enabled:
+                weights = np.ones_like(dip_app)
+            else:
+                # Start with pass all
+                weights = np.ones_like(dip_app)
+
+                # Build rejection zone based on enabled limits
+                if self.dip_min_enabled and self.dip_max_enabled:
+                    # Standard reject band between dip_min and dip_max
+
+                    # Taper down: d1 <= dip < d2
+                    mask = (dip_app >= d1) & (dip_app < d2)
+                    if self.taper_width > 0:
+                        weights[mask] = 0.5 * (1.0 + np.cos(
+                            np.pi * (dip_app[mask] - d1) / (2.0 * self.taper_width)
+                        ))
+                    else:
+                        weights[mask] = 0.0
+
+                    # Full reject: d2 <= dip <= d3
+                    weights[(dip_app >= d2) & (dip_app <= d3)] = 0.0
+
+                    # Taper up: d3 < dip <= d4
+                    mask = (dip_app > d3) & (dip_app <= d4)
+                    if self.taper_width > 0:
+                        weights[mask] = 0.5 * (1.0 - np.cos(
+                            np.pi * (dip_app[mask] - d3) / (2.0 * self.taper_width)
+                        ))
+                    else:
+                        weights[mask] = 0.0
+
+                elif self.dip_min_enabled:
+                    # Only reject dip < dip_min (left-dipping events beyond limit)
+
+                    # Taper down: d1 <= dip < d2
+                    mask = (dip_app >= d1) & (dip_app < d2)
+                    if self.taper_width > 0:
+                        weights[mask] = 0.5 * (1.0 - np.cos(
+                            np.pi * (dip_app[mask] - d1) / (2.0 * self.taper_width)
+                        ))
+                    else:
+                        weights[mask] = 1.0
+
+                    # Full reject: dip < d1
+                    weights[dip_app < d1] = 0.0
+
+                elif self.dip_max_enabled:
+                    # Only reject dip > dip_max (right-dipping events beyond limit)
+
+                    # Taper down: d3 < dip <= d4
+                    mask = (dip_app > d3) & (dip_app <= d4)
+                    if self.taper_width > 0:
+                        weights[mask] = 0.5 * (1.0 - np.cos(
+                            np.pi * (dip_app[mask] - d3) / (2.0 * self.taper_width)
+                        ))
+                    else:
+                        weights[mask] = 1.0
+
+                    # Full reject: dip > d4
+                    weights[dip_app > d4] = 0.0
+
+        # Handle DC component (f=0, k=0)
+        weights[0, 0] = 1.0  # Always preserve DC
+
+        return weights
+
+    def compute_fk_spectrum(
+        self,
+        traces: np.ndarray,
+        sample_rate: float,
+        trace_spacing: float
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Compute FK spectrum for visualization.
+
+        Args:
+            traces: 2D array (n_samples, n_traces)
+            sample_rate: Sample rate in Hz
+            trace_spacing: Distance between traces in meters
+
+        Returns:
+            Tuple of (spectrum, freqs, wavenumbers)
+            - spectrum: 2D complex FK spectrum
+            - freqs: 1D frequency axis (Hz)
+            - wavenumbers: 1D wavenumber axis (cycles/m)
+        """
+        n_samples, n_traces = traces.shape
+
+        # Forward 2D FFT
+        fk_spectrum = fft.fft2(traces)
+
+        # Frequency and wavenumber axes
+        dt = 1.0 / sample_rate
+        freqs = fft.fftfreq(n_samples, dt)
+        wavenumbers = fft.fftfreq(n_traces, trace_spacing)
+
+        return fk_spectrum, freqs, wavenumbers
+
+    def get_description(self) -> str:
+        """Get description of this filter."""
+        mode_str = "Pass" if self.mode == 'pass' else "Reject"
+        return (
+            f"FK Filter ({mode_str}): {self.v_min:.0f}-{self.v_max:.0f} m/s, "
+            f"taper {self.taper_width:.0f} m/s"
+        )
+
+
+def get_fk_filter_presets() -> Dict[str, Dict]:
+    """
+    Get predefined FK filter configurations.
+
+    Returns:
+        Dictionary of preset name -> parameters
+    """
+    return {
+        'Ground Roll Removal': {
+            'v_min': 1500,
+            'v_max': 6000,
+            'taper_width': 300,
+            'mode': 'pass',
+            'description': 'Removes slow horizontal noise (ground roll)'
+        },
+        'Air Wave Removal': {
+            'v_min': 400,
+            'v_max': 10000,
+            'taper_width': 100,
+            'mode': 'pass',
+            'description': 'Removes direct air wave (<400 m/s)'
+        },
+        'Reflection Pass': {
+            'v_min': 2000,
+            'v_max': 5000,
+            'taper_width': 200,
+            'mode': 'pass',
+            'description': 'Keeps typical reflection velocities'
+        },
+        'Steep Dip Only': {
+            'v_min': 4000,
+            'v_max': 8000,
+            'taper_width': 400,
+            'mode': 'pass',
+            'description': 'Keeps only steep events'
+        }
+    }
