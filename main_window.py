@@ -1,6 +1,7 @@
 """
 Main application window - coordinates three synchronized seismic viewers.
 """
+import logging
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                               QMenuBar, QMenu, QFileDialog, QMessageBox, QSplitter,
                               QPushButton, QProgressDialog, QApplication)
@@ -10,6 +11,10 @@ import numpy as np
 import sys
 import zarr
 from pathlib import Path
+
+# Set up logging
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.DEBUG)
 from models.seismic_data import SeismicData
 from models.viewport_state import ViewportState
 from models.gather_navigator import GatherNavigator
@@ -212,9 +217,25 @@ class MainWindow(QMainWindow):
 
     def _import_segy_dialog(self):
         """Open SEG-Y import dialog."""
-        dialog = SEGYImportDialog(self)
-        dialog.import_completed.connect(self._on_segy_imported)
-        dialog.exec()
+        logger.info("_import_segy_dialog() - START")
+        try:
+            logger.info("  → Creating SEGYImportDialog...")
+            dialog = SEGYImportDialog(self)
+            logger.info("  ✓ SEGYImportDialog created successfully")
+
+            logger.info("  → Connecting import_completed signal...")
+            dialog.import_completed.connect(self._on_segy_imported)
+            logger.info("  ✓ Signal connected")
+
+            logger.info("  → Calling dialog.exec()...")
+            dialog.exec()
+            logger.info("  ✓ Dialog exec() returned")
+
+            logger.info("_import_segy_dialog() - COMPLETE")
+        except Exception as e:
+            logger.error(f"_import_segy_dialog() - FAILED: {e}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to open SEG-Y import dialog:\n{e}")
+            raise
 
     def _on_segy_imported(self, seismic_data, headers_df, ensembles_df, file_path=None):
         """Handle completed SEG-Y import."""

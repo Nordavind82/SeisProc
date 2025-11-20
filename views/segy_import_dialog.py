@@ -1,6 +1,7 @@
 """
 SEG-Y import dialog with header mapping configuration.
 """
+import logging
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                               QPushButton, QTableWidget, QTableWidgetItem,
                               QFileDialog, QGroupBox, QLineEdit, QComboBox,
@@ -11,6 +12,10 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFont
 from typing import Optional, List
 import sys
+
+# Set up logging
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.DEBUG)
 from utils.segy_import.header_mapping import HeaderMapping, HeaderField, StandardHeaders
 from utils.segy_import.computed_headers import ComputedHeaderField
 from utils.segy_import.segy_reader import SEGYReader
@@ -34,40 +39,82 @@ class SEGYImportDialog(QDialog):
     import_completed = pyqtSignal(object, object, object, str)  # data (SeismicData or LazySeismicData), headers_df, ensembles_df, file_path
 
     def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("SEG-Y Import")
-        self.resize(900, 700)
+        logger.info("SEGYImportDialog.__init__() - START")
+        try:
+            # CRITICAL: Set attribute to disable OpenGL before any widget creation
+            # This prevents segfault when creating QTableWidget and other complex widgets
+            logger.info("  → Setting Qt::AA_UseSoftwareOpenGL attribute...")
+            from PyQt6.QtCore import Qt
+            from PyQt6.QtWidgets import QApplication
+            QApplication.setAttribute(Qt.ApplicationAttribute.AA_UseSoftwareOpenGL)
+            logger.info("  ✓ Software OpenGL enabled")
 
-        self.segy_file = None
-        self.header_mapping = HeaderMapping()
-        self.reader = None
+            super().__init__(parent)
+            logger.info("  ✓ QDialog parent init complete")
 
-        self._init_ui()
-        self._load_standard_headers()
+            self.setWindowTitle("SEG-Y Import")
+            logger.info("  ✓ Window title set")
+
+            self.resize(900, 700)
+            logger.info("  ✓ Window resized")
+
+            self.segy_file = None
+            self.header_mapping = HeaderMapping()
+            self.reader = None
+            logger.info("  ✓ Instance variables initialized")
+
+            logger.info("  → Calling _init_ui()...")
+            self._init_ui()
+            logger.info("  ✓ _init_ui() complete")
+
+            logger.info("  → Calling _load_standard_headers()...")
+            self._load_standard_headers()
+            logger.info("  ✓ _load_standard_headers() complete")
+
+            logger.info("SEGYImportDialog.__init__() - COMPLETE")
+        except Exception as e:
+            logger.error(f"SEGYImportDialog.__init__() - FAILED: {e}", exc_info=True)
+            raise
 
     def _init_ui(self):
         """Initialize user interface."""
+        logger.info("    _init_ui() - Creating layout...")
         layout = QVBoxLayout()
+        logger.info("    ✓ Layout created")
 
         # File selection
+        logger.info("    → Creating file selection group...")
         layout.addWidget(self._create_file_selection_group())
+        logger.info("    ✓ File selection group added")
 
         # Header mapping table
+        logger.info("    → Creating header mapping group...")
         layout.addWidget(self._create_header_mapping_group())
+        logger.info("    ✓ Header mapping group added")
 
         # Computed headers configuration
+        logger.info("    → Creating computed headers group...")
         layout.addWidget(self._create_computed_headers_group())
+        logger.info("    ✓ Computed headers group added")
 
         # Ensemble configuration
+        logger.info("    → Creating ensemble group...")
         layout.addWidget(self._create_ensemble_group())
+        logger.info("    ✓ Ensemble group added")
 
         # Preview area
+        logger.info("    → Creating preview group...")
         layout.addWidget(self._create_preview_group())
+        logger.info("    ✓ Preview group added")
 
         # Action buttons
+        logger.info("    → Creating action buttons...")
         layout.addLayout(self._create_action_buttons())
+        logger.info("    ✓ Action buttons added")
 
+        logger.info("    → Setting layout on dialog...")
         self.setLayout(layout)
+        logger.info("    ✓ Layout set")
 
     def _create_file_selection_group(self) -> QGroupBox:
         """Create file selection group."""
@@ -92,10 +139,12 @@ class SEGYImportDialog(QDialog):
 
     def _create_header_mapping_group(self) -> QGroupBox:
         """Create header mapping configuration table."""
+        logger.info("      _create_header_mapping_group() - START")
         group = QGroupBox("Trace Header Mapping Configuration")
         layout = QVBoxLayout()
 
         # Toolbar
+        logger.info("        → Creating toolbar...")
         toolbar = QHBoxLayout()
 
         add_btn = QPushButton("Add Custom Header")
@@ -124,24 +173,46 @@ class SEGYImportDialog(QDialog):
         toolbar.addWidget(load_preset_btn)
 
         layout.addLayout(toolbar)
+        logger.info("        ✓ Toolbar created")
 
         # Table
+        logger.info("        → Creating QTableWidget...")
         self.header_table = QTableWidget()
+        logger.info("        ✓ QTableWidget created")
+
+        logger.info("        → Setting column count...")
         self.header_table.setColumnCount(5)
+        logger.info("        ✓ Column count set")
+
+        logger.info("        → Setting horizontal headers...")
         self.header_table.setHorizontalHeaderLabels([
             'Header Name', 'Byte Position', 'Format', 'Description', 'Sample Values (5 traces)'
         ])
+        logger.info("        ✓ Headers set")
+
         # Set column stretch modes
+        logger.info("        → Configuring header resize modes...")
         header = self.header_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)  # Name
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)  # Byte
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)  # Format
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)           # Description
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)  # Sample Values
-        self.header_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        layout.addWidget(self.header_table)
+        logger.info("        ✓ Resize modes set")
 
+        logger.info("        → Setting selection behavior...")
+        self.header_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        logger.info("        ✓ Selection behavior set")
+
+        logger.info("        → Adding table to layout...")
+        layout.addWidget(self.header_table)
+        logger.info("        ✓ Table added to layout")
+
+        logger.info("        → Setting layout on group...")
         group.setLayout(layout)
+        logger.info("        ✓ Layout set on group")
+
+        logger.info("      _create_header_mapping_group() - COMPLETE")
         return group
 
     def _create_computed_headers_group(self) -> QGroupBox:
@@ -199,10 +270,12 @@ class SEGYImportDialog(QDialog):
 
     def _create_ensemble_group(self) -> QGroupBox:
         """Create ensemble configuration group."""
+        logger.info("      _create_ensemble_group() - START")
         group = QGroupBox("Import Configuration")
         layout = QVBoxLayout()
 
         # Ensemble keys row
+        logger.info("        → Creating ensemble keys row...")
         ensemble_row = QHBoxLayout()
         ensemble_row.addWidget(QLabel("Ensemble Keys (comma-separated):"))
 
@@ -212,19 +285,27 @@ class SEGYImportDialog(QDialog):
 
         ensemble_row.addWidget(QLabel("(Headers that define ensemble boundaries)"))
         layout.addLayout(ensemble_row)
+        logger.info("        ✓ Ensemble keys row created")
 
         # Spatial units row
+        logger.info("        → Creating spatial units row...")
         units_row = QHBoxLayout()
         units_row.addWidget(QLabel("Spatial Units:"))
 
+        logger.info("        → Creating QComboBox...")
         self.spatial_units_combo = QComboBox()
+        logger.info("        ✓ QComboBox created")
+
+        logger.info("        → Adding combo items...")
         self.spatial_units_combo.addItem("Meters (m)", AppSettings.METERS)
         self.spatial_units_combo.addItem("Feet (ft)", AppSettings.FEET)
+        logger.info("        ✓ Combo items added")
 
-        # Set current value from settings
-        current_units = get_settings().get_spatial_units()
-        index = 0 if current_units == AppSettings.METERS else 1
-        self.spatial_units_combo.setCurrentIndex(index)
+        # Set current value from settings (use default to avoid crash)
+        logger.info("        → Setting default units (meters)...")
+        # TODO: Load from settings after dialog is shown (to avoid QSettings crash during init)
+        self.spatial_units_combo.setCurrentIndex(0)  # Default to meters
+        logger.info("        ✓ Default units set")
 
         self.spatial_units_combo.setToolTip(
             "Select spatial units for coordinates and distances.\n"
@@ -290,22 +371,37 @@ class SEGYImportDialog(QDialog):
 
     def _browse_segy_file(self):
         """Browse for SEG-Y file."""
-        filename, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select SEG-Y File",
-            "",
-            "SEG-Y Files (*.sgy *.segy *.SGY *.SEGY);;All Files (*)"
-        )
+        logger.info("_browse_segy_file() - START")
+        try:
+            logger.info("  → Opening QFileDialog...")
+            filename, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select SEG-Y File",
+                "",
+                "SEG-Y Files (*.sgy *.segy *.SGY *.SEGY);;All Files (*)",
+                options=QFileDialog.Option.DontUseNativeDialog  # Prevent native dialog crash
+            )
+            logger.info(f"  ✓ QFileDialog returned: {filename}")
 
-        if filename:
-            self.segy_file = filename
-            self.file_path_edit.setText(filename)
-            self._update_reader()
-            self.import_btn.setEnabled(True)
+            if filename:
+                logger.info(f"  → Setting segy_file to: {filename}")
+                self.segy_file = filename
+                self.file_path_edit.setText(filename)
+                logger.info("  → Calling _update_reader()...")
+                self._update_reader()
+                logger.info("  ✓ Reader updated")
+                self.import_btn.setEnabled(True)
 
-            # Load sample header values if table has headers
-            if self.header_table.rowCount() > 0:
-                self._load_sample_header_values()
+                # Load sample header values if table has headers
+                if self.header_table.rowCount() > 0:
+                    logger.info("  → Loading sample header values...")
+                    self._load_sample_header_values()
+                    logger.info("  ✓ Sample headers loaded")
+
+            logger.info("_browse_segy_file() - COMPLETE")
+        except Exception as e:
+            logger.error(f"_browse_segy_file() - FAILED: {e}", exc_info=True)
+            raise
 
     def _show_file_info(self):
         """Show SEG-Y file information in a nice scrollable dialog."""
@@ -791,31 +887,43 @@ The binary header contains file-level metadata about the entire SEG-Y dataset.
 
     def _import_segy(self):
         """Import SEG-Y file with current configuration."""
+        logger.info("_import_segy() - START")
         if not self.reader:
             QMessageBox.warning(self, "No File", "Please select a SEG-Y file first.")
             return
 
         try:
             # Update mapping and ensemble keys
+            logger.info("  → Updating reader...")
             self._update_reader()
+            logger.info("  ✓ Reader updated")
 
+            logger.info("  → Processing ensemble keys...")
             ensemble_keys_text = self.ensemble_keys_edit.text().strip()
             ensemble_keys = []
             if ensemble_keys_text:
                 ensemble_keys = [k.strip() for k in ensemble_keys_text.split(',')]
                 self.header_mapping.set_ensemble_keys(ensemble_keys)
+            logger.info(f"  ✓ Ensemble keys: {ensemble_keys}")
 
-            # Save spatial units selection to app settings
+            # Get spatial units selection (don't save to QSettings - causes crash)
+            logger.info("  → Getting selected units...")
             selected_units = self.spatial_units_combo.currentData()
-            get_settings().set_spatial_units(selected_units)
+            logger.info(f"  ✓ Selected units: {selected_units}")
+
+            # NOTE: Not saving to QSettings to avoid segfault in WSL2/problematic environments
+            # The selected units will be used for this import session only
             print(f"Spatial units set to: {selected_units}")
 
-            # Ask for output directory
+            # Ask for output directory (THIS MAY CRASH WITH NATIVE DIALOG)
+            logger.info("  → Opening directory dialog (may crash here)...")
             output_dir = QFileDialog.getExistingDirectory(
                 self,
                 "Select Output Directory for Zarr/Parquet Storage",
-                ""
+                "",
+                options=QFileDialog.Option.DontUseNativeDialog  # CRITICAL: Prevent native dialog crash
             )
+            logger.info(f"  ✓ Directory dialog returned: {output_dir}")
 
             if not output_dir:
                 return
@@ -911,7 +1019,7 @@ The binary header contains file-level metadata about the entire SEG-Y dataset.
                 progress.setValue(current)
                 progress.setLabelText(
                     f"Processing: {current:,}/{total:,} traces\n"
-                    f"(Writing traces, headers, detecting ensembles simultaneously)"
+                    f"(Writing Seismic Data to Zarr/Parquet internal format)"
                 )
 
             # Single-pass import: traces + headers + ensembles all at once!

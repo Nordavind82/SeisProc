@@ -11,7 +11,20 @@ Professional seismic data quality control application with:
 Usage:
     python main.py
 """
+import os
 import sys
+
+# Fix for segmentation fault: Set Qt/display environment variables BEFORE importing PyQt6
+# This prevents OpenGL integration issues that cause crashes on some systems
+os.environ.setdefault('QT_QPA_PLATFORM', 'xcb')          # Use X11 backend
+os.environ.setdefault('QT_XCB_GL_INTEGRATION', 'none')  # Disable OpenGL (prevents segfault)
+os.environ.setdefault('MPLBACKEND', 'Agg')              # Non-interactive matplotlib backend
+
+# CRITICAL: Force Qt to use portable settings format instead of native D-Bus/system services
+# This prevents QSettings from crashing when accessing system services with display issues
+os.environ.setdefault('QT_SETTINGS_PATH', '/tmp')        # Use temp directory for settings
+os.environ['QT_SCALE_FACTOR'] = '1'                      # Disable automatic scaling
+
 from PyQt6.QtWidgets import QApplication
 from main_window import MainWindow
 
