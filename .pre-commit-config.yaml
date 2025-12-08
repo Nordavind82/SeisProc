@@ -1,0 +1,93 @@
+# Pre-commit hooks configuration for SeisProc
+# Install with: pip install pre-commit && pre-commit install
+# Run manually: pre-commit run --all-files
+
+repos:
+  # Code formatting with Black
+  - repo: https://github.com/psf/black
+    rev: 24.3.0
+    hooks:
+      - id: black
+        language_version: python3
+        args: ['--line-length=100']
+        exclude: '^(tests/|docs/)'
+
+  # Import sorting with isort
+  - repo: https://github.com/pycqa/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+        args: ['--profile=black', '--line-length=100']
+        exclude: '^(tests/|docs/)'
+
+  # Linting with flake8
+  - repo: https://github.com/pycqa/flake8
+    rev: 7.0.0
+    hooks:
+      - id: flake8
+        args:
+          - '--max-line-length=100'
+          - '--ignore=E203,E501,W503'  # Black compatibility
+          - '--per-file-ignores=__init__.py:F401'
+        exclude: '^(tests/|docs/|\.)'
+
+  # Type checking with mypy
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.9.0
+    hooks:
+      - id: mypy
+        args:
+          - '--ignore-missing-imports'
+          - '--no-strict-optional'
+          - '--warn-unused-ignores'
+        additional_dependencies:
+          - 'numpy>=1.20'
+          - 'pandas-stubs'
+          - 'types-PyYAML'
+        exclude: '^(tests/|docs/)'
+
+  # General pre-commit hooks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      # Trailing whitespace
+      - id: trailing-whitespace
+        exclude: '^(docs/|\.md$)'
+      # End of file fixer
+      - id: end-of-file-fixer
+        exclude: '^(docs/)'
+      # Check YAML syntax
+      - id: check-yaml
+      # Check JSON syntax
+      - id: check-json
+      # Check for merge conflicts
+      - id: check-merge-conflict
+      # Check for large files
+      - id: check-added-large-files
+        args: ['--maxkb=1000']
+      # Check Python syntax
+      - id: check-ast
+      # Debug statements check
+      - id: debug-statements
+      # Requirements.txt fixer
+      - id: requirements-txt-fixer
+
+  # Security checks with bandit
+  - repo: https://github.com/PyCQA/bandit
+    rev: 1.7.8
+    hooks:
+      - id: bandit
+        args: ['-c', 'pyproject.toml', '--quiet']
+        additional_dependencies: ['bandit[toml]']
+        exclude: '^tests/'
+
+# CI configuration
+ci:
+  autofix_commit_msg: |
+    [pre-commit.ci] auto fixes from pre-commit hooks
+  autofix_prs: true
+  autoupdate_branch: ''
+  autoupdate_commit_msg: '[pre-commit.ci] pre-commit autoupdate'
+  autoupdate_schedule: weekly
+  skip: [mypy]  # Skip mypy in CI (runs separately)
+  submodules: false

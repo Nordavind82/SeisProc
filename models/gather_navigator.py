@@ -10,8 +10,12 @@ from collections import OrderedDict
 import threading
 import time
 import sys
+import logging
 from models.seismic_data import SeismicData
 from models.lazy_seismic_data import LazySeismicData
+
+# Set up module logger
+logger = logging.getLogger(__name__)
 
 
 class GatherNavigator(QObject):
@@ -162,7 +166,7 @@ class GatherNavigator(QObject):
                 first_header = self.lazy_data.get_headers([0])
                 return list(first_header.columns)
             except Exception as e:
-                print(f"Warning: Failed to load headers: {e}")
+                logger.warning(f"Failed to load headers: {e}")
                 return []
         elif self.headers_df is not None:
             # Full data mode
@@ -369,7 +373,7 @@ class GatherNavigator(QObject):
         valid_sort_keys = [key for key in self.sort_keys if key in gather_headers.columns]
 
         if not valid_sort_keys:
-            print(f"Warning: None of the sort keys {self.sort_keys} found in headers")
+            logger.warning(f"None of the sort keys {self.sort_keys} found in headers")
             return gather_data, gather_headers
 
         try:
@@ -398,7 +402,10 @@ class GatherNavigator(QObject):
             return sorted_gather_data, sorted_headers
 
         except Exception as e:
-            print(f"Warning: Failed to sort gather: {e}")
+            logger.warning(
+                f"Failed to sort gather by {self.sort_keys}: {e}",
+                exc_info=True
+            )
             return gather_data, gather_headers
 
     def _get_gather_info(self, gather_id: int) -> Dict:
@@ -441,7 +448,7 @@ class GatherNavigator(QObject):
                     if key in first_header:
                         key_values[key] = first_header[key]
             except Exception as e:
-                print(f"Warning: Failed to load header for gather {gather_id}: {e}")
+                logger.warning(f"Failed to load header for gather {gather_id}: {e}")
         elif self.headers_df is not None:
             # Full data mode
             first_header = self.headers_df.iloc[start_trace]
@@ -538,7 +545,7 @@ class GatherNavigator(QObject):
                 try:
                     self._get_lazy_gather(prev_id)
                 except Exception as e:
-                    print(f"Warning: Failed to prefetch gather {prev_id}: {e}")
+                    logger.debug(f"Failed to prefetch gather {prev_id}: {e}")
 
         # Prefetch next gather if available and not cached
         if self.can_go_next():
@@ -547,7 +554,7 @@ class GatherNavigator(QObject):
                 try:
                     self._get_lazy_gather(next_id)
                 except Exception as e:
-                    print(f"Warning: Failed to prefetch gather {next_id}: {e}")
+                    logger.debug(f"Failed to prefetch gather {next_id}: {e}")
 
     def get_cache_stats(self) -> Optional[Dict]:
         """
@@ -684,7 +691,7 @@ class GatherNavigator(QObject):
                     # Load gather into cache
                     self._get_lazy_gather(gather_id)
                 except Exception as e:
-                    print(f"Warning: Prefetch failed for gather {gather_id}: {e}")
+                    logger.debug(f"Prefetch failed for gather {gather_id}: {e}")
 
     def _trigger_prefetch(self, gather_id: int):
         """

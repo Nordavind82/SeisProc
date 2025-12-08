@@ -3,12 +3,21 @@ FK (Frequency-Wavenumber) Filter Processor
 
 Implements velocity-based filtering in the FK domain for removing
 coherent linear noise (ground roll, air wave, etc.) from seismic gathers.
+
+Supports both metric (m/s) and imperial (ft/s) velocity units.
+All internal calculations use metric units; conversion happens at boundaries.
 """
 import numpy as np
 from scipy import fft
 from typing import Optional, Tuple, Dict
 from processors.base_processor import BaseProcessor
 from models.seismic_data import SeismicData
+from utils.unit_conversion import (
+    convert_velocity_to_metric,
+    convert_velocity_from_metric,
+    METERS_TO_FEET,
+    FEET_TO_METERS
+)
 
 
 class FKFilter(BaseProcessor):
@@ -19,19 +28,23 @@ class FKFilter(BaseProcessor):
     domain. Uses 2D FFT to transform from time-space to frequency-wavenumber,
     applies filter, then inverse 2D FFT back to time-space.
 
+    Supports both metric (m/s) and imperial (ft/s) velocity units. Velocities are
+    converted to metric internally for calculations, then converted back for display.
+
     Parameters:
         filter_type: 'velocity' or 'dip' (default: 'velocity')
-        v_min: Minimum velocity to pass (m/s) - used in velocity mode
-        v_max: Maximum velocity to pass (m/s) - used in velocity mode
+        v_min: Minimum velocity to pass (in coordinate_units/s)
+        v_max: Maximum velocity to pass (in coordinate_units/s)
         v_min_enabled: Enable minimum velocity limit (default: True)
         v_max_enabled: Enable maximum velocity limit (default: True)
-        dip_min: Minimum dip to pass (s/m) - used in dip mode
-        dip_max: Maximum dip to pass (s/m) - used in dip mode
+        dip_min: Minimum dip to pass (s/coordinate_unit)
+        dip_max: Maximum dip to pass (s/coordinate_unit)
         dip_min_enabled: Enable minimum dip limit (default: True)
         dip_max_enabled: Enable maximum dip limit (default: True)
-        taper_width: Cosine taper width (m/s for velocity, s/m for dip)
+        taper_width: Cosine taper width (velocity_units/s for velocity mode)
         mode: 'pass' or 'reject'
-        trace_spacing: Spatial distance between traces (m)
+        trace_spacing: Spatial distance between traces (in coordinate_units)
+        coordinate_units: 'meters' or 'feet' (default: 'meters')
     """
 
     def _validate_params(self):
@@ -44,16 +57,33 @@ class FKFilter(BaseProcessor):
         # Get filter type
         self.filter_type = self.params.get('filter_type', 'velocity')
 
-        # Common parameters
+        # Get coordinate units (meters or feet)
+        self.coordinate_units = self.params.get('coordinate_units', 'meters')
+        if self.coordinate_units not in ['meters', 'feet']:
+            raise ValueError(f"coordinate_units must be 'meters' or 'feet', got {self.coordinate_units}")
+
+        # Common parameters (in display units)
         self.taper_width = float(self.params['taper_width'])
         self.trace_spacing = float(self.params['trace_spacing'])
         self.mode = self.params.get('mode', 'pass')  # 'pass' or 'reject'
 
-        # Velocity mode parameters
+        # Velocity mode parameters (in display units - will be converted for internal use)
         self.v_min = float(self.params.get('v_min', 2000.0))
         self.v_max = float(self.params.get('v_max', 6000.0))
         self.v_min_enabled = bool(self.params.get('v_min_enabled', True))
         self.v_max_enabled = bool(self.params.get('v_max_enabled', True))
+
+        # Convert velocities to metric for internal calculations
+        # This ensures FK filter math always uses m/s internally
+        self._v_min_metric = convert_velocity_to_metric(self.v_min, self.coordinate_units)
+        self._v_max_metric = convert_velocity_to_metric(self.v_max, self.coordinate_units)
+        self._taper_width_metric = convert_velocity_to_metric(self.taper_width, self.coordinate_units)
+
+        # Convert trace spacing to metric for internal calculations
+        if self.coordinate_units == 'feet':
+            self._trace_spacing_metric = self.trace_spacing * FEET_TO_METERS
+        else:
+            self._trace_spacing_metric = self.trace_spacing
 
         # Dip mode parameters
         self.dip_min = float(self.params.get('dip_min', -0.01))
@@ -103,11 +133,11 @@ class FKFilter(BaseProcessor):
                 f"Current gather has too few traces for meaningful FK analysis."
             )
 
-        # Apply FK filter
+        # Apply FK filter (using metric trace spacing for internal calculations)
         filtered_traces = self._apply_fk_filter(
             data.traces,
             data.sample_rate,
-            self.trace_spacing
+            self._trace_spacing_metric  # Use metric spacing for FFT calculations
         )
 
         # Create output with metadata
@@ -549,48 +579,68 @@ class FKFilter(BaseProcessor):
         return fk_spectrum, freqs, wavenumbers
 
     def get_description(self) -> str:
-        """Get description of this filter."""
+        """Get description of this filter with correct units."""
         mode_str = "Pass" if self.mode == 'pass' else "Reject"
+        unit = 'ft' if self.coordinate_units == 'feet' else 'm'
         return (
-            f"FK Filter ({mode_str}): {self.v_min:.0f}-{self.v_max:.0f} m/s, "
-            f"taper {self.taper_width:.0f} m/s"
+            f"FK Filter ({mode_str}): {self.v_min:.0f}-{self.v_max:.0f} {unit}/s, "
+            f"taper {self.taper_width:.0f} {unit}/s"
         )
 
 
-def get_fk_filter_presets() -> Dict[str, Dict]:
+# Presets stored in metric (m/s) - converted to display units when used
+_FK_PRESETS_METRIC = {
+    'Ground Roll Removal': {
+        'v_min': 1500,
+        'v_max': 6000,
+        'taper_width': 300,
+        'mode': 'pass',
+        'description': 'Removes slow horizontal noise (ground roll)'
+    },
+    'Air Wave Removal': {
+        'v_min': 400,
+        'v_max': 10000,
+        'taper_width': 100,
+        'mode': 'pass',
+        'description': 'Removes direct air wave (<400 m/s)'
+    },
+    'Reflection Pass': {
+        'v_min': 2000,
+        'v_max': 5000,
+        'taper_width': 200,
+        'mode': 'pass',
+        'description': 'Keeps typical reflection velocities'
+    },
+    'Steep Dip Only': {
+        'v_min': 4000,
+        'v_max': 8000,
+        'taper_width': 400,
+        'mode': 'pass',
+        'description': 'Keeps only steep events'
+    }
+}
+
+
+def get_fk_filter_presets(coordinate_units: str = 'meters') -> Dict[str, Dict]:
     """
     Get predefined FK filter configurations.
 
+    Args:
+        coordinate_units: Target units for velocities ('meters' or 'feet')
+
     Returns:
-        Dictionary of preset name -> parameters
+        Dictionary of preset name -> parameters (in specified units)
     """
-    return {
-        'Ground Roll Removal': {
-            'v_min': 1500,
-            'v_max': 6000,
-            'taper_width': 300,
-            'mode': 'pass',
-            'description': 'Removes slow horizontal noise (ground roll)'
-        },
-        'Air Wave Removal': {
-            'v_min': 400,
-            'v_max': 10000,
-            'taper_width': 100,
-            'mode': 'pass',
-            'description': 'Removes direct air wave (<400 m/s)'
-        },
-        'Reflection Pass': {
-            'v_min': 2000,
-            'v_max': 5000,
-            'taper_width': 200,
-            'mode': 'pass',
-            'description': 'Keeps typical reflection velocities'
-        },
-        'Steep Dip Only': {
-            'v_min': 4000,
-            'v_max': 8000,
-            'taper_width': 400,
-            'mode': 'pass',
-            'description': 'Keeps only steep events'
-        }
-    }
+    presets = {}
+    for name, params in _FK_PRESETS_METRIC.items():
+        preset = params.copy()
+        # Convert velocities if feet mode requested
+        if coordinate_units == 'feet':
+            preset['v_min'] = convert_velocity_from_metric(params['v_min'], 'feet')
+            preset['v_max'] = convert_velocity_from_metric(params['v_max'], 'feet')
+            preset['taper_width'] = convert_velocity_from_metric(params['taper_width'], 'feet')
+            # Update description to show ft/s
+            preset['description'] = preset['description'].replace('m/s', 'ft/s')
+        preset['coordinate_units'] = coordinate_units
+        presets[name] = preset
+    return presets

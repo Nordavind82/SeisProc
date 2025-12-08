@@ -5,15 +5,17 @@ Detects sub-gather boundaries within a gather based on header value changes.
 """
 import numpy as np
 import pandas as pd
-from typing import List, Optional
-from models.fk_config import SubGather
+from typing import List, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from models.fk_config import SubGather
 
 
 def detect_subgathers(
     headers_df: pd.DataFrame,
     boundary_header: str,
     min_traces: int = 8
-) -> List[SubGather]:
+) -> List["SubGather"]:
     """
     Detect sub-gathers based on header value changes.
 
@@ -56,6 +58,9 @@ def detect_subgathers(
 
     # Create boundary list: [0, change_points..., n_traces]
     boundaries = [0] + change_indices.tolist() + [n_traces]
+
+    # Import SubGather at runtime to avoid circular import
+    from models.fk_config import SubGather
 
     # Create SubGather objects
     subgathers = []
@@ -107,7 +112,7 @@ def detect_subgathers(
 
 def extract_subgather_traces(
     full_traces: np.ndarray,
-    subgather: SubGather
+    subgather: "SubGather"
 ) -> np.ndarray:
     """
     Extract traces for a specific sub-gather.
@@ -123,13 +128,64 @@ def extract_subgather_traces(
     return full_traces[:, subgather.start_trace:subgather.end_trace + 1]
 
 
+def _apply_segy_scalar(coordinates: np.ndarray, scalar_value: float) -> np.ndarray:
+    """
+    Apply SEGY coordinate scalar to coordinate values.
+
+    SEGY scalar convention:
+    - If scalar > 0: multiply coordinates by scalar
+    - If scalar < 0: divide coordinates by abs(scalar)
+    - If scalar == 0: no scaling (treat as 1)
+
+    Args:
+        coordinates: Array of coordinate values
+        scalar_value: SEGY scalar value
+
+    Returns:
+        Scaled coordinate values
+    """
+    if scalar_value == 0:
+        return coordinates.astype(float)
+    elif scalar_value < 0:
+        return coordinates.astype(float) / abs(scalar_value)
+    else:
+        return coordinates.astype(float) * scalar_value
+
+
+def _get_scalar_from_headers(headers_df: pd.DataFrame) -> float:
+    """
+    Extract SEGY coordinate scalar from headers.
+
+    Checks multiple possible column names for the scalar value.
+
+    Args:
+        headers_df: DataFrame with trace headers
+
+    Returns:
+        Scalar value (default 1.0 if not found)
+    """
+    # Possible scalar column names (in priority order)
+    scalar_columns = ['scalar_coord', 'scalco', 'ScalarCoord', 'SCALCO', 'ScalCo']
+
+    for col in scalar_columns:
+        if col in headers_df.columns:
+            scalar_val = headers_df[col].iloc[0]
+            if scalar_val != 0:
+                return float(scalar_val)
+
+    return 1.0  # Default: no scaling
+
+
 def calculate_subgather_trace_spacing(
     headers_df: pd.DataFrame,
-    subgather: SubGather,
+    subgather: "SubGather",
     default_spacing: float = 25.0
 ) -> float:
     """
     Calculate trace spacing for a specific sub-gather.
+
+    Properly applies SEGY coordinate scalars to ensure correct spacing
+    calculation regardless of how coordinates are stored in the file.
 
     Args:
         headers_df: DataFrame with trace headers
@@ -137,24 +193,52 @@ def calculate_subgather_trace_spacing(
         default_spacing: Default spacing if cannot be calculated
 
     Returns:
-        Trace spacing in meters
+        Trace spacing in coordinate units (meters or feet depending on SEGY file)
     """
     try:
         # Extract headers for this sub-gather
         sg_headers = headers_df.iloc[subgather.start_trace:subgather.end_trace + 1]
 
-        # Try to calculate from GroupX coordinates
+        # Get SEGY scalar for coordinate scaling
+        scalar = _get_scalar_from_headers(sg_headers)
+
+        # Try to calculate from GroupX coordinates (with scalar)
         if 'GroupX' in sg_headers.columns and len(sg_headers) > 1:
             group_x = sg_headers['GroupX'].values
-            spacings = np.abs(np.diff(group_x))
-            median_spacing = np.median(spacings[spacings > 0])
-            if median_spacing > 0 and median_spacing < 1000:  # Sanity check
-                return float(median_spacing)
+            group_x_scaled = _apply_segy_scalar(group_x, scalar)
+            spacings = np.abs(np.diff(group_x_scaled))
+            valid_spacings = spacings[spacings > 0]
+            if len(valid_spacings) > 0:
+                median_spacing = np.median(valid_spacings)
+                if median_spacing > 0 and median_spacing < 10000:  # Increased for feet
+                    return float(median_spacing)
 
-        # Try d3 header
+        # Try receiver_x with scalar (alternate column name)
+        if 'receiver_x' in sg_headers.columns and len(sg_headers) > 1:
+            rx = sg_headers['receiver_x'].values
+            rx_scaled = _apply_segy_scalar(rx, scalar)
+            spacings = np.abs(np.diff(rx_scaled))
+            valid_spacings = spacings[spacings > 0]
+            if len(valid_spacings) > 0:
+                median_spacing = np.median(valid_spacings)
+                if median_spacing > 0 and median_spacing < 10000:
+                    return float(median_spacing)
+
+        # Try CDP_X with scalar
+        if 'CDP_X' in sg_headers.columns and len(sg_headers) > 1:
+            cdp_x = sg_headers['CDP_X'].values
+            cdp_x_scaled = _apply_segy_scalar(cdp_x, scalar)
+            spacings = np.abs(np.diff(cdp_x_scaled))
+            valid_spacings = spacings[spacings > 0]
+            if len(valid_spacings) > 0:
+                median_spacing = np.median(valid_spacings)
+                if median_spacing > 0 and median_spacing < 10000:
+                    return float(median_spacing)
+
+        # Try d3 header (explicit spacing, no scalar needed)
         if 'd3' in sg_headers.columns:
             d3 = sg_headers['d3'].iloc[0]
-            if d3 > 0 and d3 < 1000:
+            if d3 > 0 and d3 < 10000:  # Increased limit for feet
                 return float(d3)
 
     except Exception as e:
@@ -219,7 +303,7 @@ def get_available_boundary_headers(headers_df: pd.DataFrame) -> List[str]:
 
 
 def validate_subgather_boundaries(
-    subgathers: List[SubGather],
+    subgathers: List["SubGather"],
     min_traces: int = 8
 ) -> tuple[bool, List[str]]:
     """

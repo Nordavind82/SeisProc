@@ -1,0 +1,155 @@
+# SeisProc - Seismic Data Processing QC Tool
+# Python project configuration
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "seisproc"
+version = "1.0.0"
+description = "Professional seismic data quality control application"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Geophysical Software"}
+]
+keywords = ["seismic", "geophysics", "signal processing", "qc", "segy"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+]
+
+dependencies = [
+    "numpy>=1.20",
+    "scipy>=1.7",
+    "pandas>=1.3",
+    "PyQt6>=6.4",
+    "pyqtgraph>=0.13",
+    "segyio>=1.9",
+    "zarr>=2.10",
+    "matplotlib>=3.5",
+    "torch>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pre-commit>=3.0",
+    "black>=24.0",
+    "isort>=5.13",
+    "flake8>=7.0",
+    "mypy>=1.9",
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "bandit>=1.7",
+]
+gpu = [
+    "numba>=0.57",
+]
+
+[project.scripts]
+seisproc = "main:main"
+
+[project.urls]
+Homepage = "https://github.com/geophysical-software/seisproc"
+Documentation = "https://github.com/geophysical-software/seisproc/docs"
+Repository = "https://github.com/geophysical-software/seisproc"
+
+# Black configuration
+[tool.black]
+line-length = 100
+target-version = ['py310', 'py311', 'py312']
+include = '\.pyi?$'
+exclude = '''
+/(
+    \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | venv
+  | _build
+  | buck-out
+  | build
+  | dist
+  | docs
+)/
+'''
+
+# isort configuration
+[tool.isort]
+profile = "black"
+line_length = 100
+skip_gitignore = true
+skip = ["venv", ".venv", "docs"]
+known_first_party = ["models", "views", "processors", "utils"]
+sections = ["FUTURE", "STDLIB", "THIRDPARTY", "FIRSTPARTY", "LOCALFOLDER"]
+
+# mypy configuration
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+no_strict_optional = true
+exclude = [
+    "venv",
+    "docs",
+    "tests",
+    "build",
+]
+
+[[tool.mypy.overrides]]
+module = [
+    "segyio.*",
+    "pyqtgraph.*",
+    "zarr.*",
+    "numba.*",
+]
+ignore_missing_imports = true
+
+# pytest configuration
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
+
+# coverage configuration
+[tool.coverage.run]
+source = ["models", "views", "processors", "utils"]
+omit = ["tests/*", "venv/*", "docs/*"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]
+
+# bandit security configuration
+[tool.bandit]
+exclude_dirs = ["tests", "venv", "docs"]
+skips = ["B101", "B311"]  # Skip assert and random warnings
+
+# setuptools configuration
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["models*", "views*", "processors*", "utils*"]
+exclude = ["tests*", "docs*", "venv*"]

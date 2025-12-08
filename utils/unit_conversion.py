@@ -258,3 +258,71 @@ def format_velocity(value_ms: float, decimals: int = 0,
                    units: Optional[str] = None) -> str:
     """Format velocity for display with units."""
     return UnitConverter.format_velocity(value_ms, decimals, units, show_units=True)
+
+
+def convert_velocity_to_metric(velocity: float, from_units: str) -> float:
+    """
+    Convert velocity to m/s (metric) for internal calculations.
+
+    Args:
+        velocity: Velocity value in source units
+        from_units: Source units ('meters' or 'feet')
+
+    Returns:
+        Velocity in m/s
+    """
+    if from_units == AppSettings.FEET or from_units == 'feet':
+        return velocity * FEET_TO_METERS  # ft/s to m/s
+    return velocity  # Already m/s
+
+
+def convert_velocity_from_metric(velocity_ms: float, to_units: str) -> float:
+    """
+    Convert velocity from m/s (metric) to display units.
+
+    Args:
+        velocity_ms: Velocity in m/s
+        to_units: Target units ('meters' or 'feet')
+
+    Returns:
+        Velocity in target units
+    """
+    if to_units == AppSettings.FEET or to_units == 'feet':
+        return velocity_ms * METERS_TO_FEET  # m/s to ft/s
+    return velocity_ms  # Already m/s
+
+
+def get_velocity_range_for_units(units: str) -> tuple:
+    """
+    Get appropriate velocity slider range for given units.
+
+    Args:
+        units: Coordinate units ('meters' or 'feet')
+
+    Returns:
+        Tuple of (min_velocity, max_velocity) for UI sliders
+    """
+    if units == AppSettings.FEET or units == 'feet':
+        # Typical seismic velocities in ft/s
+        # 300 m/s = 984 ft/s (ground roll minimum)
+        # 6000 m/s = 19685 ft/s (fast P-wave)
+        return (1, 65000)
+    else:
+        # Typical seismic velocities in m/s
+        return (1, 20000)
+
+
+def get_taper_range_for_units(units: str) -> tuple:
+    """
+    Get appropriate taper width slider range for given units.
+
+    Args:
+        units: Coordinate units ('meters' or 'feet')
+
+    Returns:
+        Tuple of (min_taper, max_taper) for UI sliders
+    """
+    if units == AppSettings.FEET or units == 'feet':
+        return (0, 6500)  # ~2000 m/s in ft/s
+    else:
+        return (0, 2000)

@@ -7,8 +7,12 @@ and background monitoring thread.
 import psutil
 import threading
 import time
+import logging
 from typing import Optional, Callable
 from PyQt6.QtCore import QObject, pyqtSignal
+
+# Set up module logger
+logger = logging.getLogger(__name__)
 
 
 class MemoryMonitor(QObject):
@@ -222,9 +226,12 @@ class MemoryMonitor(QObject):
                         # Reset flag when back below threshold
                         self._threshold_exceeded_flag = False
 
+            except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+                # Process-specific errors - expected during shutdown
+                logger.debug(f"Memory monitoring process error: {e}")
             except Exception as e:
-                # Silently handle errors in monitoring thread
-                pass
+                # Unexpected errors - log but continue monitoring
+                logger.warning(f"Memory monitoring error: {e}", exc_info=True)
 
             # Sleep with interruptible wait
             self._stop_event.wait(self.update_interval)

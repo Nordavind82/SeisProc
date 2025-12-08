@@ -35,9 +35,14 @@ from utils.trace_spacing import (
     analyze_offset_step_uniformity,
     OffsetStepAnalysis
 )
-from utils.unit_conversion import UnitConverter, format_distance, format_velocity
-from models.app_settings import get_settings
+from utils.unit_conversion import (
+    UnitConverter, format_distance, format_velocity,
+    get_velocity_range_for_units, get_taper_range_for_units
+)
 from datetime import datetime
+
+# Debug flag - set to True for verbose output during development
+FK_DEBUG = False
 
 
 class FKDesignerDialog(QDialog):
@@ -82,25 +87,26 @@ class FKDesignerDialog(QDialog):
         self.gather_headers = gather_headers
 
         # DEBUG: Initialization
-        print("\n" + "="*80)
-        print("FK DESIGNER INITIALIZATION DEBUG")
-        print("="*80)
-        print(f"Data shape: {gather_data.traces.shape}")
-        print(f"Coordinate units: {gather_data.coordinate_units}")
-        print(f"Unit symbol: {gather_data.unit_symbol}")
-        print(f"Initial trace_spacing param: {trace_spacing}")
-        print(f"Has headers: {gather_headers is not None}")
-        if gather_headers is not None:
-            print(f"  Headers shape: {gather_headers.shape}")
-            if 'GroupX' in gather_headers.columns:
-                gx = gather_headers['GroupX'].values[:5]
-                print(f"  First 5 GroupX: {gx}")
-                if len(gather_headers) > 1:
-                    spacing_calc = abs(gather_headers['GroupX'].values[1] - gather_headers['GroupX'].values[0])
-                    print(f"  GroupX[1] - GroupX[0]: {spacing_calc}")
+        if FK_DEBUG:
+            print("\n" + "="*80)
+            print("FK DESIGNER INITIALIZATION DEBUG")
+            print("="*80)
+            print(f"Data shape: {gather_data.traces.shape}")
+            print(f"Coordinate units: {gather_data.coordinate_units}")
+            print(f"Unit symbol: {gather_data.unit_symbol}")
+            print(f"Initial trace_spacing param: {trace_spacing}")
+            print(f"Has headers: {gather_headers is not None}")
+            if gather_headers is not None:
+                print(f"  Headers shape: {gather_headers.shape}")
+                if 'GroupX' in gather_headers.columns:
+                    gx = gather_headers['GroupX'].values[:5]
+                    print(f"  First 5 GroupX: {gx}")
+                    if len(gather_headers) > 1:
+                        spacing_calc = abs(gather_headers['GroupX'].values[1] - gather_headers['GroupX'].values[0])
+                        print(f"  GroupX[1] - GroupX[0]: {spacing_calc}")
 
         # Current filter parameters
-        self.filter_type = 'velocity'  # 'velocity', 'dip', or 'manual'
+        self.filter_type = 'velocity'  # 'velocity' or 'dip'
         self.v_min = 2000.0
         self.v_max = 6000.0
         self.v_min_enabled = True
@@ -151,6 +157,13 @@ class FKDesignerDialog(QDialog):
         self.freqs: Optional[np.ndarray] = None
         self.wavenumbers: Optional[np.ndarray] = None
 
+        # FK spectrum cache for memoization
+        # Cache key is hash of (data_id, trace_spacing, agc_state)
+        self._fk_cache_key: Optional[str] = None
+        self._cached_fk_spectrum: Optional[np.ndarray] = None
+        self._cached_freqs: Optional[np.ndarray] = None
+        self._cached_wavenumbers: Optional[np.ndarray] = None
+
         # Auto-update flag
         self.auto_update = True
 
@@ -163,22 +176,12 @@ class FKDesignerDialog(QDialog):
         self._apply_filter()
         self._update_displays()
 
-        # Connect to spatial units changes
-        get_settings().spatial_units_changed.connect(self._on_spatial_units_changed)
+        # Note: Units are now taken from data's coordinate_units, not app settings
 
     def _get_velocity_label(self, velocity: float) -> str:
         """Format velocity with native units."""
         unit = self.working_data.unit_symbol
         return f"{velocity:.0f} {unit}/s"
-
-    def _on_spatial_units_changed(self, new_units: str):
-        """Handle change in spatial units setting (deprecated - units now from data)."""
-        # Update all unit-dependent labels
-        self.v_min_label.setText(self._get_velocity_label(self.v_min))
-        self.v_max_label.setText(self._get_velocity_label(self.v_max))
-        self.taper_label.setText(self._get_velocity_label(self.taper_width))
-        self._update_trace_spacing_display()
-        self._update_fk_spectrum()  # Refresh to update axis labels
 
     def _init_ui(self):
         """Initialize user interface."""
@@ -308,7 +311,8 @@ class FKDesignerDialog(QDialog):
         self.preset_combo = QComboBox()
         self.preset_combo.addItem("Custom", None)
 
-        presets = get_fk_filter_presets()
+        # Get presets with correct velocity units based on data's coordinate system
+        presets = get_fk_filter_presets(self.gather_data.coordinate_units)
         for name, params in presets.items():
             self.preset_combo.addItem(name, params)
 
@@ -451,7 +455,7 @@ class FKDesignerDialog(QDialog):
         self.filter_type_combo = QComboBox()
         self.filter_type_combo.addItem("Velocity", 'velocity')
         self.filter_type_combo.addItem("Dip", 'dip')
-        self.filter_type_combo.addItem("Manual", 'manual')
+        # Manual mode removed - not yet implemented
         self.filter_type_combo.currentIndexChanged.connect(self._on_filter_type_changed)
         type_layout.addWidget(self.filter_type_combo)
         layout.addLayout(type_layout)
@@ -480,8 +484,15 @@ class FKDesignerDialog(QDialog):
         velocity_layout.addLayout(vmin_header)
 
         self.v_min_slider = QSlider(Qt.Orientation.Horizontal)
-        self.v_min_slider.setRange(1, 20000)  # 1 m/s to 20000 m/s
+        # Get velocity range based on coordinate units
+        v_range = get_velocity_range_for_units(self.gather_data.coordinate_units)
+        self.v_min_slider.setRange(v_range[0], v_range[1])
         self.v_min_slider.setValue(int(self.v_min))
+        self.v_min_slider.setToolTip(
+            "Minimum velocity boundary (m/s or ft/s).\n"
+            "In 'Pass' mode: Energy with apparent velocity below this is rejected.\n"
+            "In 'Reject' mode: Energy with apparent velocity below this is kept."
+        )
         self.v_min_slider.valueChanged.connect(self._on_v_min_changed)
 
         self.v_min_label = QLabel(self._get_velocity_label(self.v_min))
@@ -499,8 +510,13 @@ class FKDesignerDialog(QDialog):
         velocity_layout.addLayout(vmax_header)
 
         self.v_max_slider = QSlider(Qt.Orientation.Horizontal)
-        self.v_max_slider.setRange(1, 20000)  # 1 m/s to 20000 m/s
+        self.v_max_slider.setRange(v_range[0], v_range[1])  # Use same range as v_min
         self.v_max_slider.setValue(int(self.v_max))
+        self.v_max_slider.setToolTip(
+            "Maximum velocity boundary (m/s or ft/s).\n"
+            "In 'Pass' mode: Energy with apparent velocity above this is rejected.\n"
+            "In 'Reject' mode: Energy with apparent velocity above this is kept."
+        )
         self.v_max_slider.valueChanged.connect(self._on_v_max_changed)
 
         self.v_max_label = QLabel(self._get_velocity_label(self.v_max))
@@ -517,8 +533,9 @@ class FKDesignerDialog(QDialog):
         dip_layout = QVBoxLayout()
         dip_layout.setContentsMargins(0, 0, 0, 0)
 
-        # Info label
-        dip_info = QLabel("Dip in s/m (dt/dx)")
+        # Info label with correct unit
+        dip_unit = self.gather_data.unit_symbol
+        dip_info = QLabel(f"Dip in s/{dip_unit} (dt/dx)")
         dip_info.setStyleSheet("QLabel { font-size: 10px; color: gray; }")
         dip_layout.addWidget(dip_info)
 
@@ -536,7 +553,12 @@ class FKDesignerDialog(QDialog):
         self.dip_min_spin.setValue(self.dip_min)
         self.dip_min_spin.setSingleStep(0.001)
         self.dip_min_spin.setDecimals(4)
-        self.dip_min_spin.setSuffix(" s/m")
+        self.dip_min_spin.setSuffix(f" s/{dip_unit}")
+        self.dip_min_spin.setToolTip(
+            f"Negative dip boundary (dt/dx in s/{dip_unit}).\n"
+            "Defines the steepest left-dipping events to filter.\n"
+            "More negative = steeper left-dip."
+        )
         self.dip_min_spin.valueChanged.connect(self._on_dip_min_changed)
         dip_layout.addWidget(self.dip_min_spin)
 
@@ -553,7 +575,12 @@ class FKDesignerDialog(QDialog):
         self.dip_max_spin.setValue(self.dip_max)
         self.dip_max_spin.setSingleStep(0.001)
         self.dip_max_spin.setDecimals(4)
-        self.dip_max_spin.setSuffix(" s/m")
+        self.dip_max_spin.setSuffix(f" s/{dip_unit}")
+        self.dip_max_spin.setToolTip(
+            f"Positive dip boundary (dt/dx in s/{dip_unit}).\n"
+            "Defines the steepest right-dipping events to filter.\n"
+            "More positive = steeper right-dip."
+        )
         self.dip_max_spin.valueChanged.connect(self._on_dip_max_changed)
         dip_layout.addWidget(self.dip_max_spin)
 
@@ -561,23 +588,20 @@ class FKDesignerDialog(QDialog):
         layout.addWidget(self.dip_widget)
         self.dip_widget.setVisible(False)  # Hidden by default
 
-        # === MANUAL PARAMETERS ===
-        self.manual_widget = QWidget()
-        manual_layout = QVBoxLayout()
-        manual_layout.setContentsMargins(0, 0, 0, 0)
-        manual_info = QLabel("Manual mode: Define custom polygons\n(Not yet implemented)")
-        manual_info.setStyleSheet("QLabel { font-size: 10px; color: gray; font-style: italic; }")
-        manual_layout.addWidget(manual_info)
-        self.manual_widget.setLayout(manual_layout)
-        layout.addWidget(self.manual_widget)
-        self.manual_widget.setVisible(False)  # Hidden by default
+        # Manual mode widget removed - not yet implemented
 
         # === COMMON PARAMETERS ===
         # Taper width slider
         layout.addWidget(QLabel("Taper Width:"))
         self.taper_slider = QSlider(Qt.Orientation.Horizontal)
-        self.taper_slider.setRange(0, 2000)
+        taper_range = get_taper_range_for_units(self.gather_data.coordinate_units)
+        self.taper_slider.setRange(taper_range[0], taper_range[1])
         self.taper_slider.setValue(int(self.taper_width))
+        self.taper_slider.setToolTip(
+            "Width of the transition zone at velocity boundaries.\n"
+            "Larger values create smoother filter edges, reducing ringing.\n"
+            "0 = sharp cutoff, higher values = gradual transition."
+        )
         self.taper_slider.valueChanged.connect(self._on_taper_changed)
 
         self.taper_label = QLabel(self._get_velocity_label(self.taper_width))
@@ -830,13 +854,12 @@ class FKDesignerDialog(QDialog):
             self._apply_filter()
 
     def _on_filter_type_changed(self, index: int):
-        """Handle filter type change (velocity/dip/manual)."""
+        """Handle filter type change (velocity/dip)."""
         self.filter_type = self.filter_type_combo.currentData()
 
         # Show/hide appropriate parameter widgets
         self.velocity_widget.setVisible(self.filter_type == 'velocity')
         self.dip_widget.setVisible(self.filter_type == 'dip')
-        self.manual_widget.setVisible(self.filter_type == 'manual')
 
         # Mark as custom
         self.preset_combo.setCurrentIndex(0)
@@ -990,7 +1013,7 @@ class FKDesignerDialog(QDialog):
             # Validate
             is_valid, warnings = validate_subgather_boundaries(self.subgathers)
 
-            if warnings:
+            if warnings and FK_DEBUG:
                 for warning in warnings:
                     print(f"Sub-gather warning: {warning}")
 
@@ -1196,7 +1219,8 @@ class FKDesignerDialog(QDialog):
             use_subgathers=self.use_subgathers,
             boundary_header=self.boundary_header if self.use_subgathers else None,
             apply_agc=self.apply_agc,
-            agc_window_ms=self.agc_window_ms
+            agc_window_ms=self.agc_window_ms,
+            coordinate_units=self.gather_data.coordinate_units
         )
 
         # Save via config manager
@@ -1216,12 +1240,51 @@ class FKDesignerDialog(QDialog):
 
     # Processing methods
 
+    def _get_fk_cache_key(self, traces: np.ndarray) -> str:
+        """
+        Generate cache key for FK spectrum memoization.
+
+        Args:
+            traces: Input trace data
+
+        Returns:
+            Unique cache key string
+        """
+        import hashlib
+        # Create hash from data shape, a sample of values, and relevant parameters
+        data_hash = hashlib.md5(
+            traces.tobytes()[:10000] +  # First ~10KB of data
+            str(traces.shape).encode() +
+            str(self.working_trace_spacing).encode() +
+            str(self.working_data.sample_rate).encode() +
+            str(self.preview_with_agc and self.apply_agc).encode() +
+            str(self.agc_window_ms if self.apply_agc else 0).encode()
+        ).hexdigest()
+        return data_hash
+
+    def _invalidate_fk_cache(self):
+        """
+        Invalidate the FK spectrum cache.
+
+        Call this when the underlying data changes and a fresh FFT is required.
+        """
+        self._fk_cache_key = None
+        self._cached_fk_spectrum = None
+        self._cached_freqs = None
+        self._cached_wavenumbers = None
+
     def _compute_fk_spectrum(self):
-        """Compute FK spectrum of working data (with optional AGC for preview and filtered display)."""
+        """
+        Compute FK spectrum of working data (with optional AGC for preview and filtered display).
+
+        Uses memoization to cache FFT results - only recomputes when input data changes.
+        Filter parameters can change without requiring spectrum recomputation.
+        """
         # Choose data source: filtered or input
         if self.fk_show_filtered and self.filtered_data is not None:
-            # Show FK spectrum of filtered data
+            # Show FK spectrum of filtered data - always recompute (no caching for filtered)
             traces = self.filtered_data.traces
+            use_cache = False
         else:
             # Show FK spectrum of input data (default)
             traces = self.working_data.traces
@@ -1236,7 +1299,21 @@ class FKDesignerDialog(QDialog):
                     self.agc_window_ms
                 )
 
-        # Create processor for FK computation
+            use_cache = True
+
+        # Check if we can use cached spectrum
+        if use_cache:
+            cache_key = self._get_fk_cache_key(traces)
+            if cache_key == self._fk_cache_key and self._cached_fk_spectrum is not None:
+                # Use cached results
+                self.fk_spectrum = self._cached_fk_spectrum
+                self.freqs = self._cached_freqs
+                self.wavenumbers = self._cached_wavenumbers
+                if FK_DEBUG:
+                    print(f"[FK Cache HIT] Using cached spectrum (key: {cache_key[:8]}...)")
+                return
+
+        # Create processor for FK computation (only need it for compute_fk_spectrum method)
         processor = FKFilter(
             filter_type=self.filter_type,
             v_min=self.v_min,
@@ -1249,7 +1326,8 @@ class FKDesignerDialog(QDialog):
             dip_max_enabled=self.dip_max_enabled,
             taper_width=self.taper_width,
             mode=self.mode,
-            trace_spacing=self.working_trace_spacing
+            trace_spacing=self.working_trace_spacing,
+            coordinate_units=self.gather_data.coordinate_units
         )
 
         # Compute FK spectrum
@@ -1257,12 +1335,13 @@ class FKDesignerDialog(QDialog):
         sample_rate_hz = 1000.0 / self.working_data.sample_rate
 
         # DEBUG: FK spectrum calculation
-        print("\n" + "="*80)
-        print("FK SPECTRUM COMPUTATION DEBUG")
-        print("="*80)
-        print(f"Traces shape: {traces.shape}")
-        print(f"Sample rate: {sample_rate_hz} Hz")
-        print(f"Working trace spacing: {self.working_trace_spacing} {self.working_data.unit_symbol}")
+        if FK_DEBUG:
+            print("\n" + "="*80)
+            print("FK SPECTRUM COMPUTATION DEBUG")
+            print("="*80)
+            print(f"Traces shape: {traces.shape}")
+            print(f"Sample rate: {sample_rate_hz} Hz")
+            print(f"Working trace spacing: {self.working_trace_spacing} {self.working_data.unit_symbol}")
 
         self.fk_spectrum, self.freqs, self.wavenumbers = processor.compute_fk_spectrum(
             traces,
@@ -1270,14 +1349,24 @@ class FKDesignerDialog(QDialog):
             self.working_trace_spacing
         )
 
+        # Cache results for input data
+        if use_cache:
+            self._fk_cache_key = cache_key
+            self._cached_fk_spectrum = self.fk_spectrum
+            self._cached_freqs = self.freqs
+            self._cached_wavenumbers = self.wavenumbers
+            if FK_DEBUG:
+                print(f"[FK Cache MISS] Computed and cached new spectrum (key: {cache_key[:8]}...)")
+
         # DEBUG: FK spectrum results
-        print(f"\nFK Spectrum results:")
-        print(f"  Frequencies: {self.freqs.min():.2f} to {self.freqs.max():.2f} Hz")
-        print(f"  Wavenumbers: {self.wavenumbers.min():.8f} to {self.wavenumbers.max():.8f} cycles/{self.working_data.unit_symbol}")
-        print(f"  Wavenumbers (milli): {self.wavenumbers.min()*1000:.5f} to {self.wavenumbers.max()*1000:.5f} mcycles/{self.working_data.unit_symbol}")
-        k_nyquist = 1.0 / (2.0 * self.working_trace_spacing)
-        print(f"  Expected Nyquist: {k_nyquist:.8f} cycles/{self.working_data.unit_symbol}")
-        print(f"  Expected Nyquist (milli): {k_nyquist*1000:.5f} mcycles/{self.working_data.unit_symbol}")
+        if FK_DEBUG:
+            print(f"\nFK Spectrum results:")
+            print(f"  Frequencies: {self.freqs.min():.2f} to {self.freqs.max():.2f} Hz")
+            print(f"  Wavenumbers: {self.wavenumbers.min():.8f} to {self.wavenumbers.max():.8f} cycles/{self.working_data.unit_symbol}")
+            print(f"  Wavenumbers (milli): {self.wavenumbers.min()*1000:.5f} to {self.wavenumbers.max()*1000:.5f} mcycles/{self.working_data.unit_symbol}")
+            k_nyquist = 1.0 / (2.0 * self.working_trace_spacing)
+            print(f"  Expected Nyquist: {k_nyquist:.8f} cycles/{self.working_data.unit_symbol}")
+            print(f"  Expected Nyquist (milli): {k_nyquist*1000:.5f} mcycles/{self.working_data.unit_symbol}")
 
     def _apply_filter(self):
         """Apply current filter parameters and update results (with optional AGC)."""
@@ -1317,7 +1406,8 @@ class FKDesignerDialog(QDialog):
                 dip_max_enabled=self.dip_max_enabled,
                 taper_width=self.taper_width,
                 mode=self.mode,
-                trace_spacing=self.working_trace_spacing
+                trace_spacing=self.working_trace_spacing,
+                coordinate_units=self.gather_data.coordinate_units
             )
 
             # Apply FK filter
@@ -1458,17 +1548,19 @@ class FKDesignerDialog(QDialog):
 
     def _draw_velocity_lines(self, freqs: np.ndarray, wavenumbers: np.ndarray):
         """Draw velocity lines on FK spectrum."""
-        # DEBUG: Velocity line drawing
-        print("\n" + "="*80)
-        print("VELOCITY LINE DRAWING DEBUG")
-        print("="*80)
         unit = self.working_data.unit_symbol
-        print(f"Units: {unit}")
-        print(f"v_min: {self.v_min} {unit}/s (enabled: {self.v_min_enabled})")
-        print(f"v_max: {self.v_max} {unit}/s (enabled: {self.v_max_enabled})")
-        print(f"taper_width: {self.taper_width} {unit}/s")
-        print(f"Wavenumber range: {wavenumbers.min():.8f} to {wavenumbers.max():.8f} cycles/{unit}")
-        print(f"Frequency range: {freqs.min():.2f} to {freqs.max():.2f} Hz")
+
+        # DEBUG: Velocity line drawing
+        if FK_DEBUG:
+            print("\n" + "="*80)
+            print("VELOCITY LINE DRAWING DEBUG")
+            print("="*80)
+            print(f"Units: {unit}")
+            print(f"v_min: {self.v_min} {unit}/s (enabled: {self.v_min_enabled})")
+            print(f"v_max: {self.v_max} {unit}/s (enabled: {self.v_max_enabled})")
+            print(f"taper_width: {self.taper_width} {unit}/s")
+            print(f"Wavenumber range: {wavenumbers.min():.8f} to {wavenumbers.max():.8f} cycles/{unit}")
+            print(f"Frequency range: {freqs.min():.2f} to {freqs.max():.2f} Hz")
 
         # Velocity lines: f = v * k (for positive and negative slopes)
         # Create dense k array for smooth line drawing (500 points)
@@ -1476,9 +1568,10 @@ class FKDesignerDialog(QDialog):
         k_display = np.linspace(k_min, k_max, 500)
         f_max = freqs.max()
 
-        print(f"\nLine drawing setup:")
-        print(f"  k_display: {len(k_display)} points from {k_min:.8f} to {k_max:.8f}")
-        print(f"  f_max: {f_max:.2f} Hz")
+        if FK_DEBUG:
+            print(f"\nLine drawing setup:")
+            print(f"  k_display: {len(k_display)} points from {k_min:.8f} to {k_max:.8f}")
+            print(f"  f_max: {f_max:.2f} Hz")
 
         # Define velocities to draw (only if enabled)
         velocities = []
@@ -1509,17 +1602,19 @@ class FKDesignerDialog(QDialog):
                 continue
 
             # DEBUG: Line calculation
-            print(f"\n  Drawing line for v={v:.0f} {unit}/s ({color} {style}):")
+            if FK_DEBUG:
+                print(f"\n  Drawing line for v={v:.0f} {unit}/s ({color} {style}):")
 
             # Positive k: f = v * k
             k_pos = k_display[k_display >= 0]
             if len(k_pos) > 0:
                 f_pos = v * k_pos
                 f_pos_clipped = np.clip(f_pos, 0, f_max)
-                print(f"    Positive k: {len(k_pos)} points, range [{k_pos[0]:.8f}, {k_pos[-1]:.8f}] cycles/{unit}")
-                print(f"    f = v*k: range [{f_pos[0]:.3f}, {f_pos[-1]:.3f}] Hz (before clip)")
-                print(f"    f (clipped): range [{f_pos_clipped[0]:.3f}, {f_pos_clipped[-1]:.3f}] Hz")
-                print(f"    -> This line should go from (k={k_pos[0]:.6f}, f={f_pos_clipped[0]:.1f}) to (k={k_pos[-1]:.6f}, f={f_pos_clipped[-1]:.1f})")
+                if FK_DEBUG:
+                    print(f"    Positive k: {len(k_pos)} points, range [{k_pos[0]:.8f}, {k_pos[-1]:.8f}] cycles/{unit}")
+                    print(f"    f = v*k: range [{f_pos[0]:.3f}, {f_pos[-1]:.3f}] Hz (before clip)")
+                    print(f"    f (clipped): range [{f_pos_clipped[0]:.3f}, {f_pos_clipped[-1]:.3f}] Hz")
+                    print(f"    -> This line should go from (k={k_pos[0]:.6f}, f={f_pos_clipped[0]:.1f}) to (k={k_pos[-1]:.6f}, f={f_pos_clipped[-1]:.1f})")
                 pen = pg.mkPen(color, width=line_width, style={'--': Qt.PenStyle.DashLine, '-': Qt.PenStyle.SolidLine}[style])
                 self.fk_plot.plot(k_pos, f_pos_clipped, pen=pen)
 
@@ -1528,8 +1623,9 @@ class FKDesignerDialog(QDialog):
             if len(k_neg) > 0:
                 f_neg = v * np.abs(k_neg)
                 f_neg = np.clip(f_neg, 0, f_max)
-                print(f"    Negative k: {len(k_neg)} points, range [{k_neg[0]:.8f}, {k_neg[-1]:.8f}] cycles/{unit}")
-                print(f"    -> Mirror line from (k={k_neg[0]:.6f}, f={f_neg[0]:.1f}) to (k={k_neg[-1]:.6f}, f={f_neg[-1]:.1f})")
+                if FK_DEBUG:
+                    print(f"    Negative k: {len(k_neg)} points, range [{k_neg[0]:.8f}, {k_neg[-1]:.8f}] cycles/{unit}")
+                    print(f"    -> Mirror line from (k={k_neg[0]:.6f}, f={f_neg[0]:.1f}) to (k={k_neg[-1]:.6f}, f={f_neg[-1]:.1f})")
                 pen = pg.mkPen(color, width=line_width, style={'--': Qt.PenStyle.DashLine, '-': Qt.PenStyle.SolidLine}[style])
                 self.fk_plot.plot(k_neg, f_neg, pen=pen)
 
@@ -1887,11 +1983,12 @@ class FKDesignerDialog(QDialog):
         Returns:
             TraceSpacingStats object with spacing and statistics
         """
-        print("\n" + "="*80)
-        print("TRACE SPACING CALCULATION DEBUG")
-        print("="*80)
-        print(f"Has headers: {self.gather_headers is not None}")
-        print(f"Use subgathers: {self.use_subgathers}")
+        if FK_DEBUG:
+            print("\n" + "="*80)
+            print("TRACE SPACING CALCULATION DEBUG")
+            print("="*80)
+            print(f"Has headers: {self.gather_headers is not None}")
+            print(f"Use subgathers: {self.use_subgathers}")
 
         if self.gather_headers is None:
             # No headers available, use default
@@ -1911,7 +2008,8 @@ class FKDesignerDialog(QDialog):
             )
 
         if self.use_subgathers and self.current_subgather is not None:
-            print(f"Calculating for sub-gather {self.current_subgather_index + 1}")
+            if FK_DEBUG:
+                print(f"Calculating for sub-gather {self.current_subgather_index + 1}")
             # Calculate for current sub-gather
             stats = calculate_subgather_trace_spacing_with_stats(
                 self.gather_headers,
@@ -1920,20 +2018,22 @@ class FKDesignerDialog(QDialog):
                 default_spacing=self.trace_spacing
             )
         else:
-            print("Calculating for full gather")
+            if FK_DEBUG:
+                print("Calculating for full gather")
             # Calculate for full gather
             stats = calculate_trace_spacing_with_stats(
                 self.gather_headers,
                 default_spacing=self.trace_spacing
             )
 
-        print(f"\nResult:")
-        print(f"  Spacing: {stats.spacing:.2f}")
-        print(f"  Source: {stats.coordinate_source}")
-        print(f"  Scalar: {stats.scalar_applied}")
-        print(f"  n_spacings: {stats.n_spacings}")
-        if len(stats.spacings_all) > 0:
-            print(f"  First 5 spacings: {stats.spacings_all[:5]}")
+        if FK_DEBUG:
+            print(f"\nResult:")
+            print(f"  Spacing: {stats.spacing:.2f}")
+            print(f"  Source: {stats.coordinate_source}")
+            print(f"  Scalar: {stats.scalar_applied}")
+            print(f"  n_spacings: {stats.n_spacings}")
+            if len(stats.spacings_all) > 0:
+                print(f"  First 5 spacings: {stats.spacings_all[:5]}")
 
         return stats
 

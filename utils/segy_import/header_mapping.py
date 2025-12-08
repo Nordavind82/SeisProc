@@ -241,6 +241,19 @@ class HeaderMapping:
         """Check if any computed headers are configured."""
         return len(self.computed_fields) > 0
 
+    def get_all_mappings(self) -> Dict[str, int]:
+        """
+        Get all header field name to byte position mappings.
+
+        Returns:
+            Dictionary mapping field names to segyio byte locations.
+            Byte positions are 1-based as per SEG-Y convention.
+
+        Note:
+            This is used for batch header reading with segyio.attributes()
+        """
+        return {name: field.byte_position for name, field in self.fields.items()}
+
     def read_headers(self, header_bytes: bytes, trace_idx: int = -1,
                     compute_headers: bool = True) -> Dict[str, any]:
         """

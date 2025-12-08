@@ -27,6 +27,7 @@ os.environ['QT_SCALE_FACTOR'] = '1'                      # Disable automatic sca
 
 from PyQt6.QtWidgets import QApplication
 from main_window import MainWindow
+from utils.theme_manager import get_theme_manager
 
 
 def main():
@@ -38,6 +39,10 @@ def main():
     app.setApplicationName("Seismic QC Tool")
     app.setOrganizationName("Geophysical Software")
     app.setApplicationVersion("1.0.0")
+
+    # Apply theme from saved preferences
+    theme_manager = get_theme_manager()
+    theme_manager.apply_to_app()
 
     # Create and show main window
     window = MainWindow()

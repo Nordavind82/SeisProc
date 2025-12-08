@@ -12,14 +12,139 @@ Features:
 import numpy as np
 import pyqtgraph as pg
 from pyqtgraph import ImageView, GraphicsLayoutWidget
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton, QToolBar
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QAction, QPainter
+from PyQt6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
+    QPushButton, QToolBar, QFrame, QGraphicsOpacityEffect
+)
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve
+from PyQt6.QtGui import QAction, QPainter, QColor, QLinearGradient, QPalette
 import sys
 from models.seismic_data import SeismicData
 from models.lazy_seismic_data import LazySeismicData
 from models.viewport_state import ViewportState, ViewportLimits
 from utils.window_cache import WindowCache
+
+
+class LoadingOverlay(QFrame):
+    """
+    Semi-transparent loading overlay with animated gradient skeleton.
+
+    Provides visual feedback while data is being loaded.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("LoadingOverlay")
+
+        # Make the overlay semi-transparent
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        # Styling for a subtle skeleton effect
+        self.setStyleSheet("""
+            QFrame#LoadingOverlay {
+                background-color: rgba(245, 245, 245, 200);
+                border: none;
+            }
+        """)
+
+        # Layout with loading message
+        layout = QVBoxLayout(self)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self._loading_label = QLabel("Loading data...")
+        self._loading_label.setStyleSheet("""
+            QLabel {
+                color: #666666;
+                font-size: 14px;
+                font-weight: bold;
+                padding: 10px 20px;
+                background-color: rgba(255, 255, 255, 180);
+                border-radius: 5px;
+            }
+        """)
+        self._loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self._loading_label)
+
+        # Animation for shimmer effect
+        self._animation_offset = 0
+        self._animation_timer = QTimer(self)
+        self._animation_timer.timeout.connect(self._animate_shimmer)
+
+        # Fade animation
+        self._opacity_effect = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(self._opacity_effect)
+        self._opacity_effect.setOpacity(0)
+
+        self._fade_animation = QPropertyAnimation(self._opacity_effect, b"opacity")
+        self._fade_animation.setDuration(150)  # 150ms fade
+        self._fade_animation.setEasingCurve(QEasingCurve.Type.InOutQuad)
+
+        self.hide()
+
+    def show_loading(self, message: str = "Loading data..."):
+        """Show the loading overlay with fade-in animation."""
+        self._loading_label.setText(message)
+        self.show()
+        self.raise_()
+
+        # Fade in
+        self._fade_animation.stop()
+        self._fade_animation.setStartValue(self._opacity_effect.opacity())
+        self._fade_animation.setEndValue(1.0)
+        self._fade_animation.start()
+
+        # Start shimmer animation
+        self._animation_timer.start(50)  # 20 FPS shimmer
+
+    def hide_loading(self):
+        """Hide the loading overlay with fade-out animation."""
+        self._animation_timer.stop()
+
+        # Fade out
+        self._fade_animation.stop()
+        self._fade_animation.setStartValue(self._opacity_effect.opacity())
+        self._fade_animation.setEndValue(0.0)
+        self._fade_animation.finished.connect(self._on_fade_complete)
+        self._fade_animation.start()
+
+    def _on_fade_complete(self):
+        """Called when fade-out completes."""
+        self._fade_animation.finished.disconnect(self._on_fade_complete)
+        if self._opacity_effect.opacity() < 0.1:
+            self.hide()
+
+    def _animate_shimmer(self):
+        """Animate shimmer effect by updating gradient offset."""
+        self._animation_offset = (self._animation_offset + 10) % 200
+        # Force repaint for shimmer effect (optional, mainly for skeleton patterns)
+        self.update()
+
+    def paintEvent(self, event):
+        """Custom paint for gradient skeleton effect."""
+        super().paintEvent(event)
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # Draw subtle animated gradient stripes (skeleton pattern)
+        rect = self.rect()
+
+        # Create gradient for skeleton shimmer
+        gradient = QLinearGradient(
+            rect.left() + self._animation_offset - 100,
+            rect.top(),
+            rect.left() + self._animation_offset + 100,
+            rect.bottom()
+        )
+        gradient.setColorAt(0.0, QColor(230, 230, 230, 50))
+        gradient.setColorAt(0.5, QColor(250, 250, 250, 100))
+        gradient.setColorAt(1.0, QColor(230, 230, 230, 50))
+
+        painter.setBrush(gradient)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRect(rect)
+
+        painter.end()
 
 
 class SeismicViewerPyQtGraph(QWidget):
@@ -34,6 +159,9 @@ class SeismicViewerPyQtGraph(QWidget):
     - Right Mouse Drag: Box zoom
     - Middle Mouse: Reset view
     """
+
+    # Signal emitted when user clicks on a trace
+    trace_clicked = pyqtSignal(int)  # trace_index
 
     def __init__(self, title: str, viewport_state: ViewportState, parent=None):
         super().__init__(parent)
@@ -113,6 +241,11 @@ class SeismicViewerPyQtGraph(QWidget):
 
         layout.addWidget(self.graphics_widget)
         self.setLayout(layout)
+
+        # Create loading overlay (positioned over graphics widget)
+        self._loading_overlay = LoadingOverlay(self)
+        self._loading_overlay.hide()
+        self._is_loading = False
 
     def _create_toolbar(self) -> QWidget:
         """Create toolbar with zoom mode controls."""
@@ -272,6 +405,28 @@ class SeismicViewerPyQtGraph(QWidget):
         # Connect range change signal for synchronization
         self.view_box.sigRangeChanged.connect(self._on_view_range_changed)
 
+        # Connect mouse click for trace selection (for ISA)
+        self.image_item.mouseClickEvent = self._on_image_clicked
+
+    def _on_image_clicked(self, event):
+        """Handle mouse click on image - emit trace index."""
+        if self.data is None:
+            return
+
+        # Get click position in scene coordinates
+        pos = event.pos()
+
+        # Map to data coordinates
+        mouse_point = self.image_item.mapToData(pos)
+        trace_idx = int(round(mouse_point.x()))
+
+        # Validate trace index
+        if 0 <= trace_idx < self.data.n_traces:
+            self.trace_clicked.emit(trace_idx)
+
+        # Let PyQtGraph handle the event normally
+        event.accept()
+
     def _on_zoom_mode_changed(self, index: int):
         """Handle zoom mode change."""
         if index == 0:  # Both axes
@@ -428,14 +583,28 @@ class SeismicViewerPyQtGraph(QWidget):
         window_data = self._window_cache.get(cache_key)
 
         if window_data is None:
-            # Cache miss - load from Zarr
-            window_data = self.lazy_data.get_window(
-                load_time_start, load_time_end,
-                load_trace_start, load_trace_end
-            )
+            # Cache miss - show loading indicator for potentially slow I/O
+            n_traces_loading = load_trace_end - load_trace_start
+            n_samples_loading = int((load_time_end - load_time_start) / self.lazy_data.sample_rate)
+            data_size = n_traces_loading * n_samples_loading
 
-            # Add to cache
-            self._window_cache.put(cache_key, window_data)
+            # Only show loading for large windows (> 1M samples)
+            show_loading = data_size > 1_000_000
+            if show_loading:
+                self._show_loading(f"Loading {n_traces_loading} traces...")
+
+            try:
+                # Load from Zarr
+                window_data = self.lazy_data.get_window(
+                    load_time_start, load_time_end,
+                    load_trace_start, load_trace_end
+                )
+
+                # Add to cache
+                self._window_cache.put(cache_key, window_data)
+            finally:
+                if show_loading:
+                    self._hide_loading()
 
         # Cache the loaded window (for backward compat with single-window logic)
         self._cached_window = window_data
@@ -614,6 +783,65 @@ class SeismicViewerPyQtGraph(QWidget):
         self._cached_bounds = None
         self._window_cache.clear()
         self.image_item.clear()
+
+    def resizeEvent(self, event):
+        """Handle resize to keep loading overlay sized correctly."""
+        super().resizeEvent(event)
+        # Resize loading overlay to match graphics widget area
+        if hasattr(self, '_loading_overlay') and hasattr(self, 'graphics_widget'):
+            # Position overlay over the graphics widget
+            geo = self.graphics_widget.geometry()
+            self._loading_overlay.setGeometry(geo)
+
+    def _show_loading(self, message: str = "Loading data..."):
+        """Show loading overlay with message."""
+        if hasattr(self, '_loading_overlay'):
+            self._is_loading = True
+            # Update geometry before showing
+            geo = self.graphics_widget.geometry()
+            self._loading_overlay.setGeometry(geo)
+            self._loading_overlay.show_loading(message)
+
+    def _hide_loading(self):
+        """Hide loading overlay."""
+        if hasattr(self, '_loading_overlay'):
+            self._is_loading = False
+            self._loading_overlay.hide_loading()
+
+    def cleanup(self):
+        """
+        Release resources before destruction.
+
+        Call this method before closing the viewer to ensure
+        proper cleanup of cached data and references.
+        """
+        # Clear all cached data
+        self._window_cache.clear()
+        self._cached_window = None
+        self._cached_bounds = None
+
+        # Release data references
+        self.data = None
+        self.lazy_data = None
+        self._lazy_data_id = None
+
+        # Disconnect viewport state signals to prevent callbacks after cleanup
+        try:
+            self.viewport_state.limits_changed.disconnect(self._on_limits_changed)
+            self.viewport_state.amplitude_range_changed.disconnect(self._on_amplitude_range_changed)
+            self.viewport_state.colormap_changed.disconnect(self._on_colormap_changed)
+            self.viewport_state.interpolation_changed.disconnect(self._on_interpolation_changed)
+        except (RuntimeError, TypeError):
+            # Signals may already be disconnected
+            pass
+
+    def __del__(self):
+        """Cleanup on deletion."""
+        try:
+            self.cleanup()
+        except Exception:
+            # Ignore errors during garbage collection
+            pass
 
     def get_cache_stats(self):
         """

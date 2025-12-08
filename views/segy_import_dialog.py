@@ -20,6 +20,15 @@ from utils.segy_import.header_mapping import HeaderMapping, HeaderField, Standar
 from utils.segy_import.computed_headers import ComputedHeaderField
 from utils.segy_import.segy_reader import SEGYReader
 from utils.segy_import.data_storage import DataStorage
+from utils.segy_import import (
+    DEFAULT_CHUNK_SIZE,
+    HEADER_BATCH_SIZE,
+    PARALLEL_THRESHOLD,
+    ParallelImportCoordinator,
+    ImportConfig,
+    ImportProgress,
+    get_optimal_workers,
+)
 from models.seismic_data import SeismicData
 from models.app_settings import get_settings, AppSettings
 
@@ -38,7 +47,7 @@ class SEGYImportDialog(QDialog):
 
     import_completed = pyqtSignal(object, object, object, str)  # data (SeismicData or LazySeismicData), headers_df, ensembles_df, file_path
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, initial_file: str = None):
         logger.info("SEGYImportDialog.__init__() - START")
         try:
             # CRITICAL: Set attribute to disable OpenGL before any widget creation
@@ -61,6 +70,7 @@ class SEGYImportDialog(QDialog):
             self.segy_file = None
             self.header_mapping = HeaderMapping()
             self.reader = None
+            self._initial_file = initial_file  # Store for loading after UI init
             logger.info("  ✓ Instance variables initialized")
 
             logger.info("  → Calling _init_ui()...")
@@ -71,10 +81,22 @@ class SEGYImportDialog(QDialog):
             self._load_standard_headers()
             logger.info("  ✓ _load_standard_headers() complete")
 
+            # Load initial file if provided (from recent files)
+            if self._initial_file:
+                logger.info(f"  → Loading initial file: {self._initial_file}")
+                self._load_initial_file()
+                logger.info("  ✓ Initial file loaded")
+
             logger.info("SEGYImportDialog.__init__() - COMPLETE")
         except Exception as e:
             logger.error(f"SEGYImportDialog.__init__() - FAILED: {e}", exc_info=True)
             raise
+
+    def _load_initial_file(self):
+        """Load the initial file specified at construction (for recent files)."""
+        if self._initial_file and Path(self._initial_file).exists():
+            self.file_path_edit.setText(self._initial_file)
+            self._on_file_selected(self._initial_file)
 
     def _init_ui(self):
         """Initialize user interface."""
@@ -301,11 +323,20 @@ class SEGYImportDialog(QDialog):
         self.spatial_units_combo.addItem("Feet (ft)", AppSettings.FEET)
         logger.info("        ✓ Combo items added")
 
-        # Set current value from settings (use default to avoid crash)
-        logger.info("        → Setting default units (meters)...")
-        # TODO: Load from settings after dialog is shown (to avoid QSettings crash during init)
-        self.spatial_units_combo.setCurrentIndex(0)  # Default to meters
-        logger.info("        ✓ Default units set")
+        # Set current value from AppSettings
+        logger.info("        → Loading units from settings...")
+        try:
+            from models.app_settings import get_settings
+            app_settings = get_settings()
+            current_units = app_settings.get_spatial_units()
+            if current_units == 'feet':
+                self.spatial_units_combo.setCurrentIndex(1)
+            else:
+                self.spatial_units_combo.setCurrentIndex(0)
+            logger.info(f"        ✓ Units loaded: {current_units}")
+        except Exception as e:
+            logger.warning(f"        Could not load units from settings: {e}")
+            self.spatial_units_combo.setCurrentIndex(0)  # Default to meters
 
         self.spatial_units_combo.setToolTip(
             "Select spatial units for coordinates and distances.\n"
@@ -552,6 +583,8 @@ The binary header contains file-level metadata about the entire SEG-Y dataset.
         """Update SEG-Y reader with current header mapping."""
         if self.segy_file:
             self._update_mapping_from_table()
+            # Use simple SEGYReader for preview and small operations
+            # Large file import uses multiprocess coordinator
             self.reader = SEGYReader(self.segy_file, self.header_mapping)
 
     def _create_format_combo(self, default_format: str = 'i') -> QComboBox:
@@ -906,27 +939,36 @@ The binary header contains file-level metadata about the entire SEG-Y dataset.
                 self.header_mapping.set_ensemble_keys(ensemble_keys)
             logger.info(f"  ✓ Ensemble keys: {ensemble_keys}")
 
-            # Get spatial units selection (don't save to QSettings - causes crash)
+            # Get spatial units selection and save to AppSettings
             logger.info("  → Getting selected units...")
             selected_units = self.spatial_units_combo.currentData()
             logger.info(f"  ✓ Selected units: {selected_units}")
 
-            # NOTE: Not saving to QSettings to avoid segfault in WSL2/problematic environments
-            # The selected units will be used for this import session only
-            print(f"Spatial units set to: {selected_units}")
+            # Get AppSettings instance
+            from models.app_settings import get_settings
+            app_settings = get_settings()
 
-            # Ask for output directory (THIS MAY CRASH WITH NATIVE DIALOG)
-            logger.info("  → Opening directory dialog (may crash here)...")
-            output_dir = QFileDialog.getExistingDirectory(
-                self,
-                "Select Output Directory for Zarr/Parquet Storage",
-                "",
-                options=QFileDialog.Option.DontUseNativeDialog  # CRITICAL: Prevent native dialog crash
-            )
-            logger.info(f"  ✓ Directory dialog returned: {output_dir}")
+            # Save to AppSettings (uses JSON file, no QSettings crash)
+            try:
+                app_settings.set_spatial_units(selected_units)
+                logger.info(f"  ✓ Spatial units saved to settings: {selected_units}")
+            except Exception as e:
+                logger.warning(f"  Could not save spatial units: {e}")
 
-            if not output_dir:
-                return
+            # Determine output directory
+            # Use configured storage directory + filename-based subdirectory
+            from pathlib import Path
+            from datetime import datetime
+
+            base_storage_dir = app_settings.get_effective_storage_directory()
+
+            # Create unique subdirectory based on filename and timestamp
+            segy_name = Path(self.segy_file).stem
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            subdir_name = f"{segy_name}_{timestamp}"
+
+            output_dir = str(base_storage_dir / subdir_name)
+            logger.info(f"  ✓ Using storage directory: {output_dir}")
 
             # Get file info to determine import strategy
             file_info = self.reader.read_file_info()
@@ -992,146 +1034,135 @@ The binary header contains file-level metadata about the entire SEG-Y dataset.
         self.accept()
 
     def _import_streaming(self, output_dir: str, file_info: dict, ensemble_keys: List[str]):
-        """Import using streaming method (for large files)."""
+        """Import using multiprocess parallel method (for large files)."""
         import time
         start_time = time.time()
 
         n_traces = file_info['n_traces']
         n_samples = file_info['n_samples']
+        n_workers = get_optimal_workers()
 
         # Create progress dialog
-        progress = QProgressDialog("Streaming import in progress...", "Cancel", 0, n_traces, self)
+        progress = QProgressDialog(
+            f"Parallel import with {n_workers} workers...",
+            "Cancel", 0, n_traces, self
+        )
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(0)
         progress.setValue(0)
 
-        storage = DataStorage(output_dir)
+        # Configure parallel import
+        config = ImportConfig(
+            segy_path=str(self.segy_file),
+            output_dir=output_dir,
+            header_mapping=self.header_mapping,
+            ensemble_key=ensemble_keys[0] if ensemble_keys else None,
+            n_workers=n_workers,
+            chunk_size=DEFAULT_CHUNK_SIZE
+        )
+
+        coordinator = ParallelImportCoordinator(config)
+        cancelled = False
 
         try:
-            # OPTIMIZED SINGLE-PASS IMPORT
-            # Reads the SEG-Y file ONCE and processes everything simultaneously
-            progress.setLabelText(f"Streaming {n_traces:,} traces (single-pass optimization)...")
-            trace_generator = self.reader.read_traces_in_chunks(chunk_size=5000)
-
-            def import_progress(current, total, phase):
+            # Progress callback
+            def on_progress(prog: ImportProgress):
+                nonlocal cancelled
                 if progress.wasCanceled():
-                    raise InterruptedError("Import cancelled by user")
-                progress.setValue(current)
+                    coordinator.cancel()
+                    cancelled = True
+                    return
+                progress.setValue(prog.current_traces)
+
+                # Format ETA
+                if prog.eta_seconds > 0 and prog.eta_seconds < float('inf'):
+                    eta_str = f"{prog.eta_seconds:.0f}s"
+                else:
+                    eta_str = "calculating..."
+
                 progress.setLabelText(
-                    f"Processing: {current:,}/{total:,} traces\n"
-                    f"(Writing Seismic Data to Zarr/Parquet internal format)"
+                    f"Phase: {prog.phase}\n"
+                    f"Progress: {prog.current_traces:,}/{prog.total_traces:,} traces\n"
+                    f"Workers: {prog.active_workers}, ETA: {eta_str}"
                 )
 
-            # Single-pass import: traces + headers + ensembles all at once!
-            import_stats = storage.save_all_streaming(
-                trace_generator,
-                n_samples=n_samples,
-                n_traces=n_traces,
-                ensemble_keys=ensemble_keys if ensemble_keys else None,
-                chunk_size=5000,
-                header_batch_size=10000,
-                progress_callback=import_progress
-            )
+            # Run parallel import
+            print(f"Starting parallel import with {n_workers} workers...")
+            result = coordinator.run(progress_callback=on_progress)
 
-            if progress.wasCanceled():
+            if cancelled:
                 raise InterruptedError("Import cancelled by user")
 
-            # Extract statistics from single-pass import
-            compression_ratio = import_stats['compression_ratio']
-            n_ensembles = import_stats['n_ensembles']
-            total_headers = import_stats['total_headers']
-
-            # Phase 4: Save metadata
-            progress.setLabelText("Saving metadata...")
-            metadata = {
-                'shape': [n_samples, n_traces],
-                'sample_rate': file_info['sample_interval'],
-                'n_samples': n_samples,
-                'n_traces': n_traces,
-                'duration_ms': (n_samples - 1) * file_info['sample_interval'],
-                'nyquist_freq': 1000.0 / (2.0 * file_info['sample_interval']),
-                'seismic_metadata': {
-                    'source_file': str(self.segy_file),
-                    'original_segy_path': str(self.segy_file),  # For export functionality
-                    'file_info': file_info,
-                    'header_mapping': self.header_mapping.to_dict(),
-                },
-                'storage_info': {
-                    'zarr_chunks': f"({n_samples}, 1000)",
-                    'parquet_compression': 'snappy',
-                    'zarr_compression': 'zstd'
-                }
-            }
-
-            import json
-            with open(storage.metadata_path, 'w') as f:
-                json.dump(metadata, f, indent=2)
-
-            # Also save trace index
-            import pandas as pd
-            import numpy as np
-            df_index = pd.DataFrame({
-                'trace_index': np.arange(n_traces),
-                'global_trace_id': np.arange(n_traces)
-            })
-            df_index.to_parquet(
-                storage.trace_index_path,
-                engine='pyarrow',
-                compression='snappy',
-                index=False
-            )
-
-            progress.setValue(n_traces)
+            if not result.success:
+                raise RuntimeError(result.error)
 
             elapsed_time = time.time() - start_time
 
-            # Print computed header errors if any
-            error_summary = self.reader.get_computed_header_errors()
-            if error_summary:
-                print(error_summary)
+            # Update metadata with source file info
+            import json
+            from pathlib import Path
+            metadata_path = Path(output_dir) / 'metadata.json'
+            if metadata_path.exists():
+                with open(metadata_path, 'r') as f:
+                    metadata = json.load(f)
+                metadata['seismic_metadata'] = {
+                    'source_file': str(self.segy_file),
+                    'original_segy_path': str(self.segy_file),
+                    'file_info': file_info,
+                    'header_mapping': self.header_mapping.to_dict(),
+                }
+                with open(metadata_path, 'w') as f:
+                    json.dump(metadata, f, indent=2)
 
             # Show success statistics
             stats_text = f"""
-Streaming Import Successful!
+Parallel Import Successful!
 
 Data Statistics:
 - Traces: {n_traces:,}
 - Samples: {n_samples}
-- Ensembles: {n_ensembles if ensemble_keys else 'Not configured'}
+- Segments: {result.n_segments}
 
 Performance:
 - Import time: {elapsed_time:.1f}s
-- Throughput: {n_traces / elapsed_time:.0f} traces/sec
-- Compression ratio: {compression_ratio:.2f}x
+- Throughput: {n_traces / elapsed_time:,.0f} traces/sec
+- Workers used: {n_workers}
 
 Output: {output_dir}
             """
 
             QMessageBox.information(self, "Import Complete", stats_text)
 
-            # Load back for viewer using lazy loading for memory efficiency
+            # Load back for viewer using lazy loading
             from models.lazy_seismic_data import LazySeismicData
 
             progress.setLabelText("Preparing data for viewing...")
-            lazy_data = LazySeismicData.from_storage_dir(str(storage.output_dir))
+            lazy_data = LazySeismicData.from_storage_dir(output_dir)
+
+            # Load ensemble index if exists
+            storage = DataStorage(output_dir)
             ensembles_df = storage.get_ensemble_index()
 
-            # Emit signal with lazy data and file path
+            # Emit signal with lazy data
             self.import_completed.emit(lazy_data, None, ensembles_df, self.segy_file)
 
             self.accept()
 
-        except InterruptedError as e:
+        except InterruptedError:
             # User cancelled - clean up
             import shutil
-            if storage.output_dir.exists():
-                shutil.rmtree(storage.output_dir, ignore_errors=True)
+            from pathlib import Path
+            output_path = Path(output_dir)
+            if output_path.exists():
+                shutil.rmtree(output_path, ignore_errors=True)
             QMessageBox.information(self, "Import Cancelled", "Import was cancelled by user.")
         except Exception as e:
             # Error - clean up
             import shutil
-            if storage.output_dir.exists():
-                shutil.rmtree(storage.output_dir, ignore_errors=True)
+            from pathlib import Path
+            output_path = Path(output_dir)
+            if output_path.exists():
+                shutil.rmtree(output_path, ignore_errors=True)
             raise
 
     def _show_success_stats(self, storage: DataStorage, loaded_data, output_dir: str):

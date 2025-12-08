@@ -11,6 +11,7 @@ import numpy as np
 import sys
 from processors.bandpass_filter import BandpassFilter
 from models.fk_config import FKConfigManager, FKFilterConfig
+from models.fkk_config import FKKConfig, FKK_PRESETS
 
 # Try to import GPU modules
 try:
@@ -44,6 +45,8 @@ class ControlPanel(QWidget):
     reset_view_requested = pyqtSignal()
     fk_design_requested = pyqtSignal()  # Request to open FK designer
     fk_config_selected = pyqtSignal(str)  # FK config name selected for applying
+    fkk_design_requested = pyqtSignal()  # Request to open 3D FKK designer
+    fkk_apply_requested = pyqtSignal(object)  # FKKConfig for applying
 
     def __init__(self, nyquist_freq: float = 250.0, parent=None):
         super().__init__(parent)
@@ -92,11 +95,14 @@ class ControlPanel(QWidget):
         self.bandpass_group = self._create_bandpass_group()
         self.tfdenoise_group = self._create_tfdenoise_group()
         self.fk_filter_group = self._create_fk_filter_group()
+        self.fkk_filter_group = self._create_fkk_filter_group()
         controls_layout.addWidget(self.bandpass_group)
         controls_layout.addWidget(self.tfdenoise_group)
         controls_layout.addWidget(self.fk_filter_group)
+        controls_layout.addWidget(self.fkk_filter_group)
         self.tfdenoise_group.hide()  # Initially hidden
         self.fk_filter_group.hide()  # Initially hidden
+        self.fkk_filter_group.hide()  # Initially hidden
 
         # Display controls
         controls_layout.addWidget(self._create_display_group())
@@ -131,7 +137,8 @@ class ControlPanel(QWidget):
         self.algorithm_combo.addItems([
             "Bandpass Filter",
             "TF-Denoise (S-Transform)",
-            "FK Filter"
+            "FK Filter",
+            "3D FKK Filter"
         ])
         self.algorithm_combo.currentIndexChanged.connect(self._on_algorithm_changed)
         algo_layout.addWidget(self.algorithm_combo)
@@ -315,6 +322,34 @@ class ControlPanel(QWidget):
         transform_layout.addWidget(self.transform_type_combo)
         layout.addLayout(transform_layout)
 
+        # Threshold mode (NEW)
+        threshold_mode_layout = QHBoxLayout()
+        threshold_mode_layout.addWidget(QLabel("Noise Removal:"))
+        self.threshold_mode_combo = QComboBox()
+        self.threshold_mode_combo.addItems([
+            "Adaptive (Recommended)",
+            "Hard (Full Removal)",
+            "Scaled (Progressive)",
+            "Soft (Legacy)"
+        ])
+        self.threshold_mode_combo.setToolTip(
+            "Adaptive: Hard for severe outliers, scaled for moderate (recommended)\n"
+            "Hard: Full removal for all outliers\n"
+            "Scaled: Progressive removal based on severity\n"
+            "Soft: Legacy partial removal"
+        )
+        threshold_mode_layout.addWidget(self.threshold_mode_combo)
+        layout.addLayout(threshold_mode_layout)
+
+        # Low-amplitude protection (NEW)
+        self.low_amp_protection_checkbox = QCheckBox("Low-amplitude protection")
+        self.low_amp_protection_checkbox.setChecked(True)
+        self.low_amp_protection_checkbox.setToolTip(
+            "Prevent inflation of low-amplitude samples\n"
+            "(isolated signals won't be boosted toward median)"
+        )
+        layout.addWidget(self.low_amp_protection_checkbox)
+
         # Apply button
         self.tfdenoise_apply_btn = QPushButton("Apply TF-Denoise")
         self.tfdenoise_apply_btn.setStyleSheet("""
@@ -454,6 +489,175 @@ class ControlPanel(QWidget):
         self._refresh_fk_config_list()
 
         return group
+
+    def _create_fkk_filter_group(self) -> QGroupBox:
+        """Create 3D FKK filter group with Design/Apply modes."""
+        group = QGroupBox("3D FKK Filter")
+        layout = QVBoxLayout()
+
+        # Mode selection (Design/Apply)
+        mode_group = QGroupBox("Mode")
+        mode_layout = QVBoxLayout()
+
+        self.fkk_mode_design = QRadioButton("Design (build volume & create filter)")
+        self.fkk_mode_apply = QRadioButton("Apply (use saved preset)")
+        self.fkk_mode_design.setChecked(True)
+
+        self.fkk_mode_group = QButtonGroup()
+        self.fkk_mode_group.addButton(self.fkk_mode_design, 0)
+        self.fkk_mode_group.addButton(self.fkk_mode_apply, 1)
+        self.fkk_mode_group.buttonClicked.connect(self._on_fkk_mode_changed)
+
+        mode_layout.addWidget(self.fkk_mode_design)
+        mode_layout.addWidget(self.fkk_mode_apply)
+        mode_group.setLayout(mode_layout)
+        layout.addWidget(mode_group)
+
+        # Design mode controls
+        self.fkk_design_widget = QWidget()
+        design_layout = QVBoxLayout()
+        design_layout.setContentsMargins(0, 0, 0, 0)
+
+        design_info = QLabel(
+            "Build 3D volume from current data using\n"
+            "selected headers for inline/crossline axes,\n"
+            "then design velocity cone filter."
+        )
+        design_info.setStyleSheet("color: #666; font-size: 9pt;")
+        design_info.setWordWrap(True)
+        design_layout.addWidget(design_info)
+
+        self.fkk_design_btn = QPushButton("Open 3D FKK Designer...")
+        self.fkk_design_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #9C27B0;
+                color: white;
+                font-weight: bold;
+                padding: 8px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #7B1FA2;
+            }
+            QPushButton:pressed {
+                background-color: #6A1B9A;
+            }
+        """)
+        self.fkk_design_btn.clicked.connect(self._on_fkk_design_clicked)
+        design_layout.addWidget(self.fkk_design_btn)
+
+        self.fkk_design_widget.setLayout(design_layout)
+        layout.addWidget(self.fkk_design_widget)
+
+        # Apply mode controls
+        self.fkk_apply_widget = QWidget()
+        apply_layout = QVBoxLayout()
+        apply_layout.setContentsMargins(0, 0, 0, 0)
+
+        apply_info = QLabel("Select preset and configure parameters")
+        apply_info.setStyleSheet("color: #666; font-size: 9pt;")
+        apply_info.setWordWrap(True)
+        apply_layout.addWidget(apply_info)
+
+        # Preset selection
+        preset_layout = QHBoxLayout()
+        preset_layout.addWidget(QLabel("Preset:"))
+        self.fkk_preset_combo = QComboBox()
+        self.fkk_preset_combo.addItem("Custom", None)
+        for name in FKK_PRESETS.keys():
+            self.fkk_preset_combo.addItem(name, name)
+        self.fkk_preset_combo.currentIndexChanged.connect(self._on_fkk_preset_changed)
+        preset_layout.addWidget(self.fkk_preset_combo)
+        apply_layout.addLayout(preset_layout)
+
+        # V_min
+        vmin_layout = QHBoxLayout()
+        vmin_layout.addWidget(QLabel("V min:"))
+        self.fkk_vmin_spin = QDoubleSpinBox()
+        self.fkk_vmin_spin.setRange(50, 10000)
+        self.fkk_vmin_spin.setValue(200)
+        self.fkk_vmin_spin.setSuffix(" m/s")
+        vmin_layout.addWidget(self.fkk_vmin_spin)
+        apply_layout.addLayout(vmin_layout)
+
+        # V_max
+        vmax_layout = QHBoxLayout()
+        vmax_layout.addWidget(QLabel("V max:"))
+        self.fkk_vmax_spin = QDoubleSpinBox()
+        self.fkk_vmax_spin.setRange(100, 20000)
+        self.fkk_vmax_spin.setValue(1500)
+        self.fkk_vmax_spin.setSuffix(" m/s")
+        vmax_layout.addWidget(self.fkk_vmax_spin)
+        apply_layout.addLayout(vmax_layout)
+
+        # Mode
+        mode_filter_layout = QHBoxLayout()
+        mode_filter_layout.addWidget(QLabel("Filter:"))
+        self.fkk_filter_mode_combo = QComboBox()
+        self.fkk_filter_mode_combo.addItem("Reject (remove)", "reject")
+        self.fkk_filter_mode_combo.addItem("Pass (keep)", "pass")
+        mode_filter_layout.addWidget(self.fkk_filter_mode_combo)
+        apply_layout.addLayout(mode_filter_layout)
+
+        # Apply button
+        self.fkk_apply_btn = QPushButton("Apply FKK Filter")
+        self.fkk_apply_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                font-weight: bold;
+                padding: 8px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+            QPushButton:pressed {
+                background-color: #3d8b40;
+            }
+        """)
+        self.fkk_apply_btn.clicked.connect(self._on_fkk_apply_clicked)
+        apply_layout.addWidget(self.fkk_apply_btn)
+
+        self.fkk_apply_widget.setLayout(apply_layout)
+        layout.addWidget(self.fkk_apply_widget)
+        self.fkk_apply_widget.hide()  # Initially hidden
+
+        group.setLayout(layout)
+        return group
+
+    def _on_fkk_mode_changed(self, button):
+        """Handle FKK mode radio button change."""
+        if button == self.fkk_mode_design:
+            self.fkk_design_widget.show()
+            self.fkk_apply_widget.hide()
+        else:
+            self.fkk_design_widget.hide()
+            self.fkk_apply_widget.show()
+
+    def _on_fkk_design_clicked(self):
+        """Handle FKK design button click."""
+        self.fkk_design_requested.emit()
+
+    def _on_fkk_preset_changed(self, index):
+        """Handle FKK preset selection."""
+        preset_name = self.fkk_preset_combo.currentData()
+        if preset_name and preset_name in FKK_PRESETS:
+            preset = FKK_PRESETS[preset_name]
+            self.fkk_vmin_spin.setValue(preset.v_min)
+            self.fkk_vmax_spin.setValue(preset.v_max)
+            mode_idx = 0 if preset.mode == 'reject' else 1
+            self.fkk_filter_mode_combo.setCurrentIndex(mode_idx)
+
+    def _on_fkk_apply_clicked(self):
+        """Handle FKK apply button click."""
+        config = FKKConfig(
+            v_min=self.fkk_vmin_spin.value(),
+            v_max=self.fkk_vmax_spin.value(),
+            mode=self.fkk_filter_mode_combo.currentData(),
+            taper_width=0.1
+        )
+        self.fkk_apply_requested.emit(config)
 
     def _create_display_group(self) -> QGroupBox:
         """Create display controls group."""
@@ -610,27 +814,32 @@ class ControlPanel(QWidget):
 
     def _on_algorithm_changed(self, index: int):
         """Handle algorithm selection change."""
+        # Hide all algorithm groups first
+        self.bandpass_group.hide()
+        self.tfdenoise_group.hide()
+        self.fk_filter_group.hide()
+        self.fkk_filter_group.hide()
+
         if index == 0:  # Bandpass Filter
             self.bandpass_group.show()
-            self.tfdenoise_group.hide()
-            self.fk_filter_group.hide()
             # Disable GPU for bandpass filter
             if self.gpu_checkbox is not None:
                 self.gpu_checkbox.setEnabled(False)
         elif index == 1:  # TF-Denoise
-            self.bandpass_group.hide()
             self.tfdenoise_group.show()
-            self.fk_filter_group.hide()
             # Enable GPU for TF-Denoise if available
             if self.gpu_checkbox is not None and self.gpu_available:
                 self.gpu_checkbox.setEnabled(True)
         elif index == 2:  # FK Filter
-            self.bandpass_group.hide()
-            self.tfdenoise_group.hide()
             self.fk_filter_group.show()
             # Disable GPU for FK filter
             if self.gpu_checkbox is not None:
                 self.gpu_checkbox.setEnabled(False)
+        elif index == 3:  # 3D FKK Filter
+            self.fkk_filter_group.show()
+            # Enable GPU for 3D FKK filter if available
+            if self.gpu_checkbox is not None and self.gpu_available:
+                self.gpu_checkbox.setEnabled(True)
 
     def _on_gpu_checkbox_changed(self, state):
         """Handle GPU checkbox state change."""
@@ -686,6 +895,20 @@ class ControlPanel(QWidget):
                     self.gpu_checkbox.isChecked()
                 )
 
+                # Get threshold mode from combo box
+                threshold_mode_map = {
+                    0: 'adaptive',  # Adaptive (Recommended)
+                    1: 'hard',      # Hard (Full Removal)
+                    2: 'scaled',    # Scaled (Progressive)
+                    3: 'soft'       # Soft (Legacy)
+                }
+                threshold_mode = threshold_mode_map.get(
+                    self.threshold_mode_combo.currentIndex(), 'adaptive'
+                )
+
+                # Get low-amplitude protection setting
+                low_amp_protection = self.low_amp_protection_checkbox.isChecked()
+
                 if use_gpu:
                     # Use GPU-accelerated version
                     processor = TFDenoiseGPU(
@@ -694,11 +917,14 @@ class ControlPanel(QWidget):
                         fmax=self.tfdenoise_fmax_spin.value(),
                         threshold_k=self.threshold_k_spin.value(),
                         threshold_type=self.threshold_type_combo.currentText().lower(),
+                        threshold_mode=threshold_mode,
                         transform_type=self.transform_type_combo.currentText().lower().replace("-", ""),
                         use_gpu='auto',
+                        low_amp_protection=low_amp_protection,
                         device_manager=self.device_manager
                     )
                     print(f"✓ Using GPU-accelerated TF-Denoise: {self.device_manager.get_device_name()}")
+                    print(f"  Threshold mode: {threshold_mode}, Low-amp protection: {low_amp_protection}")
                 else:
                     # Use CPU version
                     from processors.tf_denoise import TFDenoise
@@ -708,9 +934,12 @@ class ControlPanel(QWidget):
                         fmax=self.tfdenoise_fmax_spin.value(),
                         threshold_k=self.threshold_k_spin.value(),
                         threshold_type=self.threshold_type_combo.currentText().lower(),
-                        transform_type=self.transform_type_combo.currentText().lower().replace("-", "")
+                        threshold_mode=threshold_mode,
+                        transform_type=self.transform_type_combo.currentText().lower().replace("-", ""),
+                        low_amp_protection=low_amp_protection
                     )
                     print(f"✓ Using CPU TF-Denoise")
+                    print(f"  Threshold mode: {threshold_mode}, Low-amp protection: {low_amp_protection}")
 
             self.process_requested.emit(processor)
         except ValueError as e:

@@ -1,0 +1,34 @@
+# SeisProc package manifest
+# Include non-Python files in source distribution
+
+# Documentation
+include README.md
+include LICENSE
+include CHANGELOG.md
+recursive-include docs *.md *.rst *.txt
+
+# Configuration files
+include pyproject.toml
+include .pre-commit-config.yaml
+
+# Type stubs
+recursive-include . *.pyi
+
+# Exclude development and test files
+exclude *.pyc
+exclude .gitignore
+exclude .coverage
+recursive-exclude tests *
+recursive-exclude venv *
+recursive-exclude __pycache__ *
+recursive-exclude .git *
+recursive-exclude .mypy_cache *
+recursive-exclude .pytest_cache *
+
+# Exclude debug/diagnostic scripts
+exclude check_*.py
+exclude debug_*.py
+exclude diagnose_*.py
+exclude find_*.py
+exclude test_*.py
+exclude verify_*.py

@@ -167,7 +167,7 @@ class STFT_GPU:
         sample_rate: Optional[float] = None
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Compute STFT for multiple signals in batch.
+        Compute STFT for multiple signals in batch (fully vectorized).
 
         Args:
             signals: Input signals (2D array: n_samples x n_signals)
@@ -186,23 +186,19 @@ class STFT_GPU:
         signals_gpu = numpy_to_tensor(signals.T, self.device, dtype=torch.float32)
         # Shape: (n_signals, n_samples)
 
-        # Compute STFT for all signals
-        stft_results = []
-        for i in range(n_signals):
-            stft_result = torch.stft(
-                signals_gpu[i],
-                n_fft=self.n_fft,
-                hop_length=self.hop_length,
-                win_length=self.n_fft,
-                window=self.window,
-                center=self.center,
-                normalized=self.normalized,
-                return_complex=True
-            )
-            stft_results.append(stft_result)
-
-        # Stack results: (n_signals, n_freqs, n_frames)
-        stft_batch = torch.stack(stft_results, dim=0)
+        # Vectorized STFT: compute all signals at once
+        # torch.stft supports batched input (batch_dim, signal_length)
+        stft_batch = torch.stft(
+            signals_gpu,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.n_fft,
+            window=self.window,
+            center=self.center,
+            normalized=self.normalized,
+            return_complex=True
+        )
+        # Shape: (n_signals, n_freqs, n_frames)
 
         # Create frequency array
         if sample_rate is not None:
@@ -225,7 +221,7 @@ class STFT_GPU:
         signal_length: Optional[int] = None
     ) -> np.ndarray:
         """
-        Compute inverse STFT for multiple coefficient sets.
+        Compute inverse STFT for multiple coefficient sets (fully vectorized).
 
         Args:
             stft_coeffs: STFT coefficients (3D array: n_signals x n_freqs x n_frames)
@@ -239,24 +235,20 @@ class STFT_GPU:
         # Transfer to GPU
         stft_gpu = torch.from_numpy(stft_coeffs).to(self.device)
 
-        # Compute inverse STFT for all signals
-        signals = []
-        for i in range(n_signals):
-            signal = torch.istft(
-                stft_gpu[i],
-                n_fft=self.n_fft,
-                hop_length=self.hop_length,
-                win_length=self.n_fft,
-                window=self.window,
-                center=self.center,
-                normalized=self.normalized,
-                length=signal_length,
-                return_complex=False
-            )
-            signals.append(signal)
-
-        # Stack results: (n_signals, n_samples)
-        signals_batch = torch.stack(signals, dim=0)
+        # Vectorized inverse STFT: compute all signals at once
+        # torch.istft supports batched input (batch, freq, time)
+        signals_batch = torch.istft(
+            stft_gpu,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.n_fft,
+            window=self.window,
+            center=self.center,
+            normalized=self.normalized,
+            length=signal_length,
+            return_complex=False
+        )
+        # Shape: (n_signals, n_samples)
 
         # Transfer back to CPU and transpose
         signals_numpy = tensor_to_numpy(signals_batch).T  # (n_samples, n_signals)

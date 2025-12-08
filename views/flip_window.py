@@ -150,6 +150,10 @@ class FlipWindow(QMainWindow):
             # Let parent handle other buttons
             super(SeismicViewerPyQtGraph, self.viewer).mousePressEvent(event)
 
+    def cycle_view(self):
+        """Public method to cycle to next view (for keyboard shortcut)."""
+        self._cycle_forward()
+
     def _cycle_forward(self):
         """Cycle to next view (Input → Processed → Difference → Input)."""
         self.current_view_index = (self.current_view_index + 1) % len(self.view_modes)

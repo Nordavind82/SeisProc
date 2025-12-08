@@ -8,17 +8,24 @@ Optimized with Numba JIT compilation and parallel processing.
 """
 import numpy as np
 from scipy import signal
+from scipy.ndimage import uniform_filter1d
 from typing import Optional, Literal
 import sys
 from models.seismic_data import SeismicData
 from processors.base_processor import BaseProcessor
 
 # Try to import numba for JIT acceleration
+import logging
+logger = logging.getLogger(__name__)
+
 try:
     from numba import jit, prange
+    from numba.core.errors import NumbaError, TypingError, UnsupportedError
     NUMBA_AVAILABLE = True
+    NUMBA_JIT_FAILED = False  # Track if JIT compilation failed at runtime
 except ImportError:
     NUMBA_AVAILABLE = False
+    NUMBA_JIT_FAILED = False
     # Fallback decorator that does nothing
     def jit(*args, **kwargs):
         def decorator(func):
@@ -35,6 +42,90 @@ try:
 except ImportError:
     JOBLIB_AVAILABLE = False
     N_JOBS = 1
+
+
+# LRU cache for S-Transform Gaussian windows
+# Key: (n_samples, fmin, fmax), Value: (windows, freq_indices, output_freqs)
+_STRANSFORM_WINDOW_CACHE = {}
+_STRANSFORM_CACHE_MAX_SIZE = 5  # Cache up to 5 different window configurations
+
+
+def _get_cached_windows(n: int, fmin: float, fmax: float, positive_freqs: np.ndarray):
+    """
+    Get cached Gaussian windows or compute and cache them.
+
+    Args:
+        n: Number of samples
+        fmin: Minimum frequency (normalized, 0-0.5)
+        fmax: Maximum frequency (normalized, 0-0.5)
+        positive_freqs: Array of positive frequencies
+
+    Returns:
+        Tuple of (windows, freq_indices, output_freqs)
+    """
+    global _STRANSFORM_WINDOW_CACHE
+
+    # Create cache key (round fmin/fmax to avoid floating point issues)
+    cache_key = (n, round(fmin * 1000), round(fmax * 1000))
+
+    if cache_key in _STRANSFORM_WINDOW_CACHE:
+        logger.debug(f"S-Transform window cache HIT: n={n}, fmin={fmin:.3f}, fmax={fmax:.3f}")
+        return _STRANSFORM_WINDOW_CACHE[cache_key]
+
+    logger.debug(f"S-Transform window cache MISS: n={n}, fmin={fmin:.3f}, fmax={fmax:.3f}")
+
+    # Calculate frequency indices
+    if fmin is not None or fmax is not None:
+        fmin_norm = fmin if fmin is not None else 0
+        fmax_norm = fmax if fmax is not None else 0.5
+        freq_mask = (positive_freqs >= fmin_norm) & (positive_freqs <= fmax_norm)
+        freq_indices = np.where(freq_mask)[0]
+    else:
+        freq_indices = np.arange(1, n//2 + 1)
+
+    output_freqs = positive_freqs[freq_indices]
+
+    # Compute windows
+    global NUMBA_JIT_FAILED
+    use_numba = NUMBA_AVAILABLE and not NUMBA_JIT_FAILED and len(freq_indices) > 10
+
+    if use_numba:
+        try:
+            windows = _compute_gaussian_windows_numba(freq_indices, output_freqs, n)
+        except Exception as e:
+            if NUMBA_AVAILABLE:
+                try:
+                    from numba.core.errors import NumbaError
+                    if isinstance(e, (NumbaError, TypeError, RuntimeError)):
+                        NUMBA_JIT_FAILED = True
+                        logger.warning(f"Numba JIT compilation failed: {e}")
+                except ImportError:
+                    pass
+            use_numba = False
+
+    if not use_numba:
+        # Fallback to pure NumPy
+        n_freqs = len(freq_indices)
+        windows = np.zeros((n_freqs, n))
+        freq_range = np.arange(n)
+
+        for i, k in enumerate(freq_indices):
+            f = output_freqs[i]
+            if f == 0:
+                windows[i, :] = 1.0 / n
+            else:
+                sigma_f = np.abs(f) / (2 * np.sqrt(2 * np.log(2)))
+                freq_diff = np.where(freq_range <= n//2, freq_range - k, freq_range - k - n)
+                windows[i, :] = np.exp(-2 * np.pi**2 * sigma_f**2 * freq_diff**2)
+
+    # Cache the result (with LRU eviction)
+    if len(_STRANSFORM_WINDOW_CACHE) >= _STRANSFORM_CACHE_MAX_SIZE:
+        # Remove oldest entry (simple FIFO eviction)
+        oldest_key = next(iter(_STRANSFORM_WINDOW_CACHE))
+        del _STRANSFORM_WINDOW_CACHE[oldest_key]
+
+    _STRANSFORM_WINDOW_CACHE[cache_key] = (windows, freq_indices, output_freqs)
+    return windows, freq_indices, output_freqs
 
 
 @jit(nopython=True, parallel=False, cache=True)  # parallel=False to avoid conflict with joblib
@@ -71,6 +162,9 @@ def stockwell_transform(data, fmin=None, fmax=None):
     """
     Compute S-Transform (Stockwell Transform) of a 1D signal.
 
+    Uses cached Gaussian windows for improved performance when processing
+    multiple traces with the same sample count and frequency range.
+
     Args:
         data: 1D array, input signal
         fmin: Minimum frequency (Hz) to compute
@@ -89,54 +183,29 @@ def stockwell_transform(data, fmin=None, fmax=None):
     freqs = np.fft.fftfreq(n)
     positive_freqs = freqs[:n//2 + 1]  # Only positive frequencies
 
-    # Limit frequency range if specified
-    if fmin is not None or fmax is not None:
-        if fmin is None:
-            fmin = 0
-        if fmax is None:
-            fmax = 0.5
+    # Normalize fmin/fmax for caching
+    fmin_norm = fmin if fmin is not None else 0.0
+    fmax_norm = fmax if fmax is not None else 0.5
 
-        # Select positive frequencies within range
-        freq_mask = (positive_freqs >= fmin) & (positive_freqs <= fmax)
-        freq_indices = np.where(freq_mask)[0]
-    else:
-        freq_indices = np.arange(1, n//2 + 1)  # Skip DC
+    # Get cached windows (or compute and cache them)
+    windows, freq_indices, output_freqs = _get_cached_windows(
+        n, fmin_norm, fmax_norm, positive_freqs
+    )
 
     # Initialize S-transform matrix
     n_freqs = len(freq_indices)
     S = np.zeros((n_freqs, n), dtype=complex)
-    output_freqs = positive_freqs[freq_indices]
 
-    # Print debug info once
+    # Log S-Transform config once per session (debug level)
     if not hasattr(stockwell_transform, '_debug_printed'):
         stockwell_transform._debug_printed = True
-        print(f"     📊 S-Transform details:")
-        print(f"        - Input length: {n} samples")
-        print(f"        - Frequency indices: {len(freq_indices)} out of {n//2} possible")
-        print(f"        - Computing {n_freqs} frequencies × {n} times = {n_freqs*n:,} points")
-        if NUMBA_AVAILABLE:
-            print(f"        - ⚡ Numba JIT acceleration: ENABLED")
-        else:
-            print(f"        - ⚠️  Numba JIT acceleration: DISABLED (install numba for speedup)")
+        numba_status = "enabled" if NUMBA_AVAILABLE else "disabled"
+        logger.debug(
+            f"S-Transform: {n} samples, {n_freqs} freqs, {n_freqs*n:,} TF points | "
+            f"Window cache: {_STRANSFORM_CACHE_MAX_SIZE} configs | Numba: {numba_status}"
+        )
 
-    # Pre-compute Gaussian windows (use Numba if available)
-    if NUMBA_AVAILABLE and n_freqs > 10:
-        windows = _compute_gaussian_windows_numba(freq_indices, output_freqs, n)
-    else:
-        # Fallback to pure NumPy
-        windows = np.zeros((n_freqs, n))
-        freq_range = np.arange(n)
-
-        for i, k in enumerate(freq_indices):
-            f = output_freqs[i]
-            if f == 0:
-                windows[i, :] = 1.0 / n
-            else:
-                sigma_f = np.abs(f) / (2 * np.sqrt(2 * np.log(2)))
-                freq_diff = np.where(freq_range <= n//2, freq_range - k, freq_range - k - n)
-                windows[i, :] = np.exp(-2 * np.pi**2 * sigma_f**2 * freq_diff**2)
-
-    # Compute S-Transform using pre-computed windows
+    # Compute S-Transform using cached windows
     freq_range = np.arange(n)
     for i, k in enumerate(freq_indices):
         if output_freqs[i] == 0:
@@ -261,76 +330,18 @@ def inverse_stft_transform(S, nperseg=64, noverlap=None):
     return reconstructed
 
 
-def compute_mad_threshold(amplitudes, k=3.0):
-    """
-    Compute MAD-based threshold for noise suppression.
-
-    Args:
-        amplitudes: Array of amplitudes across spatial aperture
-        k: Threshold multiplier (higher = more aggressive)
-
-    Returns:
-        threshold: Computed threshold value
-    """
-    # Median absolute deviation (MAD)
-    median_amp = np.median(amplitudes)
-    mad = np.median(np.abs(amplitudes - median_amp))
-
-    # Robust threshold
-    threshold = median_amp + k * mad
-
-    return threshold
-
-
-def soft_threshold(coef, threshold):
-    """
-    Soft thresholding (shrinkage) function.
-
-    Args:
-        coef: Complex coefficient
-        threshold: Threshold value
-
-    Returns:
-        Thresholded coefficient
-    """
-    magnitude = np.abs(coef)
-    phase = np.angle(coef)
-
-    # Soft shrinkage
-    new_magnitude = np.maximum(magnitude - threshold, 0)
-
-    return new_magnitude * np.exp(1j * phase)
-
-
-def garrote_threshold(coef, threshold):
-    """
-    Garrote thresholding function (less aggressive than soft).
-
-    Args:
-        coef: Complex coefficient
-        threshold: Threshold value
-
-    Returns:
-        Thresholded coefficient
-    """
-    magnitude = np.abs(coef)
-    phase = np.angle(coef)
-
-    # Garrote shrinkage
-    if magnitude > threshold:
-        new_magnitude = magnitude - (threshold**2 / magnitude)
-    else:
-        new_magnitude = 0
-
-    return new_magnitude * np.exp(1j * phase)
-
-
 class TFDenoise(BaseProcessor):
     """
     Time-Frequency Domain Denoising using S-Transform with MAD thresholding.
 
     Implements spatial aperture processing with robust noise characterization
     for effective random noise attenuation while preserving signal.
+
+    Supports multiple threshold modes for improved noise removal:
+    - 'soft': Classical soft thresholding (partial removal, legacy)
+    - 'hard': Full removal for outliers, preserve non-outliers exactly
+    - 'scaled': Progressive removal based on outlier severity
+    - 'adaptive': Combined hard (severe) + scaled (moderate) - recommended
     """
 
     def __init__(self,
@@ -339,7 +350,11 @@ class TFDenoise(BaseProcessor):
                  fmax: float = 100.0,
                  threshold_k: float = 3.0,
                  threshold_type: Literal['soft', 'garrote'] = 'soft',
-                 transform_type: Literal['stransform', 'stft'] = 'stransform'):
+                 threshold_mode: Literal['soft', 'hard', 'scaled', 'adaptive'] = 'adaptive',
+                 transform_type: Literal['stransform', 'stft'] = 'stransform',
+                 time_smoothing: int = 1,
+                 low_amp_protection: bool = True,
+                 low_amp_factor: float = 0.3):
         """
         Initialize TF-Denoise processor.
 
@@ -348,15 +363,29 @@ class TFDenoise(BaseProcessor):
             fmin: Minimum frequency (Hz) for processing
             fmax: Maximum frequency (Hz) for processing
             threshold_k: MAD threshold multiplier
-            threshold_type: Type of thresholding ('soft' or 'garrote')
+            threshold_type: Type of thresholding ('soft' or 'garrote') - legacy parameter
+            threshold_mode: Noise removal mode (recommended: 'adaptive'):
+                - 'soft': Classical soft thresholding (partial removal)
+                - 'hard': Full removal for outliers (Option A)
+                - 'scaled': Progressive removal based on severity (Option B)
+                - 'adaptive': Hard for severe + scaled for moderate (recommended)
             transform_type: Transform to use ('stransform' or 'stft')
+            time_smoothing: Time window size for MAD smoothing (1=no smoothing,
+                           >1 averages MAD over neighboring time bins for robust
+                           threshold estimation in non-stationary signals)
+            low_amp_protection: Prevent inflation of low-amplitude samples
+            low_amp_factor: Threshold for low-amplitude protection (fraction of median)
         """
         self.aperture = aperture
         self.fmin = fmin
         self.fmax = fmax
         self.threshold_k = threshold_k
         self.threshold_type = threshold_type
+        self.threshold_mode = threshold_mode
         self.transform_type = transform_type
+        self.time_smoothing = time_smoothing
+        self.low_amp_protection = low_amp_protection
+        self.low_amp_factor = low_amp_factor
 
         # Call parent init which will call _validate_params
         super().__init__(
@@ -365,7 +394,11 @@ class TFDenoise(BaseProcessor):
             fmax=fmax,
             threshold_k=threshold_k,
             threshold_type=threshold_type,
-            transform_type=transform_type
+            threshold_mode=threshold_mode,
+            transform_type=transform_type,
+            time_smoothing=time_smoothing,
+            low_amp_protection=low_amp_protection,
+            low_amp_factor=low_amp_factor
         )
 
     def _validate_params(self):
@@ -382,16 +415,25 @@ class TFDenoise(BaseProcessor):
             raise ValueError("threshold_k must be positive")
         if self.threshold_type not in ['soft', 'garrote']:
             raise ValueError("threshold_type must be 'soft' or 'garrote'")
+        if self.threshold_mode not in ['soft', 'hard', 'scaled', 'adaptive']:
+            raise ValueError("threshold_mode must be 'soft', 'hard', 'scaled', or 'adaptive'")
         if self.transform_type not in ['stransform', 'stft']:
             raise ValueError("transform_type must be 'stransform' or 'stft'")
+        if self.time_smoothing < 1:
+            raise ValueError("time_smoothing must be at least 1")
+        if self.low_amp_factor <= 0 or self.low_amp_factor >= 1:
+            raise ValueError("low_amp_factor must be between 0 and 1")
 
     def get_description(self) -> str:
         """Get processor description."""
+        mode_str = f", mode={self.threshold_mode}"
+        if self.low_amp_protection:
+            mode_str += ", low_amp_protect"
         return (f"TF-Denoise ({self.transform_type.upper()}): "
                 f"aperture={self.aperture}, "
                 f"freq={self.fmin:.0f}-{self.fmax:.0f}Hz, "
                 f"k={self.threshold_k:.1f}, "
-                f"{self.threshold_type} threshold")
+                f"{self.threshold_type} threshold{mode_str}")
 
     def process(self, data: SeismicData) -> SeismicData:
         """
@@ -405,27 +447,28 @@ class TFDenoise(BaseProcessor):
         """
         import time
 
-        print(f"\n{'='*60}")
-        print(f"TF-DENOISE DEBUG - Starting processing")
-        print(f"{'='*60}")
-
         start_time_total = time.time()
 
         traces = data.traces.copy()
         n_samples, n_traces = traces.shape
 
-        print(f"Input data: {n_samples} samples × {n_traces} traces")
-        print(f"Parameters:")
-        print(f"  - Aperture: {self.aperture}")
-        print(f"  - Frequency range: {self.fmin:.1f}-{self.fmax:.1f} Hz")
-        print(f"  - Threshold k: {self.threshold_k}")
-        print(f"  - Threshold type: {self.threshold_type}")
-        print(f"  - Transform: {self.transform_type}")
+        # Log gather summary once at start
+        parallel_info = f"Parallel({N_JOBS} cores)" if JOBLIB_AVAILABLE else "Sequential"
+        logger.info(
+            f"TFD-CPU: {n_traces} traces × {n_samples} samples | "
+            f"Transform: {self.transform_type} | "
+            f"Aperture: {self.aperture} | "
+            f"Freq: {self.fmin:.0f}-{self.fmax:.0f}Hz | "
+            f"k={self.threshold_k}, mode={self.threshold_mode} | "
+            f"{parallel_info}"
+        )
 
         # Validate aperture
         if n_traces < self.aperture:
-            print(f"⚠️  Warning: Not enough traces ({n_traces}) for aperture ({self.aperture}). "
-                  f"Using all available traces.")
+            logger.warning(
+                f"Not enough traces ({n_traces}) for aperture ({self.aperture}), "
+                f"using {n_traces if n_traces % 2 == 1 else n_traces - 1}"
+            )
             effective_aperture = n_traces if n_traces % 2 == 1 else n_traces - 1
         else:
             effective_aperture = self.aperture
@@ -435,73 +478,42 @@ class TFDenoise(BaseProcessor):
 
         # Convert frequencies to normalized (0-0.5) based on sample rate
         nyquist_freq = data.nyquist_freq
+        sample_rate = 2.0 * nyquist_freq
         fmin_norm = self.fmin / (2 * nyquist_freq)
         fmax_norm = self.fmax / (2 * nyquist_freq)
 
-        print(f"Normalized frequencies: {fmin_norm:.4f} - {fmax_norm:.4f}")
-
         half_aperture = effective_aperture // 2
 
-        print(f"\nProcessing {n_traces} traces...")
-
         # Check if parallel processing is available and beneficial
-        # Only use parallel for S-Transform (slow enough to benefit)
-        # STFT is too fast - thread overhead makes it slower
         use_parallel = (JOBLIB_AVAILABLE and
                        n_traces > 50 and
                        self.transform_type == 'stransform')
 
-        if use_parallel:
-            print(f"🚀 Parallel processing: ENABLED ({N_JOBS} cores)")
-        else:
-            if not JOBLIB_AVAILABLE and self.transform_type == 'stransform':
-                print(f"⚠️  Parallel processing: DISABLED (install joblib for multi-core speedup)")
-            print(f"Sequential processing...")
-
-        print(f"Progress: ", end='', flush=True)
-
-        progress_interval = max(1, n_traces // 20)  # Print 20 progress updates
         trace_times = []
 
         if use_parallel:
             # Parallel processing using joblib
             def process_single_trace(trace_idx):
-                # Determine spatial window
                 start_idx = max(0, trace_idx - half_aperture)
                 end_idx = min(n_traces, trace_idx + half_aperture + 1)
-
-                # Extract spatial ensemble
                 ensemble = traces[:, start_idx:end_idx]
                 center_in_ensemble = trace_idx - start_idx
 
-                # Process with TF transform
                 if self.transform_type == 'stransform':
                     return self._process_with_stransform(
                         ensemble, center_in_ensemble, fmin_norm, fmax_norm
                     )
                 else:
-                    return self._process_with_stft(ensemble, center_in_ensemble)
+                    return self._process_with_stft(ensemble, center_in_ensemble, sample_rate)
 
-            # Process in parallel with progress
             trace_start_total = time.time()
             results = Parallel(n_jobs=N_JOBS, prefer="threads")(
                 delayed(process_single_trace)(i) for i in range(n_traces)
             )
 
-            # Copy results
             for i, result in enumerate(results):
                 denoised_traces[:, i] = result
 
-                # Progress indicator
-                if (i + 1) % progress_interval == 0:
-                    percent = (i + 1) / n_traces * 100
-                    elapsed = time.time() - trace_start_total
-                    avg_time = elapsed / (i + 1)
-                    remaining = (n_traces - i - 1) * avg_time
-                    print(f"{percent:.0f}% (avg: {avg_time:.3f}s/trace, est. remaining: {remaining:.1f}s)... ",
-                          end='', flush=True)
-
-            # Record timing
             total_time = time.time() - trace_start_total
             trace_times = [total_time / n_traces] * n_traces
         else:
@@ -509,69 +521,45 @@ class TFDenoise(BaseProcessor):
             for trace_idx in range(n_traces):
                 trace_start = time.time()
 
-                # Determine spatial window
                 start_idx = max(0, trace_idx - half_aperture)
                 end_idx = min(n_traces, trace_idx + half_aperture + 1)
-
-                # Extract spatial ensemble
                 ensemble = traces[:, start_idx:end_idx]
                 center_in_ensemble = trace_idx - start_idx
 
-                # Process with TF transform
                 if self.transform_type == 'stransform':
                     denoised_traces[:, trace_idx] = self._process_with_stransform(
                         ensemble, center_in_ensemble, fmin_norm, fmax_norm
                     )
-                else:  # stft
+                else:
                     denoised_traces[:, trace_idx] = self._process_with_stft(
-                        ensemble, center_in_ensemble
+                        ensemble, center_in_ensemble, sample_rate
                     )
 
-                trace_time = time.time() - trace_start
-                trace_times.append(trace_time)
+                trace_times.append(time.time() - trace_start)
 
-                # Progress indicator
-                if (trace_idx + 1) % progress_interval == 0 or trace_idx == 0:
-                    percent = (trace_idx + 1) / n_traces * 100
-                    avg_time = np.mean(trace_times[-min(100, len(trace_times)):])
-                    remaining = (n_traces - trace_idx - 1) * avg_time
-                    print(f"{percent:.0f}% (avg: {avg_time:.3f}s/trace, est. remaining: {remaining:.1f}s)... ",
-                          end='', flush=True)
-
-        print("\n")  # New line after progress
-
-        total_time = time.time() - start_time_total
+        # Compute timing and energy metrics
+        elapsed_total = time.time() - start_time_total
+        throughput = n_traces / elapsed_total if elapsed_total > 0 else 0
         avg_trace_time = np.mean(trace_times)
-        min_trace_time = np.min(trace_times)
-        max_trace_time = np.max(trace_times)
-
-        print(f"\n{'='*60}")
-        print(f"TF-DENOISE DEBUG - Completed")
-        print(f"{'='*60}")
-        print(f"Total time: {total_time:.2f}s")
-        print(f"Average per trace: {avg_trace_time:.3f}s")
-        print(f"Min/Max per trace: {min_trace_time:.3f}s / {max_trace_time:.3f}s")
-        print(f"Throughput: {n_traces/total_time:.1f} traces/sec")
-        print(f"{'='*60}\n")
 
         # Energy verification
         input_rms = np.sqrt(np.mean(traces**2))
         output_rms = np.sqrt(np.mean(denoised_traces**2))
-        ratio = output_rms / input_rms if input_rms > 0 else 0
+        energy_ratio = output_rms / input_rms if input_rms > 0 else 0
 
-        print(f"ENERGY VERIFICATION:")
-        print(f"  Input RMS:  {input_rms:.6f}")
-        print(f"  Output RMS: {output_rms:.6f}")
-        print(f"  Ratio:      {ratio:.2%}")
+        # Log completion summary with bottleneck metrics
+        logger.info(
+            f"TFD-CPU complete: {elapsed_total:.2f}s | "
+            f"{throughput:.1f} traces/s | "
+            f"{avg_trace_time*1000:.1f}ms/trace | "
+            f"Energy: {energy_ratio:.1%} retained"
+        )
 
-        if ratio < 0.10:
-            print(f"  ⚠️  WARNING: Output is < 10% of input - threshold may be too aggressive!")
-        elif 0.70 <= ratio <= 0.95:
-            print(f"  ✓ Output is signal model (70-95% of input energy preserved)")
-        elif ratio > 0.95:
-            print(f"  ⚠️  WARNING: Output is > 95% of input - minimal denoising occurred")
-
-        print(f"{'='*60}\n")
+        # Warn about potential issues
+        if energy_ratio < 0.10:
+            logger.warning(f"Output <10% of input energy - threshold may be too aggressive")
+        elif energy_ratio > 0.95:
+            logger.warning(f"Output >95% of input energy - minimal denoising occurred")
 
         # Create output
         return SeismicData(
@@ -587,169 +575,262 @@ class TFDenoise(BaseProcessor):
         """Process ensemble using S-Transform."""
         import time
 
-        process_start = time.time()
-
         n_samples, n_traces = ensemble.shape
         center_trace = ensemble[:, center_idx]
 
+        # Timing accumulators for bottleneck analysis
+        t0 = time.time()
+
         # Compute S-transform for all traces in ensemble
-        st_start = time.time()
         st_ensemble = []
-        freq_values = None  # Will store frequency values for inverse transform
+        freq_values = None
         for i in range(n_traces):
             st, freqs = stockwell_transform(ensemble[:, i], fmin=fmin_norm, fmax=fmax_norm)
             st_ensemble.append(st)
             if i == 0:
-                freq_values = freqs  # Save frequency values from first trace
-        st_time = time.time() - st_start
+                freq_values = freqs
+        time_forward = time.time() - t0
 
         if len(st_ensemble) == 0:
             return center_trace
 
         # Stack into 3D array (trace x frequency x time)
-        stack_start = time.time()
         st_ensemble = np.array(st_ensemble)
-        stack_time = time.time() - stack_start
 
         # Get center trace ST
         st_center = st_ensemble[center_idx]
         n_freqs, n_times = st_center.shape
 
         # Apply MAD thresholding (VECTORIZED for speed)
-        threshold_start = time.time()
+        t0 = time.time()
         st_denoised = np.zeros_like(st_center)
 
-        # Vectorize across time dimension for each frequency
         for f in range(n_freqs):
-            # Extract spatial amplitudes for all times at this frequency
-            spatial_amplitudes = np.abs(st_ensemble[:, f, :])  # shape: (n_traces, n_times)
+            spatial_amplitudes = np.abs(st_ensemble[:, f, :])
+            median_amp = np.median(spatial_amplitudes, axis=0)
+            mad = np.median(np.abs(spatial_amplitudes - median_amp), axis=0)
+            mad_scaled = mad * 1.4826
+            outlier_threshold = self.threshold_k * mad_scaled
 
-            # Compute spatial median and MAD (vectorized across time)
-            median_amp = np.median(spatial_amplitudes, axis=0)  # shape: (n_times,)
-            mad = np.median(np.abs(spatial_amplitudes - median_amp), axis=0)  # shape: (n_times,)
-
-            # MAD-based outlier threshold
-            # Coefficients CLOSE to median (< k*MAD) are coherent signal → KEEP
-            # Coefficients FAR from median (> k*MAD) are outliers/noise → REMOVE
-            outlier_threshold = self.threshold_k * mad  # shape: (n_times,)
-
-            # Get center trace coefficients
-            coefs = st_center[f, :]  # shape: (n_times,)
+            coefs = st_center[f, :]
             magnitudes = np.abs(coefs)
             phases = np.angle(coefs)
+            deviations = np.abs(magnitudes - median_amp)
 
-            # Compute deviation from spatial median
-            deviations = np.abs(magnitudes - median_amp)  # shape: (n_times,)
+            new_magnitudes = self._apply_threshold_mode(
+                magnitudes, median_amp, deviations, outlier_threshold
+            )
 
+            st_denoised[f, :] = new_magnitudes * np.exp(1j * phases)
+
+        time_threshold = time.time() - t0
+
+        # Inverse transform
+        t0 = time.time()
+        denoised_trace = inverse_stockwell_transform(st_denoised, n_samples, freq_values=freq_values)
+        time_inverse = time.time() - t0
+
+        # Log timing breakdown once (debug level)
+        if not hasattr(self, '_stransform_timing_logged'):
+            self._stransform_timing_logged = True
+            total = time_forward + time_threshold + time_inverse
+            logger.debug(
+                f"S-Transform timing: Forward={time_forward:.3f}s | "
+                f"Threshold={time_threshold:.3f}s | Inverse={time_inverse:.3f}s | "
+                f"TF: {n_freqs}×{n_times} points"
+            )
+
+        return denoised_trace
+
+    def _apply_threshold_mode(self, magnitudes, median_amp, deviations, outlier_threshold):
+        """
+        Apply thresholding based on the configured threshold_mode.
+
+        Args:
+            magnitudes: Original magnitudes (n_freqs, n_times)
+            median_amp: Spatial median (n_freqs, n_times)
+            deviations: Deviation from median (n_freqs, n_times)
+            outlier_threshold: k * MAD threshold (n_freqs, n_times)
+
+        Returns:
+            new_magnitudes: Thresholded magnitudes
+        """
+        if self.threshold_mode == 'hard':
+            # Option A: Hard threshold - outliers snap to median, non-outliers keep original
+            new_magnitudes = np.where(
+                deviations > outlier_threshold,
+                median_amp,  # Full removal - snap to median
+                magnitudes  # Keep original exactly (no inflation!)
+            )
+
+        elif self.threshold_mode == 'scaled':
+            # Option B: Progressive removal based on severity
+            outlier_ratio = deviations / (outlier_threshold + 1e-10)
+            excess_ratio = np.maximum(outlier_ratio - 1.0, 0.0)
+            removal_factor = 1.0 - 1.0 / (1.0 + excess_ratio ** 2)
+
+            new_deviations = deviations * (1.0 - removal_factor)
+            signs = np.where(magnitudes >= median_amp, 1, -1)
+
+            new_magnitudes = np.where(
+                outlier_ratio > 1.0,
+                np.maximum(median_amp + signs * new_deviations, 0),
+                magnitudes  # Keep original for non-outliers
+            )
+
+        elif self.threshold_mode == 'adaptive':
+            # Combined: hard for severe, scaled for moderate, preserve non-outliers
+            outlier_ratio = deviations / (outlier_threshold + 1e-10)
+            severe_threshold = 2.0
+
+            # Scaled removal for moderate outliers
+            moderate_removal = np.clip(
+                (outlier_ratio - 1.0) / (severe_threshold - 1.0), 0.0, 1.0
+            )
+            signs = np.where(magnitudes >= median_amp, 1, -1)
+            moderate_new_deviations = deviations * (1.0 - moderate_removal)
+            moderate_magnitude = np.maximum(
+                median_amp + signs * moderate_new_deviations, 0
+            )
+
+            new_magnitudes = np.where(
+                outlier_ratio > severe_threshold,
+                median_amp,  # Severe: full removal
+                np.where(
+                    outlier_ratio > 1.0,
+                    moderate_magnitude,  # Moderate: scaled
+                    magnitudes  # Non-outlier: keep original
+                )
+            )
+
+        else:  # 'soft' (default/legacy) - use threshold_type
             if self.threshold_type == 'soft':
-                # Soft threshold on DEVIATION (not magnitude)
-                # Remove outliers: if deviation > k*MAD, shrink toward median
                 new_deviations = np.maximum(deviations - outlier_threshold, 0)
-                # Reconstruct: preserve sign of deviation
-                signs = np.where(magnitudes >= median_amp, 1, -1)
-                new_magnitudes = median_amp + signs * new_deviations
-                # Ensure non-negative
-                new_magnitudes = np.maximum(new_magnitudes, 0)
             else:  # garrote
-                # Garrote threshold on deviation
                 new_deviations = np.where(
                     deviations > outlier_threshold,
                     deviations - (outlier_threshold**2 / (deviations + 1e-10)),
                     deviations
                 )
-                signs = np.where(magnitudes >= median_amp, 1, -1)
-                new_magnitudes = median_amp + signs * new_deviations
-                new_magnitudes = np.maximum(new_magnitudes, 0)
+            signs = np.where(magnitudes >= median_amp, 1, -1)
+            new_magnitudes = np.maximum(median_amp + signs * new_deviations, 0)
 
-            st_denoised[f, :] = new_magnitudes * np.exp(1j * phases)
+        # Apply low-amplitude protection if enabled
+        if self.low_amp_protection:
+            low_amp_threshold = median_amp * self.low_amp_factor
+            low_amp_mask = magnitudes < low_amp_threshold
+            inflation_mask = low_amp_mask & (new_magnitudes > magnitudes)
+            new_magnitudes = np.where(inflation_mask, magnitudes, new_magnitudes)
 
-        threshold_time = time.time() - threshold_start
+        return new_magnitudes
 
-        # Inverse transform
-        inverse_start = time.time()
-        denoised_trace = inverse_stockwell_transform(st_denoised, n_samples, freq_values=freq_values)
-        inverse_time = time.time() - inverse_start
+    def _process_with_stft(self, ensemble, center_idx, sample_rate=None):
+        """
+        Process ensemble using STFT with fully vectorized MAD thresholding.
 
-        total_time = time.time() - process_start
+        Optimizations:
+        - Batch STFT computation for all traces
+        - Fully vectorized thresholding (no frequency loop)
+        - Robust MAD with adaptive floor (fixes MAD=0 bug)
+        - Optional frequency filtering via fmin/fmax
 
-        # Debug timing (only print for first trace)
-        if not hasattr(self, '_debug_printed'):
-            self._debug_printed = True
-            print(f"\n  🔍 S-Transform timing breakdown (first trace):")
-            print(f"     - Forward S-Transform ({n_traces} traces): {st_time:.3f}s ({st_time/n_traces*1000:.1f}ms/trace)")
-            print(f"     - Array stacking: {stack_time:.3f}s")
-            print(f"     - MAD thresholding ({n_freqs}×{n_times} points): {threshold_time:.3f}s")
-            print(f"     - Inverse S-Transform: {inverse_time:.3f}s")
-            print(f"     - Total per output trace: {total_time:.3f}s")
-            print(f"     - TF matrix size: {n_freqs} freqs × {n_times} times = {n_freqs*n_times:,} points")
-            print()
+        Args:
+            ensemble: Spatial aperture traces (n_samples, n_traces)
+            center_idx: Index of center trace in ensemble
+            sample_rate: Sample rate in Hz (for frequency filtering)
 
-        return denoised_trace
-
-    def _process_with_stft(self, ensemble, center_idx):
-        """Process ensemble using STFT."""
+        Returns:
+            Denoised center trace (n_samples,)
+        """
         n_samples, n_traces = ensemble.shape
         center_trace = ensemble[:, center_idx]
 
-        # Compute STFT for all traces
+        # STFT parameters
         nperseg = min(64, n_samples // 4)
-        stft_ensemble = []
+        noverlap = nperseg // 2
 
-        for i in range(n_traces):
-            stft, freqs, times = stft_transform(ensemble[:, i], nperseg=nperseg)
-            stft_ensemble.append(stft)
+        # Batch STFT: compute all traces at once
+        # Transpose to (n_traces, n_samples) for batch processing
+        freqs, times, stft_batch = signal.stft(
+            ensemble.T,
+            nperseg=nperseg,
+            noverlap=noverlap,
+            axis=-1
+        )
+        # stft_batch shape: (n_traces, n_freqs, n_times)
+        stft_ensemble = stft_batch
+        n_freqs, n_times = stft_ensemble.shape[1], stft_ensemble.shape[2]
 
-        if len(stft_ensemble) == 0:
+        if n_freqs == 0 or n_times == 0:
             return center_trace
 
-        # Stack into 3D array
-        stft_ensemble = np.array(stft_ensemble)
-
         # Get center trace STFT
-        stft_center = stft_ensemble[center_idx]
-        n_freqs, n_times = stft_center.shape
+        stft_center = stft_ensemble[center_idx]  # (n_freqs, n_times)
 
-        # Apply MAD-based outlier detection thresholding
-        stft_denoised = np.zeros_like(stft_center)
+        # === FULLY VECTORIZED THRESHOLDING ===
+        # Process ALL frequencies at once (no loop)
 
-        for f in range(n_freqs):
-            for t in range(n_times):
-                # Extract spatial amplitudes
-                spatial_amplitudes = np.abs(stft_ensemble[:, f, t])
+        # Compute spatial statistics across trace dimension (axis=0)
+        all_amplitudes = np.abs(stft_ensemble)  # (n_traces, n_freqs, n_times)
+        median_amp = np.median(all_amplitudes, axis=0)  # (n_freqs, n_times)
+        mad = np.median(np.abs(all_amplitudes - median_amp), axis=0)  # (n_freqs, n_times)
 
-                # Compute spatial median and MAD
-                median_amp = np.median(spatial_amplitudes)
-                mad = np.median(np.abs(spatial_amplitudes - median_amp))
+        # Apply temporal smoothing for non-stationary signals
+        # This averages MAD over neighboring time bins for more robust estimation
+        if self.time_smoothing > 1 and n_times >= self.time_smoothing:
+            # Smooth MAD along time axis (axis=1)
+            mad = uniform_filter1d(mad, size=self.time_smoothing, axis=1, mode='nearest')
+            # Also smooth median for consistency
+            median_amp = uniform_filter1d(median_amp, size=self.time_smoothing, axis=1, mode='nearest')
 
-                # Outlier threshold: deviation from median
-                outlier_threshold = self.threshold_k * mad
+        # CRITICAL FIX: Prevent MAD=0 from causing zero threshold
+        # Use adaptive floor: 1% of median or small epsilon
+        min_mad = np.maximum(0.01 * median_amp, 1e-10)
+        mad = np.maximum(mad, min_mad)
 
-                # Get center trace coefficient
-                coef = stft_center[f, t]
-                magnitude = np.abs(coef)
-                phase = np.angle(coef)
+        # Scale MAD for Gaussian consistency
+        mad_scaled = mad * 1.4826
 
-                # Compute deviation from spatial median
-                deviation = abs(magnitude - median_amp)
+        # MAD-based outlier threshold
+        outlier_threshold = self.threshold_k * mad_scaled  # (n_freqs, n_times)
 
-                if self.threshold_type == 'soft':
-                    # Soft threshold on deviation
-                    new_deviation = max(deviation - outlier_threshold, 0)
-                    sign = 1 if magnitude >= median_amp else -1
-                    new_magnitude = max(median_amp + sign * new_deviation, 0)
-                else:  # garrote
-                    # Garrote threshold on deviation
-                    if deviation > outlier_threshold:
-                        new_deviation = deviation - (outlier_threshold**2 / (deviation + 1e-10))
-                    else:
-                        new_deviation = deviation
-                    sign = 1 if magnitude >= median_amp else -1
-                    new_magnitude = max(median_amp + sign * new_deviation, 0)
+        # Center trace coefficients
+        magnitudes = np.abs(stft_center)  # (n_freqs, n_times)
+        phases = np.angle(stft_center)    # (n_freqs, n_times)
 
-                stft_denoised[f, t] = new_magnitude * np.exp(1j * phase)
+        # Deviation from spatial median
+        deviations = np.abs(magnitudes - median_amp)  # (n_freqs, n_times)
+
+        # Apply thresholding using the new mode-based method
+        new_magnitudes = self._apply_threshold_mode(
+            magnitudes, median_amp, deviations, outlier_threshold
+        )
+
+        # Apply frequency filtering if sample_rate provided
+        if sample_rate is not None and (self.fmin > 0 or self.fmax < sample_rate / 2):
+            # freqs from scipy.stft are normalized (0 to 0.5)
+            # Convert to Hz: freq_hz = freq_norm * sample_rate
+            freq_hz = freqs * sample_rate
+
+            # Create frequency mask
+            freq_mask = (freq_hz >= self.fmin) & (freq_hz <= self.fmax)
+
+            # Keep original magnitudes outside frequency range
+            new_magnitudes = np.where(
+                freq_mask[:, np.newaxis],  # Broadcast to (n_freqs, n_times)
+                new_magnitudes,
+                magnitudes  # Keep original outside range
+            )
+
+        # Reconstruct denoised STFT
+        stft_denoised = new_magnitudes * np.exp(1j * phases)
 
         # Inverse transform
-        denoised_trace = inverse_stft_transform(stft_denoised, nperseg=nperseg)
+        _, denoised_trace = signal.istft(
+            stft_denoised,
+            nperseg=nperseg,
+            noverlap=noverlap
+        )
 
         # Handle length mismatch
         if len(denoised_trace) < n_samples:

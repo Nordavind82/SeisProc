@@ -28,13 +28,22 @@ class ThresholdingGPU:
 
     Implements MAD-based adaptive thresholding with soft and Garrote
     threshold functions, optimized for GPU execution.
+
+    Threshold modes:
+    - 'soft': Classical soft thresholding (partial removal)
+    - 'hard': Full removal for outliers, preserve non-outliers exactly
+    - 'scaled': Progressive removal based on outlier severity
+    - 'adaptive': Combined hard (severe) + scaled (moderate) outliers
     """
 
     def __init__(
         self,
         device: torch.device,
         threshold_k: float = 3.0,
-        threshold_type: Literal['soft', 'garrote'] = 'soft'
+        threshold_type: Literal['soft', 'garrote'] = 'soft',
+        threshold_mode: Literal['soft', 'hard', 'scaled', 'adaptive'] = 'adaptive',
+        low_amp_protection: bool = True,
+        low_amp_factor: float = 0.3
     ):
         """
         Initialize thresholding processor.
@@ -43,10 +52,20 @@ class ThresholdingGPU:
             device: PyTorch device (cuda, mps, or cpu)
             threshold_k: MAD threshold multiplier (k * MAD)
             threshold_type: Type of thresholding ('soft' or 'garrote')
+            threshold_mode: Noise removal mode:
+                - 'soft': Classical soft thresholding (partial removal)
+                - 'hard': Full removal for outliers (snap to median)
+                - 'scaled': Progressive removal based on outlier severity
+                - 'adaptive': Hard for severe (>2k*MAD) + scaled for moderate
+            low_amp_protection: If True, prevent inflation of low-amplitude samples
+            low_amp_factor: Threshold for low-amplitude protection (fraction of median)
         """
         self.device = device
         self.threshold_k = threshold_k
         self.threshold_type = threshold_type
+        self.threshold_mode = threshold_mode
+        self.low_amp_protection = low_amp_protection
+        self.low_amp_factor = low_amp_factor
 
     def apply_mad_thresholding(
         self,
@@ -231,6 +250,327 @@ class ThresholdingGPU:
 
         # Reconstruct complex value
         return new_magnitude * torch.exp(1j * phase)
+
+    def _hard_threshold_outliers_gpu(
+        self,
+        tf_center: torch.Tensor,
+        median: torch.Tensor,
+        outlier_threshold: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Option A: Hard threshold - full removal for outliers, preserve non-outliers exactly.
+
+        Key difference from soft: non-outliers keep their ORIGINAL magnitude,
+        not pushed toward median. This prevents inflation of low-amplitude samples.
+
+        Args:
+            tf_center: Center trace TF coefficients (n_freqs, n_times)
+            median: Spatial median (n_freqs, n_times)
+            outlier_threshold: k * MAD threshold (n_freqs, n_times)
+
+        Returns:
+            Thresholded coefficients (n_freqs, n_times)
+        """
+        magnitude = torch.abs(tf_center)
+        phase = torch.angle(tf_center)
+
+        # Compute deviation from spatial median
+        deviation = torch.abs(magnitude - median)
+
+        # Hard threshold: outliers snap to median, non-outliers keep original
+        new_magnitude = torch.where(
+            deviation > outlier_threshold,
+            median,  # Full removal - snap to median
+            magnitude  # Keep original exactly (no inflation!)
+        )
+
+        # Reconstruct complex value
+        return new_magnitude * torch.exp(1j * phase)
+
+    def _scaled_threshold_outliers_gpu(
+        self,
+        tf_center: torch.Tensor,
+        median: torch.Tensor,
+        outlier_threshold: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Option B: Scaled progressive removal based on outlier severity.
+
+        Removal factor increases smoothly from 0 (at threshold) to ~1 (for severe outliers).
+        Non-outliers keep their original magnitude.
+
+        Args:
+            tf_center: Center trace TF coefficients (n_freqs, n_times)
+            median: Spatial median (n_freqs, n_times)
+            outlier_threshold: k * MAD threshold (n_freqs, n_times)
+
+        Returns:
+            Thresholded coefficients (n_freqs, n_times)
+        """
+        magnitude = torch.abs(tf_center)
+        phase = torch.angle(tf_center)
+
+        # Compute deviation from spatial median
+        deviation = torch.abs(magnitude - median)
+
+        # Compute outlier ratio: how many times threshold is exceeded
+        outlier_ratio = deviation / (outlier_threshold + 1e-10)
+
+        # Progressive removal factor: 0 at threshold, approaches 1 for severe outliers
+        # Using smooth transition: removal = 1 - 1/(1 + (ratio-1)^2) for ratio > 1
+        excess_ratio = torch.clamp(outlier_ratio - 1.0, min=0.0)
+        removal_factor = 1.0 - 1.0 / (1.0 + excess_ratio ** 2)
+
+        # New deviation: progressively reduced toward zero based on severity
+        new_deviation = deviation * (1.0 - removal_factor)
+
+        # Reconstruct magnitude
+        signs = torch.where(magnitude >= median, 1.0, -1.0)
+        new_magnitude = torch.where(
+            outlier_ratio > 1.0,
+            torch.maximum(median + signs * new_deviation, torch.zeros_like(median)),
+            magnitude  # Keep original for non-outliers (no inflation!)
+        )
+
+        # Reconstruct complex value
+        return new_magnitude * torch.exp(1j * phase)
+
+    def _adaptive_threshold_outliers_gpu(
+        self,
+        tf_center: torch.Tensor,
+        median: torch.Tensor,
+        outlier_threshold: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Adaptive threshold: combines hard (severe outliers) + scaled (moderate outliers).
+
+        - Severe outliers (> 2*k*MAD): Hard threshold (snap to median)
+        - Moderate outliers (k*MAD to 2*k*MAD): Scaled progressive removal
+        - Non-outliers (< k*MAD): Keep original magnitude
+
+        Args:
+            tf_center: Center trace TF coefficients (n_freqs, n_times)
+            median: Spatial median (n_freqs, n_times)
+            outlier_threshold: k * MAD threshold (n_freqs, n_times)
+
+        Returns:
+            Thresholded coefficients (n_freqs, n_times)
+        """
+        magnitude = torch.abs(tf_center)
+        phase = torch.angle(tf_center)
+
+        # Compute deviation from spatial median
+        deviation = torch.abs(magnitude - median)
+
+        # Compute outlier ratio
+        outlier_ratio = deviation / (outlier_threshold + 1e-10)
+
+        # Severe outlier threshold (2x the normal threshold)
+        severe_threshold = 2.0
+
+        # For moderate outliers: scaled removal
+        # Progressive removal between ratio 1.0 and 2.0
+        moderate_removal = torch.clamp((outlier_ratio - 1.0) / (severe_threshold - 1.0), 0.0, 1.0)
+
+        # Calculate new deviation for moderate outliers
+        signs = torch.where(magnitude >= median, 1.0, -1.0)
+        moderate_new_deviation = deviation * (1.0 - moderate_removal)
+        moderate_magnitude = torch.maximum(
+            median + signs * moderate_new_deviation,
+            torch.zeros_like(median)
+        )
+
+        # Apply thresholds:
+        # - Non-outliers (ratio <= 1): keep original
+        # - Moderate outliers (1 < ratio <= 2): scaled removal
+        # - Severe outliers (ratio > 2): snap to median
+        new_magnitude = torch.where(
+            outlier_ratio > severe_threshold,
+            median,  # Severe: full removal
+            torch.where(
+                outlier_ratio > 1.0,
+                moderate_magnitude,  # Moderate: scaled removal
+                magnitude  # Non-outlier: keep original
+            )
+        )
+
+        # Reconstruct complex value
+        return new_magnitude * torch.exp(1j * phase)
+
+    def _apply_low_amp_protection(
+        self,
+        original_magnitude: torch.Tensor,
+        new_magnitude: torch.Tensor,
+        median: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Protect low-amplitude samples from inflation.
+
+        Prevents the algorithm from increasing amplitude of isolated
+        low-amplitude samples (which may be genuine signal gaps).
+
+        Args:
+            original_magnitude: Original magnitudes before thresholding
+            new_magnitude: Magnitudes after thresholding
+            median: Spatial median
+
+        Returns:
+            Protected magnitudes
+        """
+        # Identify low-amplitude regions
+        low_amp_threshold = median * self.low_amp_factor
+        low_amp_mask = original_magnitude < low_amp_threshold
+
+        # Prevent inflation: if original was low and new is higher, keep original
+        inflation_mask = low_amp_mask & (new_magnitude > original_magnitude)
+
+        protected_magnitude = torch.where(
+            inflation_mask,
+            original_magnitude,  # Keep original low amplitude
+            new_magnitude
+        )
+
+        return protected_magnitude
+
+    def apply_batch_mad_thresholding(
+        self,
+        tf_batch: np.ndarray,
+        spatial_dim: int = 0
+    ) -> np.ndarray:
+        """
+        Apply MAD-based thresholding to batch of TF coefficients.
+
+        Processes all traces in the batch simultaneously on GPU.
+        Each trace is thresholded using the spatial ensemble statistics.
+
+        Supports multiple threshold modes:
+        - 'soft': Classical soft thresholding (partial removal)
+        - 'hard': Full removal for outliers, preserve non-outliers
+        - 'scaled': Progressive removal based on outlier severity
+        - 'adaptive': Combined hard + scaled for different severity levels
+
+        Args:
+            tf_batch: TF coefficients for all traces (n_traces, n_freqs, n_times)
+            spatial_dim: Dimension along which to compute MAD (default: 0 = traces)
+
+        Returns:
+            Thresholded TF coefficients (n_traces, n_freqs, n_times)
+        """
+        n_traces, n_freqs, n_times = tf_batch.shape
+
+        logger.debug(
+            f"Batch MAD thresholding on GPU: {n_traces} traces × {n_freqs} freqs × {n_times} times, "
+            f"mode={self.threshold_mode}"
+        )
+
+        # Transfer entire batch to GPU
+        tf_gpu = torch.from_numpy(tf_batch).to(self.device)
+
+        # Compute spatial statistics across traces
+        magnitudes = torch.abs(tf_gpu)  # (n_traces, n_freqs, n_times)
+        phase = torch.angle(tf_gpu)
+
+        # Median across traces
+        median_mag = compute_median_gpu(magnitudes, dim=spatial_dim, keepdim=True)
+        # Shape: (1, n_freqs, n_times)
+
+        # MAD computation
+        abs_dev = torch.abs(magnitudes - median_mag)
+        mad = compute_median_gpu(abs_dev, dim=spatial_dim, keepdim=True) * 1.4826
+        # Shape: (1, n_freqs, n_times)
+
+        # Prevent MAD=0 from causing issues
+        min_mad = torch.maximum(0.01 * median_mag, torch.tensor(1e-10, device=self.device))
+        mad = torch.maximum(mad, min_mad)
+
+        # Outlier threshold
+        outlier_threshold = self.threshold_k * mad
+        # Shape: (1, n_freqs, n_times) - broadcasts to all traces
+
+        # Compute deviation from median
+        deviation = torch.abs(magnitudes - median_mag)
+
+        # Apply thresholding based on mode
+        if self.threshold_mode == 'hard':
+            # Option A: Hard threshold - outliers snap to median, non-outliers keep original
+            new_magnitude = torch.where(
+                deviation > outlier_threshold,
+                median_mag.expand_as(magnitudes),  # Snap to median
+                magnitudes  # Keep original
+            )
+
+        elif self.threshold_mode == 'scaled':
+            # Option B: Progressive removal based on severity
+            outlier_ratio = deviation / (outlier_threshold + 1e-10)
+            excess_ratio = torch.clamp(outlier_ratio - 1.0, min=0.0)
+            removal_factor = 1.0 - 1.0 / (1.0 + excess_ratio ** 2)
+
+            new_deviation = deviation * (1.0 - removal_factor)
+            signs = torch.where(magnitudes >= median_mag, 1.0, -1.0)
+
+            new_magnitude = torch.where(
+                outlier_ratio > 1.0,
+                torch.maximum(median_mag + signs * new_deviation, torch.zeros_like(magnitudes)),
+                magnitudes  # Keep original for non-outliers
+            )
+
+        elif self.threshold_mode == 'adaptive':
+            # Combined: hard for severe, scaled for moderate, preserve non-outliers
+            outlier_ratio = deviation / (outlier_threshold + 1e-10)
+            severe_threshold = 2.0
+
+            # Scaled removal for moderate outliers
+            moderate_removal = torch.clamp(
+                (outlier_ratio - 1.0) / (severe_threshold - 1.0), 0.0, 1.0
+            )
+            signs = torch.where(magnitudes >= median_mag, 1.0, -1.0)
+            moderate_new_deviation = deviation * (1.0 - moderate_removal)
+            moderate_magnitude = torch.maximum(
+                median_mag + signs * moderate_new_deviation,
+                torch.zeros_like(magnitudes)
+            )
+
+            new_magnitude = torch.where(
+                outlier_ratio > severe_threshold,
+                median_mag.expand_as(magnitudes),  # Severe: full removal
+                torch.where(
+                    outlier_ratio > 1.0,
+                    moderate_magnitude,  # Moderate: scaled
+                    magnitudes  # Non-outlier: keep original
+                )
+            )
+
+        else:  # 'soft' (default/legacy) or threshold_type-based
+            # Legacy behavior using threshold_type
+            if self.threshold_type == 'soft':
+                new_deviation = torch.maximum(
+                    deviation - outlier_threshold,
+                    torch.zeros_like(deviation)
+                )
+            else:  # garrote
+                new_deviation = torch.where(
+                    deviation > outlier_threshold,
+                    deviation - (outlier_threshold**2 / (deviation + 1e-10)),
+                    deviation
+                )
+
+            signs = torch.where(magnitudes >= median_mag, 1.0, -1.0)
+            new_magnitude = torch.maximum(
+                median_mag + signs * new_deviation,
+                torch.zeros_like(magnitudes)
+            )
+
+        # Apply low-amplitude protection if enabled
+        if self.low_amp_protection:
+            new_magnitude = self._apply_low_amp_protection(
+                magnitudes, new_magnitude, median_mag.expand_as(magnitudes)
+            )
+
+        # Reconstruct complex values
+        tf_denoised = new_magnitude * torch.exp(1j * phase)
+
+        # Transfer back to CPU
+        return tensor_to_numpy(tf_denoised)
 
     def apply_global_threshold(
         self,

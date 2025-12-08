@@ -2,12 +2,19 @@
 FK Filter Configuration Management
 
 Handles saving, loading, and managing FK filter configurations.
+Supports both metric (m/s) and imperial (ft/s) velocity units.
 """
 import json
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, asdict, field
+from utils.unit_conversion import (
+    convert_velocity_to_metric,
+    convert_velocity_from_metric,
+    METERS_TO_FEET,
+    FEET_TO_METERS
+)
 
 
 @dataclass
@@ -57,6 +64,9 @@ class FKFilterConfig:
     apply_agc: bool = False
     agc_window_ms: float = 500.0
 
+    # Unit settings (velocities stored in these units)
+    coordinate_units: str = 'meters'  # 'meters' or 'feet'
+
     def to_dict(self) -> Dict:
         """Convert to dictionary for JSON serialization."""
         return asdict(self)
@@ -71,7 +81,7 @@ class FKFilterConfig:
         Convert to processor parameters.
 
         Args:
-            trace_spacing: Trace spacing in meters (from gather)
+            trace_spacing: Trace spacing in coordinate units (from gather)
 
         Returns:
             Dictionary of parameters for FKFilter processor
@@ -81,13 +91,15 @@ class FKFilterConfig:
             'v_max': self.v_max,
             'taper_width': self.taper_width,
             'mode': self.mode,
-            'trace_spacing': trace_spacing
+            'trace_spacing': trace_spacing,
+            'coordinate_units': self.coordinate_units
         }
 
     def get_summary(self) -> str:
         """Get one-line summary of configuration."""
         mode_str = "Pass" if self.mode == 'pass' else "Reject"
-        return f"{mode_str}: {self.v_min:.0f}-{self.v_max:.0f} m/s, Taper: {self.taper_width:.0f} m/s"
+        unit_abbrev = "ft/s" if self.coordinate_units == 'feet' else "m/s"
+        return f"{mode_str}: {self.v_min:.0f}-{self.v_max:.0f} {unit_abbrev}, Taper: {self.taper_width:.0f} {unit_abbrev}"
 
 
 class FKConfigManager:
