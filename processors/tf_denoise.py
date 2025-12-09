@@ -478,11 +478,12 @@ class TFDenoise(BaseProcessor):
 
         # Convert frequencies to normalized (0-0.5) based on sample rate
         # Normalized frequency range: 0 = DC, 0.5 = Nyquist
-        # So fmin_norm = fmin_hz / nyquist_hz
+        # np.fft.fftfreq returns cycles per sample, range [-0.5, 0.5)
+        # Conversion: fmin_norm = fmin_hz / sample_rate_hz (NOT fmin_hz / nyquist_hz!)
         nyquist_freq = data.nyquist_freq
         sample_rate = 2.0 * nyquist_freq
-        fmin_norm = self.fmin / nyquist_freq
-        fmax_norm = self.fmax / nyquist_freq
+        fmin_norm = self.fmin / sample_rate
+        fmax_norm = self.fmax / sample_rate
         # Clamp to valid range [0, 0.5]
         fmin_norm = max(0.0, min(fmin_norm, 0.5))
         fmax_norm = max(0.0, min(fmax_norm, 0.5))

@@ -32,13 +32,18 @@ def next_power_of_2(n: int) -> int:
     return power
 
 
-def apply_agc_3d(data: np.ndarray, window_samples: int, max_gain: float = 10.0
+def apply_agc_3d(data: np.ndarray, window_samples: int
                  ) -> Tuple[np.ndarray, np.ndarray]:
-    """Apply AGC to 3D volume trace-by-trace."""
+    """
+    Apply AGC to 3D volume trace-by-trace.
+
+    Uses adaptive epsilon (0.1% of global RMS) for natural gain limiting
+    without creating shadow artifacts from outliers like air blasts.
+    """
     nt, nx, ny = data.shape
     data_2d = data.reshape(nt, -1)
     agc_data, scale_factors = apply_agc_vectorized(
-        data_2d, window_samples=window_samples, target_rms=1.0, max_gain=max_gain
+        data_2d, window_samples=window_samples, target_rms=1.0
     )
     return agc_data.reshape(nt, nx, ny), scale_factors.reshape(nt, nx, ny)
 
@@ -383,10 +388,10 @@ class FKKFilterGPU:
         data = volume.data.astype(np.float32).copy()
         agc_scale_factors = None
 
-        # Step 1: Optional AGC
+        # Step 1: Optional AGC (uses adaptive epsilon, no max_gain clipping)
         if config.apply_agc:
             window_samples = max(3, int(config.agc_window_ms / 1000.0 / volume.dt))
-            data, agc_scale_factors = apply_agc_3d(data, window_samples, config.agc_max_gain)
+            data, agc_scale_factors = apply_agc_3d(data, window_samples)
             logger.debug(f"Applied AGC with window={window_samples} samples")
 
         # Step 2: Optional temporal taper
@@ -594,10 +599,10 @@ class FKKFilterCPU:
         data = volume.data.astype(np.float32).copy()
         agc_scale_factors = None
 
-        # Step 1: Optional AGC
+        # Step 1: Optional AGC (uses adaptive epsilon, no max_gain clipping)
         if config.apply_agc:
             window_samples = max(3, int(config.agc_window_ms / 1000.0 / volume.dt))
-            data, agc_scale_factors = apply_agc_3d(data, window_samples, config.agc_max_gain)
+            data, agc_scale_factors = apply_agc_3d(data, window_samples)
             logger.debug(f"Applied AGC with window={window_samples} samples")
 
         # Step 2: Optional temporal taper

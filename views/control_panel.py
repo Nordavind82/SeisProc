@@ -10,6 +10,7 @@ from PyQt6.QtCore import Qt, pyqtSignal
 import numpy as np
 import sys
 from processors.bandpass_filter import BandpassFilter
+from processors.dwt_denoise import DWTDenoise, PYWT_AVAILABLE
 from models.fk_config import FKConfigManager, FKFilterConfig
 from models.fkk_config import FKKConfig, FKK_PRESETS
 
@@ -97,15 +98,18 @@ class ControlPanel(QWidget):
         # Processing controls (dynamic based on algorithm)
         self.bandpass_group = self._create_bandpass_group()
         self.tfdenoise_group = self._create_tfdenoise_group()
+        self.dwtdenoise_group = self._create_dwtdenoise_group()
         self.fk_filter_group = self._create_fk_filter_group()
         self.fkk_filter_group = self._create_fkk_filter_group()
         self.pstm_group = self._create_pstm_group()
         controls_layout.addWidget(self.bandpass_group)
         controls_layout.addWidget(self.tfdenoise_group)
+        controls_layout.addWidget(self.dwtdenoise_group)
         controls_layout.addWidget(self.fk_filter_group)
         controls_layout.addWidget(self.fkk_filter_group)
         controls_layout.addWidget(self.pstm_group)
         self.tfdenoise_group.hide()  # Initially hidden
+        self.dwtdenoise_group.hide()  # Initially hidden
         self.fk_filter_group.hide()  # Initially hidden
         self.fkk_filter_group.hide()  # Initially hidden
         self.pstm_group.hide()  # Initially hidden
@@ -143,6 +147,7 @@ class ControlPanel(QWidget):
         self.algorithm_combo.addItems([
             "Bandpass Filter",
             "TF-Denoise (S-Transform)",
+            "DWT-Denoise (Wavelet)",
             "FK Filter",
             "3D FKK Filter",
             "Kirchhoff PSTM"
@@ -379,6 +384,141 @@ class ControlPanel(QWidget):
 
         group.setLayout(layout)
         return group
+
+    def _create_dwtdenoise_group(self) -> QGroupBox:
+        """Create DWT-Denoise parameters group."""
+        group = QGroupBox("DWT-Denoise Parameters")
+        layout = QVBoxLayout()
+
+        # PyWavelets availability check
+        if not PYWT_AVAILABLE:
+            warning_label = QLabel("PyWavelets not installed.\nInstall with: pip install PyWavelets")
+            warning_label.setStyleSheet("color: red; font-weight: bold;")
+            layout.addWidget(warning_label)
+            group.setLayout(layout)
+            return group
+
+        # Wavelet selection
+        wavelet_layout = QHBoxLayout()
+        wavelet_layout.addWidget(QLabel("Wavelet:"))
+        self.dwt_wavelet_combo = QComboBox()
+        self.dwt_wavelet_combo.addItems([
+            "db4 (Daubechies-4)",
+            "db8 (Daubechies-8)",
+            "sym4 (Symlet-4)",
+            "sym8 (Symlet-8)",
+            "coif4 (Coiflet-4)",
+            "bior3.5 (Biorthogonal)"
+        ])
+        self.dwt_wavelet_combo.setToolTip(
+            "db4/db8: Good general purpose (recommended)\n"
+            "sym4/sym8: More symmetric wavelets\n"
+            "coif4: Nearly symmetric, good for smooth signals\n"
+            "bior3.5: Linear phase, good for sharp edges"
+        )
+        wavelet_layout.addWidget(self.dwt_wavelet_combo)
+        layout.addLayout(wavelet_layout)
+
+        # Transform type
+        transform_layout = QHBoxLayout()
+        transform_layout.addWidget(QLabel("Transform:"))
+        self.dwt_transform_combo = QComboBox()
+        self.dwt_transform_combo.addItems([
+            "DWT (Fast)",
+            "SWT (Translation-Invariant)",
+            "DWT-Spatial (with Aperture)"
+        ])
+        self.dwt_transform_combo.setToolTip(
+            "DWT: Fast standard wavelet transform (5-10x faster)\n"
+            "SWT: Stationary WT, avoids shift artifacts (slower)\n"
+            "DWT-Spatial: Uses spatial aperture for robust thresholding"
+        )
+        self.dwt_transform_combo.currentIndexChanged.connect(self._on_dwt_transform_changed)
+        transform_layout.addWidget(self.dwt_transform_combo)
+        layout.addLayout(transform_layout)
+
+        # Decomposition level
+        level_layout = QHBoxLayout()
+        level_layout.addWidget(QLabel("Level:"))
+        self.dwt_level_spin = QSpinBox()
+        self.dwt_level_spin.setRange(1, 10)
+        self.dwt_level_spin.setValue(5)
+        self.dwt_level_spin.setToolTip("Decomposition level (higher = more scales)")
+        level_layout.addWidget(self.dwt_level_spin)
+        layout.addLayout(level_layout)
+
+        # MAD threshold multiplier
+        k_layout = QHBoxLayout()
+        k_layout.addWidget(QLabel("Threshold (k):"))
+        self.dwt_threshold_k_spin = QDoubleSpinBox()
+        self.dwt_threshold_k_spin.setRange(0.5, 10.0)
+        self.dwt_threshold_k_spin.setValue(2.5)
+        self.dwt_threshold_k_spin.setSingleStep(0.5)
+        self.dwt_threshold_k_spin.setDecimals(1)
+        self.dwt_threshold_k_spin.setToolTip("MAD threshold multiplier (lower = more aggressive)")
+        k_layout.addWidget(self.dwt_threshold_k_spin)
+        layout.addLayout(k_layout)
+
+        # Threshold mode
+        mode_layout = QHBoxLayout()
+        mode_layout.addWidget(QLabel("Threshold Mode:"))
+        self.dwt_threshold_mode_combo = QComboBox()
+        self.dwt_threshold_mode_combo.addItems([
+            "Soft (Wavelet Shrinkage)",
+            "Hard (Keep/Zero)"
+        ])
+        self.dwt_threshold_mode_combo.setToolTip(
+            "Soft: Shrinks coefficients toward zero (smoother)\n"
+            "Hard: Keeps or zeros coefficients (preserves edges)"
+        )
+        mode_layout.addWidget(self.dwt_threshold_mode_combo)
+        layout.addLayout(mode_layout)
+
+        # Spatial aperture (only for DWT-Spatial mode)
+        aperture_layout = QHBoxLayout()
+        aperture_layout.addWidget(QLabel("Spatial Aperture:"))
+        self.dwt_aperture_spin = QSpinBox()
+        self.dwt_aperture_spin.setRange(3, 21)
+        self.dwt_aperture_spin.setValue(7)
+        self.dwt_aperture_spin.setSingleStep(2)
+        self.dwt_aperture_spin.setToolTip("Number of traces for spatial MAD estimation (odd)")
+        self.dwt_aperture_spin.setEnabled(False)  # Disabled by default
+        aperture_layout.addWidget(self.dwt_aperture_spin)
+        layout.addLayout(aperture_layout)
+        self.dwt_aperture_layout = aperture_layout
+
+        # Performance info
+        perf_label = QLabel("5-10x faster than STFT with comparable quality")
+        perf_label.setStyleSheet("color: #666; font-size: 9pt; font-style: italic;")
+        layout.addWidget(perf_label)
+
+        # Apply button
+        self.dwtdenoise_apply_btn = QPushButton("Apply DWT-Denoise")
+        self.dwtdenoise_apply_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2196F3;
+                color: white;
+                font-weight: bold;
+                padding: 8px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #1976D2;
+            }
+            QPushButton:pressed {
+                background-color: #1565C0;
+            }
+        """)
+        self.dwtdenoise_apply_btn.clicked.connect(self._on_apply_clicked)
+        layout.addWidget(self.dwtdenoise_apply_btn)
+
+        group.setLayout(layout)
+        return group
+
+    def _on_dwt_transform_changed(self, index: int):
+        """Handle DWT transform type change."""
+        # Enable aperture only for DWT-Spatial mode (index 2)
+        self.dwt_aperture_spin.setEnabled(index == 2)
 
     def _create_fk_filter_group(self) -> QGroupBox:
         """Create FK filter group with Design/Apply modes."""
@@ -1145,6 +1285,7 @@ class ControlPanel(QWidget):
         # Hide all algorithm groups first
         self.bandpass_group.hide()
         self.tfdenoise_group.hide()
+        self.dwtdenoise_group.hide()
         self.fk_filter_group.hide()
         self.fkk_filter_group.hide()
         self.pstm_group.hide()
@@ -1159,17 +1300,22 @@ class ControlPanel(QWidget):
             # Enable GPU for TF-Denoise if available
             if self.gpu_checkbox is not None and self.gpu_available:
                 self.gpu_checkbox.setEnabled(True)
-        elif index == 2:  # FK Filter
+        elif index == 2:  # DWT-Denoise
+            self.dwtdenoise_group.show()
+            # Disable GPU for DWT (CPU-only for now)
+            if self.gpu_checkbox is not None:
+                self.gpu_checkbox.setEnabled(False)
+        elif index == 3:  # FK Filter
             self.fk_filter_group.show()
             # Disable GPU for FK filter
             if self.gpu_checkbox is not None:
                 self.gpu_checkbox.setEnabled(False)
-        elif index == 3:  # 3D FKK Filter
+        elif index == 4:  # 3D FKK Filter
             self.fkk_filter_group.show()
             # Enable GPU for 3D FKK filter if available
             if self.gpu_checkbox is not None and self.gpu_available:
                 self.gpu_checkbox.setEnabled(True)
-        elif index == 4:  # Kirchhoff PSTM
+        elif index == 5:  # Kirchhoff PSTM
             self.pstm_group.show()
             # Enable GPU for PSTM if available
             if self.gpu_checkbox is not None and self.gpu_available:
@@ -1214,14 +1360,18 @@ class ControlPanel(QWidget):
     def _on_apply_clicked(self):
         """Handle apply button click."""
         try:
+            algo_index = self.algorithm_combo.currentIndex()
+
             # Check which algorithm is selected
-            if self.algorithm_combo.currentIndex() == 0:  # Bandpass Filter
+            if algo_index == 0:  # Bandpass Filter
                 processor = BandpassFilter(
                     low_freq=self.low_freq_spin.value(),
                     high_freq=self.high_freq_spin.value(),
                     order=self.order_spin.value()
                 )
-            else:  # TF-Denoise
+                print(f"✓ Using Bandpass Filter")
+
+            elif algo_index == 1:  # TF-Denoise
                 # Check if GPU should be used
                 use_gpu = (
                     GPU_AVAILABLE and
@@ -1274,6 +1424,44 @@ class ControlPanel(QWidget):
                     )
                     print(f"✓ Using CPU TF-Denoise")
                     print(f"  Threshold mode: {threshold_mode}, Low-amp protection: {low_amp_protection}")
+
+            elif algo_index == 2:  # DWT-Denoise
+                # Get wavelet name from combo box text
+                wavelet_map = {
+                    0: 'db4',
+                    1: 'db8',
+                    2: 'sym4',
+                    3: 'sym8',
+                    4: 'coif4',
+                    5: 'bior3.5'
+                }
+                wavelet = wavelet_map.get(self.dwt_wavelet_combo.currentIndex(), 'db4')
+
+                # Get transform type
+                transform_map = {
+                    0: 'dwt',
+                    1: 'swt',
+                    2: 'dwt_spatial'
+                }
+                transform_type = transform_map.get(self.dwt_transform_combo.currentIndex(), 'dwt')
+
+                # Get threshold mode
+                threshold_mode = 'soft' if self.dwt_threshold_mode_combo.currentIndex() == 0 else 'hard'
+
+                processor = DWTDenoise(
+                    wavelet=wavelet,
+                    level=self.dwt_level_spin.value(),
+                    threshold_k=self.dwt_threshold_k_spin.value(),
+                    threshold_mode=threshold_mode,
+                    transform_type=transform_type,
+                    aperture=self.dwt_aperture_spin.value()
+                )
+                print(f"✓ Using DWT-Denoise ({transform_type.upper()})")
+                print(f"  Wavelet: {wavelet}, Level: {self.dwt_level_spin.value()}, k={self.dwt_threshold_k_spin.value()}")
+
+            else:
+                # Other algorithms not handled here (FK, FKK, PSTM have their own handlers)
+                return
 
             self.process_requested.emit(processor)
         except ValueError as e:

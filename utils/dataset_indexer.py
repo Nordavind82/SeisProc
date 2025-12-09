@@ -465,6 +465,146 @@ class DatasetIndexer:
         index.compute_statistics()
         return index
 
+    def index_from_parquet(
+        self,
+        parquet_path: str,
+        n_samples: int,
+        sample_rate_ms: float,
+        header_mapping: Optional[Dict[str, str]] = None,
+    ) -> DatasetIndex:
+        """
+        Build index from parquet headers file (Zarr dataset).
+
+        This is the primary method for creating indices from imported datasets.
+
+        Args:
+            parquet_path: Path to headers.parquet file
+            n_samples: Number of samples per trace
+            sample_rate_ms: Sample rate in milliseconds
+            header_mapping: Mapping from required fields to parquet columns
+                           e.g., {'source_x': 'SourceX', 'receiver_x': 'GroupX'}
+
+        Returns:
+            DatasetIndex with trace information
+        """
+        import pandas as pd
+
+        logger.info(f"Building index from parquet: {parquet_path}")
+        start_time = time.time()
+
+        # Update header mapping if provided
+        if header_mapping:
+            self.header_mapping.update(header_mapping)
+
+        # Load headers dataframe
+        df = pd.read_parquet(parquet_path)
+        n_traces = len(df)
+
+        logger.info(f"Loaded {n_traces:,} trace headers from parquet")
+
+        # Helper to get column values
+        def get_column(field_name: str) -> Optional[np.ndarray]:
+            # Check explicit mapping
+            if field_name in self.header_mapping:
+                col_name = self.header_mapping[field_name]
+                if col_name in df.columns:
+                    return df[col_name].values
+            # Try default names
+            for name in self._default_headers.get(field_name, []):
+                if name in df.columns:
+                    return df[name].values
+            return None
+
+        # Extract coordinate arrays
+        source_x = get_column('source_x')
+        source_y = get_column('source_y')
+        receiver_x = get_column('receiver_x')
+        receiver_y = get_column('receiver_y')
+
+        # Get offset and azimuth (may be precomputed or need calculation)
+        offsets = get_column('offset')
+        azimuths = get_column('azimuth')
+
+        # Compute offset/azimuth if not present
+        if offsets is None and source_x is not None:
+            if self.compute_offset:
+                dx = receiver_x - source_x
+                dy = receiver_y - source_y
+                offsets = np.sqrt(dx**2 + dy**2)
+                logger.info("Computed offsets from coordinates")
+
+        if azimuths is None and source_x is not None:
+            if self.compute_azimuth:
+                dx = receiver_x - source_x
+                dy = receiver_y - source_y
+                azimuths = np.degrees(np.arctan2(dx, dy))
+                azimuths = np.where(azimuths < 0, azimuths + 360, azimuths)
+                logger.info("Computed azimuths from coordinates")
+
+        # Default values if still None
+        if offsets is None:
+            offsets = np.zeros(n_traces, dtype=np.float32)
+        if azimuths is None:
+            azimuths = np.zeros(n_traces, dtype=np.float32)
+
+        # Get inline/xline if available
+        inlines = get_column('inline')
+        xlines = get_column('xline')
+
+        # Compute CDP coordinates
+        cdp_x = None
+        cdp_y = None
+        if source_x is not None and receiver_x is not None:
+            cdp_x = (source_x + receiver_x) / 2
+            cdp_y = (source_y + receiver_y) / 2
+
+        # Build entries
+        entries = []
+        for i in range(n_traces):
+            entries.append(TraceIndexEntry(
+                trace_number=i,
+                file_position=0,
+                offset=float(offsets[i]),
+                azimuth=float(azimuths[i]),
+                inline=int(inlines[i]) if inlines is not None else None,
+                xline=int(xlines[i]) if xlines is not None else None,
+                cdp_x=float(cdp_x[i]) if cdp_x is not None else None,
+                cdp_y=float(cdp_y[i]) if cdp_y is not None else None,
+                source_x=float(source_x[i]) if source_x is not None else None,
+                source_y=float(source_y[i]) if source_y is not None else None,
+                receiver_x=float(receiver_x[i]) if receiver_x is not None else None,
+                receiver_y=float(receiver_y[i]) if receiver_y is not None else None,
+            ))
+
+            if i % 100000 == 0 and i > 0:
+                self._report_progress(i, n_traces, f"Building index: {i:,}/{n_traces:,}")
+
+        elapsed = time.time() - start_time
+
+        index = DatasetIndex(
+            filepath=str(parquet_path),
+            n_traces=n_traces,
+            n_samples=n_samples,
+            sample_rate_ms=sample_rate_ms,
+            entries=entries,
+            metadata={
+                'source': 'parquet',
+                'indexing_time_seconds': elapsed,
+                'compute_offset': self.compute_offset,
+                'compute_azimuth': self.compute_azimuth,
+                'header_mapping': self.header_mapping,
+            }
+        )
+
+        index.compute_statistics()
+
+        logger.info(
+            f"Built index for {n_traces:,} traces in {elapsed:.1f}s "
+            f"({n_traces/elapsed:,.0f} traces/s)"
+        )
+
+        return index
+
 
 class BinnedDataset:
     """

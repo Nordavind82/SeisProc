@@ -142,6 +142,126 @@ class NumpyDataReader(DataReader):
         return self._data.shape[1]
 
 
+class ZarrDataReader(DataReader):
+    """
+    Data reader for Zarr datasets.
+
+    Efficiently reads trace data from Zarr arrays with chunked access.
+    Supports both direct Zarr arrays and Zarr directories.
+
+    Handles both storage layouts:
+    - Standard: (n_traces, n_samples)
+    - Transposed: (n_samples, n_traces) - used by SeisProc import
+    """
+
+    def __init__(self, zarr_path: Path):
+        """
+        Initialize Zarr data reader.
+
+        Args:
+            zarr_path: Path to Zarr array or directory containing traces.zarr
+        """
+        import zarr
+        import json
+
+        zarr_path = Path(zarr_path)
+
+        # Determine the actual zarr array path
+        if zarr_path.name == 'traces.zarr' or (zarr_path / '.zarray').exists():
+            array_path = zarr_path
+            metadata_path = zarr_path.parent / 'metadata.json'
+        elif (zarr_path / 'traces.zarr').exists():
+            array_path = zarr_path / 'traces.zarr'
+            metadata_path = zarr_path / 'metadata.json'
+        else:
+            raise ValueError(f"No valid Zarr array found at {zarr_path}")
+
+        # Open zarr array - use keyword argument for mode (zarr v3 compatibility)
+        self._zarr = zarr.open_array(store=str(array_path), mode='r')
+
+        # Detect storage layout from metadata or array shape
+        # SeisProc stores as (n_samples, n_traces) - transposed
+        self._transposed = False
+
+        if metadata_path.exists():
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+            meta_n_samples = metadata.get('n_samples')
+            meta_n_traces = metadata.get('n_traces')
+
+            if meta_n_samples and meta_n_traces:
+                # Check if array is transposed based on metadata
+                if self._zarr.shape[0] == meta_n_samples and self._zarr.shape[1] == meta_n_traces:
+                    self._transposed = True
+                    self._n_samples = meta_n_samples
+                    self._n_traces = meta_n_traces
+                else:
+                    self._n_traces = self._zarr.shape[0]
+                    self._n_samples = self._zarr.shape[1]
+            else:
+                # No metadata hints - assume standard layout
+                self._n_traces = self._zarr.shape[0]
+                self._n_samples = self._zarr.shape[1]
+        else:
+            # No metadata - assume standard layout
+            self._n_traces = self._zarr.shape[0]
+            self._n_samples = self._zarr.shape[1]
+
+        # Log the detected layout
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(
+            f"ZarrDataReader: {self._n_traces:,} traces x {self._n_samples} samples "
+            f"(transposed={self._transposed})"
+        )
+
+    def read_traces(self, trace_numbers: np.ndarray) -> np.ndarray:
+        """
+        Read specified traces from Zarr array.
+
+        Returns array of shape (n_requested_traces, n_samples).
+        Handles transposed storage automatically.
+        """
+        trace_numbers = np.asarray(trace_numbers, dtype=np.int64)
+
+        if self._transposed:
+            # Data stored as (n_samples, n_traces) - need to slice columns and transpose
+            if len(trace_numbers) > 1 and np.all(np.diff(trace_numbers) == 1):
+                # Contiguous range - use slice for better performance
+                data = self._zarr[:, trace_numbers[0]:trace_numbers[-1]+1]
+            else:
+                # Non-contiguous - use fancy indexing
+                data = self._zarr[:, trace_numbers]
+            # Transpose to (n_traces, n_samples)
+            return data.T
+        else:
+            # Standard layout (n_traces, n_samples)
+            if len(trace_numbers) > 1 and np.all(np.diff(trace_numbers) == 1):
+                # Contiguous range - use slice
+                return self._zarr[trace_numbers[0]:trace_numbers[-1]+1, :]
+            # Non-contiguous - use fancy indexing
+            return self._zarr[trace_numbers, :]
+
+    def get_n_samples(self) -> int:
+        """Get number of samples per trace."""
+        return self._n_samples
+
+    @property
+    def n_traces(self) -> int:
+        """Get total number of traces."""
+        return self._n_traces
+
+    @property
+    def shape(self) -> Tuple[int, int]:
+        """Get array shape (n_traces, n_samples)."""
+        return (self._n_traces, self._n_samples)
+
+    @property
+    def is_transposed(self) -> bool:
+        """Check if underlying storage is transposed."""
+        return self._transposed
+
+
 class CommonOffsetGatherIterator(GatherIterator):
     """
     Iterator for common offset gathers.

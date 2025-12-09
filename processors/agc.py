@@ -3,6 +3,17 @@ AGC (Automatic Gain Control) Processor
 
 Fast vectorized implementation for amplitude equalization.
 Uses sliding window RMS for gain calculation.
+
+Note on max_gain removal (2024):
+    The explicit max_gain clipping was removed because it creates "shadow"
+    artifacts when used with filters that reverse AGC (like FKK). When an
+    outlier (e.g., air blast) exits the AGC window, adjacent quiet zones
+    need high gain to compensate. Clipping this gain creates artifacts that
+    mirror the outlier's shape.
+
+    Instead, we use adaptive epsilon based on data RMS, which provides
+    natural gain limiting without creating artifacts. The effective max
+    gain is approximately target_rms / epsilon.
 """
 import numpy as np
 from scipy.ndimage import uniform_filter
@@ -13,8 +24,8 @@ def apply_agc_vectorized(
     traces: np.ndarray,
     window_samples: int,
     target_rms: float = 1.0,
-    epsilon: float = 1e-10,
-    max_gain: float = 100.0
+    epsilon: float = None,
+    max_gain: float = None  # Deprecated, kept for backward compatibility
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Apply AGC (Automatic Gain Control) to seismic traces.
@@ -26,13 +37,20 @@ def apply_agc_vectorized(
         traces: 2D array (n_samples, n_traces)
         window_samples: Window length in samples (should be odd)
         target_rms: Target RMS value (default 1.0)
-        epsilon: Small value to prevent division by zero
-        max_gain: Maximum allowed gain factor (prevents extreme amplification)
+        epsilon: Noise floor for gain calculation. If None, automatically
+                 computed as 0.1% of global RMS. This prevents excessive
+                 amplification in dead zones while avoiding shadow artifacts.
+        max_gain: DEPRECATED - ignored. Kept for backward compatibility.
+                  Use epsilon to control maximum effective gain instead.
 
     Returns:
         Tuple of:
         - agc_traces: AGC-applied traces (same shape as input)
         - scale_factors: Scale factors used (for later inversion)
+
+    Note:
+        The effective maximum gain is approximately target_rms / epsilon.
+        With adaptive epsilon (0.1% of global RMS), typical max gain is ~1000.
 
     Performance:
         ~50ms for 1000 traces × 2000 samples on modern CPU
@@ -46,6 +64,14 @@ def apply_agc_vectorized(
     # Clip window to trace length if needed
     window_samples = min(window_samples, n_samples)
 
+    # Compute adaptive epsilon if not provided
+    # Use 0.1% of global RMS as noise floor - this gives effective max_gain ~1000
+    if epsilon is None:
+        global_rms = np.sqrt(np.mean(traces ** 2))
+        epsilon = 0.001 * global_rms
+        # Ensure minimum epsilon to prevent numerical issues
+        epsilon = max(epsilon, 1e-10)
+
     # Step 1: Compute squared traces
     traces_sq = traces ** 2
 
@@ -58,14 +84,13 @@ def apply_agc_vectorized(
     )
 
     # Step 3: Compute RMS from mean of squares
+    # Fix: Clamp to non-negative before sqrt (floating point precision can cause tiny negatives)
+    mean_sq = np.maximum(mean_sq, 0.0)
     rms = np.sqrt(mean_sq)
 
     # Step 4: Compute scale factors
-    # Add epsilon to avoid division by zero
+    # Epsilon provides natural gain limiting without creating shadow artifacts
     scale_factors = target_rms / (rms + epsilon)
-
-    # Clip extreme gains
-    scale_factors = np.clip(scale_factors, 0.0, max_gain)
 
     # Step 5: Apply scaling
     agc_traces = traces * scale_factors
@@ -168,14 +193,22 @@ try:
         traces: np.ndarray,
         window_samples: int,
         target_rms: float = 1.0,
-        epsilon: float = 1e-10,
-        max_gain: float = 100.0
+        epsilon: float = None,
+        max_gain: float = None  # Deprecated, kept for backward compatibility
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         GPU-accelerated AGC using CuPy.
 
         Same interface as apply_agc_vectorized but runs on GPU.
         Typically 5-10x faster for large gathers.
+
+        Args:
+            traces: 2D array (n_samples, n_traces)
+            window_samples: Window length in samples (should be odd)
+            target_rms: Target RMS value (default 1.0)
+            epsilon: Noise floor for gain calculation. If None, automatically
+                     computed as 0.1% of global RMS.
+            max_gain: DEPRECATED - ignored. Kept for backward compatibility.
         """
         # Transfer to GPU
         traces_gpu = cp.asarray(traces)
@@ -184,6 +217,12 @@ try:
         if window_samples % 2 == 0:
             window_samples += 1
 
+        # Compute adaptive epsilon if not provided
+        if epsilon is None:
+            global_rms = float(cp.sqrt(cp.mean(traces_gpu ** 2)))
+            epsilon = 0.001 * global_rms
+            epsilon = max(epsilon, 1e-10)
+
         # Same algorithm as CPU version
         traces_sq = traces_gpu ** 2
         mean_sq = uniform_filter_gpu(
@@ -191,9 +230,10 @@ try:
             size=(window_samples, 1),
             mode='reflect'
         )
+        # Fix: Clamp to non-negative before sqrt
+        mean_sq = cp.maximum(mean_sq, 0.0)
         rms = cp.sqrt(mean_sq)
         scale_factors_gpu = target_rms / (rms + epsilon)
-        scale_factors_gpu = cp.clip(scale_factors_gpu, 0.0, max_gain)
         agc_traces_gpu = traces_gpu * scale_factors_gpu
 
         # Transfer back to CPU

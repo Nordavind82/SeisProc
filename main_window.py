@@ -321,6 +321,17 @@ class MainWindow(QMainWindow):
         pstm_action.triggered.connect(self._open_pstm_from_menu)
         process_menu.addAction(pstm_action)
 
+        pstm_wizard_action = QAction("PSTM &Wizard...", self)
+        pstm_wizard_action.setShortcut("Ctrl+Shift+M")
+        pstm_wizard_action.setToolTip("Open the full PSTM configuration wizard")
+        pstm_wizard_action.triggered.connect(self._on_pstm_wizard_requested)
+        process_menu.addAction(pstm_wizard_action)
+
+        resume_migration_action = QAction("&Resume Migration...", self)
+        resume_migration_action.setToolTip("Resume an interrupted migration job from checkpoint")
+        resume_migration_action.triggered.connect(self._resume_migration)
+        process_menu.addAction(resume_migration_action)
+
         # View menu
         view_menu = menubar.addMenu("&View")
 
@@ -3043,15 +3054,192 @@ class MainWindow(QMainWindow):
 
     def _on_pstm_wizard_requested(self):
         """Handle request to open PSTM wizard dialog."""
-        # Placeholder for Phase 2 - full PSTM wizard with velocity picking,
-        # multi-gather processing, QC displays, etc.
-        QMessageBox.information(
+        from views.pstm_wizard_dialog import PSTMWizard
+
+        # Get the active dataset's storage path (Zarr directory)
+        initial_file = None
+        active_dataset_id = self.dataset_navigator.get_active_dataset_id()
+
+        if active_dataset_id:
+            info = self.dataset_navigator.get_dataset_info(active_dataset_id)
+            if info and info.storage_path and info.storage_path.exists():
+                initial_file = str(info.storage_path)
+                logger.info(f"PSTM Wizard: Using active dataset: {info.name} at {initial_file}")
+
+        # Fallback to original SEG-Y path if no active dataset
+        if not initial_file and hasattr(self, 'original_segy_path') and self.original_segy_path:
+            initial_file = self.original_segy_path
+
+        wizard = PSTMWizard(parent=self, initial_file=initial_file)
+        wizard.job_configured.connect(self._on_pstm_job_configured)
+        wizard.exec()
+
+    def _on_pstm_job_configured(self, config: dict):
+        """Handle completed PSTM wizard configuration."""
+        from views.migration_monitor_dialog import MigrationMonitorDialog
+
+        # Ask to start now
+        reply = QMessageBox.question(
             self,
-            "PSTM Wizard",
-            "Full PSTM Wizard will be available in Phase 2.\n\n"
-            "For now, use the Quick PSTM panel to apply migration\n"
-            "with constant velocity to the current gather."
+            "Start Migration",
+            f"Start migration job '{config.get('name', 'Migration')}' now?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
+
+        if reply == QMessageBox.StandardButton.Yes:
+            # Create and show monitor dialog
+            monitor = MigrationMonitorDialog(config, parent=self)
+            monitor.job_completed.connect(self._on_migration_job_completed)
+            monitor.show()
+            monitor.start_job()
+
+            # Track running jobs
+            if not hasattr(self, '_migration_monitors'):
+                self._migration_monitors = []
+            self._migration_monitors.append(monitor)
+
+            self.statusBar().showMessage(f"Migration job '{config.get('name')}' started")
+        else:
+            # Offer to save configuration
+            save_reply = QMessageBox.question(
+                self,
+                "Save Configuration",
+                "Would you like to save the job configuration for later?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if save_reply == QMessageBox.StandardButton.Yes:
+                self._save_migration_config(config)
+
+    def _on_migration_job_completed(self, success: bool, output_path: str):
+        """Handle migration job completion."""
+        if success:
+            self.statusBar().showMessage(f"Migration completed: {output_path}")
+            logger.info(f"Migration job completed successfully: {output_path}")
+        else:
+            self.statusBar().showMessage("Migration job failed or was cancelled")
+
+    def _save_migration_config(self, config: dict):
+        """Save migration configuration to file."""
+        import json
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Migration Configuration",
+            f"{config.get('name', 'migration_job')}.json",
+            "JSON Files (*.json);;All Files (*)"
+        )
+
+        if file_path:
+            try:
+                with open(file_path, 'w') as f:
+                    json.dump(config, f, indent=2)
+                self.statusBar().showMessage(f"Configuration saved: {file_path}")
+            except Exception as e:
+                QMessageBox.critical(
+                    self,
+                    "Save Error",
+                    f"Failed to save configuration:\n{e}"
+                )
+
+    def _resume_migration(self):
+        """Resume an interrupted migration job from checkpoint."""
+        from pathlib import Path
+        import json
+
+        # Let user select output directory or config file
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Migration Configuration or Checkpoint",
+            "",
+            "JSON Files (*.json);;All Files (*)"
+        )
+
+        if not file_path:
+            return
+
+        try:
+            # Load configuration
+            with open(file_path, 'r') as f:
+                config = json.load(f)
+
+            # Check if this is a valid migration config
+            if 'name' not in config:
+                QMessageBox.warning(
+                    self,
+                    "Invalid File",
+                    "This doesn't appear to be a valid migration configuration file."
+                )
+                return
+
+            # Check for checkpoint in output directory
+            output_dir = config.get('output_directory', '')
+            checkpoint_file = Path(output_dir) / 'checkpoint.json' if output_dir else None
+
+            if checkpoint_file and checkpoint_file.exists():
+                # Found checkpoint - offer to resume
+                reply = QMessageBox.question(
+                    self,
+                    "Checkpoint Found",
+                    f"Found checkpoint for job '{config.get('name')}'.\n\n"
+                    "Resume from checkpoint?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+
+                if reply == QMessageBox.StandardButton.Yes:
+                    # Load checkpoint info
+                    with open(checkpoint_file, 'r') as f:
+                        checkpoint = json.load(f)
+
+                    completed_bins = checkpoint.get('completed_bins', [])
+                    total_bins = checkpoint.get('total_bins', 0)
+
+                    self.statusBar().showMessage(
+                        f"Resuming: {len(completed_bins)}/{total_bins} bins completed"
+                    )
+
+                    # Mark config as resume
+                    config['_resume_from_checkpoint'] = True
+                    config['_checkpoint_file'] = str(checkpoint_file)
+            else:
+                # No checkpoint - start fresh
+                reply = QMessageBox.question(
+                    self,
+                    "Start Job",
+                    f"No checkpoint found.\n\n"
+                    f"Start job '{config.get('name')}' from beginning?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+
+            # Launch the job
+            from views.migration_monitor_dialog import MigrationMonitorDialog
+
+            monitor = MigrationMonitorDialog(config, parent=self)
+            monitor.job_completed.connect(self._on_migration_job_completed)
+            monitor.show()
+            monitor.start_job()
+
+            if not hasattr(self, '_migration_monitors'):
+                self._migration_monitors = []
+            self._migration_monitors.append(monitor)
+
+            self.statusBar().showMessage(f"Migration job '{config.get('name')}' started")
+
+        except json.JSONDecodeError:
+            QMessageBox.critical(
+                self,
+                "Invalid File",
+                "The selected file is not a valid JSON configuration."
+            )
+        except Exception as e:
+            logger.error(f"Failed to resume migration: {e}", exc_info=True)
+            QMessageBox.critical(
+                self,
+                "Resume Error",
+                f"Failed to resume migration:\n{e}"
+            )
 
     def _open_pstm_from_menu(self):
         """Open PSTM panel from Processing menu."""

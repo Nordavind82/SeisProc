@@ -8,6 +8,7 @@ from typing import Dict, Type, Any
 from .base_processor import BaseProcessor, ProgressCallback
 from .bandpass_filter import BandpassFilter, ProcessingPipeline
 from .tf_denoise import TFDenoise
+from .dwt_denoise import DWTDenoise, PYWT_AVAILABLE
 from .agc import apply_agc_vectorized, remove_agc, apply_agc_to_gather
 from .fk_filter import FKFilter
 from .fkk_filter_gpu import FKKFilterGPU, FKKFilterCPU, get_fkk_filter
@@ -26,6 +27,7 @@ from .migration.kirchhoff_migrator import KirchhoffMigrator
 PROCESSOR_REGISTRY: Dict[str, Type[BaseProcessor]] = {
     'BandpassFilter': BandpassFilter,
     'TFDenoise': TFDenoise,
+    'DWTDenoise': DWTDenoise,
     'FKFilter': FKFilter,
     'GainProcessor': GainProcessor,
     'ChunkedProcessor': ChunkedProcessor,
@@ -96,6 +98,8 @@ __all__ = [
     'BandpassFilter',
     'ProcessingPipeline',
     'TFDenoise',
+    'DWTDenoise',
+    'PYWT_AVAILABLE',
     'FKFilter',
     'FKKFilterGPU',
     'FKKFilterCPU',

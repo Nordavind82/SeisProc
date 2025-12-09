@@ -28,7 +28,9 @@ class FKKConfig:
         # AGC Parameters
         apply_agc: Whether to apply AGC before filtering and remove after
         agc_window_ms: AGC window length in milliseconds
-        agc_max_gain: Maximum AGC amplification factor
+        agc_max_gain: DEPRECATED - ignored. AGC now uses adaptive epsilon
+                      (0.1% of global RMS) for natural gain limiting without
+                      creating shadow artifacts from outliers like air blasts.
 
         # Frequency Band Selection
         f_min: Minimum frequency for filter action (Hz), None=0
@@ -61,7 +63,7 @@ class FKKConfig:
     # AGC parameters
     apply_agc: bool = False
     agc_window_ms: float = 500.0  # ms
-    agc_max_gain: float = 10.0
+    agc_max_gain: float = 10.0    # DEPRECATED - ignored, kept for backward compatibility
 
     # Frequency band selection
     f_min: Optional[float] = None  # Hz, None = 0

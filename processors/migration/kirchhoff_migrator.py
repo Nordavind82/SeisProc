@@ -230,12 +230,14 @@ class KirchhoffMigrator(BaseMigrator):
         z_axis: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Migrate a chunk of the output image.
+        Migrate a chunk of the output image - FULLY VECTORIZED with trace batching.
+
+        Processes all image points in parallel, traces in batches to manage memory.
 
         Args:
             traces: Input traces (n_samples, n_traces)
             n_samples: Number of samples
-            dt: Sample interval
+            dt: Sample interval in seconds
             src_x, src_y: Source coordinates (n_traces,)
             rcv_x, rcv_y: Receiver coordinates (n_traces,)
             offset: Source-receiver offset (n_traces,)
@@ -251,77 +253,92 @@ class KirchhoffMigrator(BaseMigrator):
         n_xl = len(img_y)
         n_traces = len(src_x)
 
-        # Initialize output chunk
+        # Initialize output
         image_chunk = torch.zeros(n_z, n_il, n_xl, device=self.device, dtype=torch.float32)
         fold_chunk = torch.zeros(n_z, n_il, n_xl, device=self.device, dtype=torch.float32)
 
-        # Create meshgrid of image coordinates
-        # (n_il, n_xl) grids
+        # Create meshgrid of image coordinates: (n_il, n_xl)
         img_xx, img_yy = torch.meshgrid(img_x, img_y, indexing='ij')
+        img_x_flat = img_xx.flatten()  # (n_points,)
+        img_y_flat = img_yy.flatten()
+        n_points = n_il * n_xl
 
-        # Process each image point
-        for i_il in range(n_il):
-            for i_xl in range(n_xl):
-                ix = img_x[i_il].item()
-                iy = img_y[i_xl].item()
+        # Process traces in batches to manage memory
+        # Memory estimate: n_z * n_points * batch_size * 4 bytes * 5 tensors
+        # For 1000 depths, 10K points, target 1GB -> batch_size ~ 50
+        mem_per_trace = n_z * n_points * 4 * 5
+        target_mem = 1e9  # 1GB
+        trace_batch_size = max(10, min(n_traces, int(target_mem / mem_per_trace)))
 
-                # Compute horizontal distances to all traces
-                h_src = torch.sqrt((ix - src_x)**2 + (iy - src_y)**2)
-                h_rcv = torch.sqrt((ix - rcv_x)**2 + (iy - rcv_y)**2)
+        v = self.velocity.v0
+        max_angle_rad = np.radians(self.config.max_angle_deg)
+        max_aperture = self.config.max_aperture_m
 
-                # Compute aperture mask for this column
-                aperture_mask = self.aperture.compute_simple_mask(
-                    h_src.unsqueeze(0).expand(n_z, -1),
-                    h_rcv.unsqueeze(0).expand(n_z, -1),
-                    z_axis,
-                    offset,
-                )  # (n_z, n_traces)
+        # Precompute z expansion
+        z_expanded = z_axis.view(n_z, 1, 1)  # (n_z, 1, 1)
 
-                # Compute traveltimes for all depths and traces
-                # t_src: time from source to image point
-                # t_rcv: time from image point to receiver
-                t_src = self.traveltime_calc.compute_traveltime(
-                    x_offset=(ix - src_x),
-                    y_offset=(iy - src_y),
-                    z_depth=z_axis.unsqueeze(1),  # (n_z, 1)
-                )  # (n_z, n_traces)
+        for t_start in range(0, n_traces, trace_batch_size):
+            t_end = min(t_start + trace_batch_size, n_traces)
+            batch_size = t_end - t_start
 
-                t_rcv = self.traveltime_calc.compute_traveltime(
-                    x_offset=(ix - rcv_x),
-                    y_offset=(iy - rcv_y),
-                    z_depth=z_axis.unsqueeze(1),
-                )  # (n_z, n_traces)
+            # Get batch of trace data and coordinates
+            traces_batch = traces[:, t_start:t_end]  # (n_samples, batch)
+            sx = src_x[t_start:t_end]
+            sy = src_y[t_start:t_end]
+            rx = rcv_x[t_start:t_end]
+            ry = rcv_y[t_start:t_end]
 
-                t_total = t_src + t_rcv  # (n_z, n_traces)
+            # Compute distances: (n_points, batch)
+            dx_src = img_x_flat.unsqueeze(1) - sx.unsqueeze(0)
+            dy_src = img_y_flat.unsqueeze(1) - sy.unsqueeze(0)
+            dx_rcv = img_x_flat.unsqueeze(1) - rx.unsqueeze(0)
+            dy_rcv = img_y_flat.unsqueeze(1) - ry.unsqueeze(0)
 
-                # Compute amplitude weights
-                angle_src = torch.atan2(h_src, z_axis.unsqueeze(1).abs())
-                angle_rcv = torch.atan2(h_rcv, z_axis.unsqueeze(1).abs())
-                r_src = torch.sqrt(h_src**2 + z_axis.unsqueeze(1)**2)
-                r_rcv = torch.sqrt(h_rcv**2 + z_axis.unsqueeze(1)**2)
+            h_src = torch.sqrt(dx_src**2 + dy_src**2)
+            h_rcv = torch.sqrt(dx_rcv**2 + dy_rcv**2)
 
-                weights = self.weight_calc.compute_weight(
-                    r_src, r_rcv, angle_src, angle_rcv, self.velocity.v0
-                )  # (n_z, n_traces)
+            # Expand for depth dimension: (n_z, n_points, batch)
+            h_src_exp = h_src.unsqueeze(0)
+            h_rcv_exp = h_rcv.unsqueeze(0)
 
-                # Combine with aperture
-                weights = weights * aperture_mask
+            # Distances and traveltimes
+            r_src = torch.sqrt(h_src_exp**2 + z_expanded**2)
+            r_rcv = torch.sqrt(h_rcv_exp**2 + z_expanded**2)
+            t_total = (r_src + r_rcv) / v
 
-                # Interpolate traces at computed traveltimes
-                amplitudes = interpolate_batch(
-                    traces, t_total, dt, t0=0.0, method='linear', device=self.device
-                )  # (n_z, n_traces)
+            # Aperture mask
+            angle_src = torch.atan2(h_src_exp, z_expanded.abs() + 1e-6)
+            angle_rcv = torch.atan2(h_rcv_exp, z_expanded.abs() + 1e-6)
+            mask = (angle_src < max_angle_rad) & (angle_rcv < max_angle_rad)
+            mask = mask & (h_src_exp < max_aperture) & (h_rcv_exp < max_aperture)
+            aperture_mask = mask.float()
 
-                # Stack: sum weighted amplitudes
-                stacked = torch.sum(amplitudes * weights, dim=1)  # (n_z,)
+            # Weights: 1/r spreading
+            weights = aperture_mask / (r_src * r_rcv + 1e-6)
 
-                # Fold: count contributing traces
-                contributing = (aperture_mask > 0).float()
-                fold_sum = torch.sum(contributing, dim=1)  # (n_z,)
+            # Interpolate traces at traveltimes
+            sample_idx = torch.clamp(t_total / dt, 0, n_samples - 2)
+            idx_floor = sample_idx.long()
+            frac = sample_idx - idx_floor.float()
 
-                # Store in output
-                image_chunk[:, i_il, i_xl] = stacked
-                fold_chunk[:, i_il, i_xl] = fold_sum
+            # Create batch indices for gather
+            batch_idx = torch.arange(batch_size, device=self.device).view(1, 1, batch_size).expand(n_z, n_points, -1)
+            idx_floor_clamped = torch.clamp(idx_floor, 0, n_samples - 1)
+            idx_ceil_clamped = torch.clamp(idx_floor + 1, 0, n_samples - 1)
+
+            # Flatten for indexing
+            idx_f = idx_floor_clamped.reshape(-1)
+            idx_c = idx_ceil_clamped.reshape(-1)
+            b_idx = batch_idx.reshape(-1)
+
+            # Gather amplitudes
+            amp_floor = traces_batch[idx_f, b_idx].reshape(n_z, n_points, batch_size)
+            amp_ceil = traces_batch[idx_c, b_idx].reshape(n_z, n_points, batch_size)
+            amplitudes = amp_floor + frac * (amp_ceil - amp_floor)
+
+            # Accumulate weighted sum
+            image_chunk += torch.sum(amplitudes * weights, dim=2).reshape(n_z, n_il, n_xl)
+            fold_chunk += torch.sum(aperture_mask, dim=2).reshape(n_z, n_il, n_xl)
 
         return image_chunk, fold_chunk
 
@@ -340,22 +357,33 @@ class KirchhoffMigrator(BaseMigrator):
 
     def _get_optimal_chunk_size(self, n_traces: int, n_z: int) -> int:
         """Determine optimal chunk size based on available memory."""
-        # Rough estimate: each image point needs n_z * n_traces * 4 bytes
-        # for traveltimes, weights, and amplitudes
-        bytes_per_point = n_z * n_traces * 4 * 4  # 4 arrays, float32
+        # Memory per image point for vectorized computation:
+        # - Distances: 4 tensors * n_points * n_traces * 4 bytes
+        # - Traveltimes: n_z * n_points * n_traces * 4 bytes
+        # - Weights/amplitudes: n_z * n_points * n_traces * 4 bytes * 3
+        # Total: ~5 * n_z * n_points * n_traces * 4 bytes
 
-        # Target 1GB per chunk
-        target_bytes = 1e9
+        bytes_per_point = n_z * n_traces * 4 * 5  # 5 arrays, float32
+
+        # Target memory usage (4GB for GPU, can be higher on Apple Silicon)
+        if self.device.type == 'mps':
+            target_bytes = 4e9  # 4GB for Metal
+        elif self.device.type == 'cuda':
+            target_bytes = 6e9  # 6GB for CUDA
+        else:
+            target_bytes = 2e9  # 2GB for CPU
+
         max_points = int(target_bytes / bytes_per_point)
 
         # Chunk size is sqrt of max points (for 2D grid)
         chunk_size = max(1, int(np.sqrt(max_points)))
 
-        # Limit to reasonable range
-        chunk_size = min(chunk_size, 100)
-        chunk_size = max(chunk_size, 10)
+        # For vectorized code, we can handle larger chunks
+        # But limit to full grid if it fits
+        chunk_size = min(chunk_size, 100)  # Max 100x100 = 10K points per chunk
+        chunk_size = max(chunk_size, 10)   # Min 10x10 = 100 points
 
-        logger.debug(f"Using chunk size {chunk_size} for {n_traces} traces, {n_z} depths")
+        logger.debug(f"Vectorized chunk size {chunk_size}x{chunk_size} for {n_traces} traces, {n_z} depths")
         return chunk_size
 
     def migrate_dataset(
