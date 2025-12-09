@@ -16,8 +16,10 @@ import sys
 
 # Fix for segmentation fault: Set Qt/display environment variables BEFORE importing PyQt6
 # This prevents OpenGL integration issues that cause crashes on some systems
-os.environ.setdefault('QT_QPA_PLATFORM', 'xcb')          # Use X11 backend
-os.environ.setdefault('QT_XCB_GL_INTEGRATION', 'none')  # Disable OpenGL (prevents segfault)
+if sys.platform == 'linux':
+    os.environ.setdefault('QT_QPA_PLATFORM', 'xcb')          # Use X11 backend on Linux
+    os.environ.setdefault('QT_XCB_GL_INTEGRATION', 'none')   # Disable OpenGL (prevents segfault)
+# On macOS, use default 'cocoa' platform (no need to set)
 os.environ.setdefault('MPLBACKEND', 'Agg')              # Non-interactive matplotlib backend
 
 # CRITICAL: Force Qt to use portable settings format instead of native D-Bus/system services

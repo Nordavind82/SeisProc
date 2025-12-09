@@ -599,6 +599,35 @@ class ControlPanel(QWidget):
         mode_filter_layout.addWidget(self.fkk_filter_mode_combo)
         apply_layout.addLayout(mode_filter_layout)
 
+        # AGC checkbox
+        agc_layout = QHBoxLayout()
+        self.fkk_agc_checkbox = QCheckBox("Apply AGC")
+        self.fkk_agc_checkbox.setToolTip("Normalize amplitudes before filtering")
+        agc_layout.addWidget(self.fkk_agc_checkbox)
+        agc_layout.addWidget(QLabel("Window:"))
+        self.fkk_agc_window_spin = QDoubleSpinBox()
+        self.fkk_agc_window_spin.setRange(50, 2000)
+        self.fkk_agc_window_spin.setValue(500)
+        self.fkk_agc_window_spin.setSuffix(" ms")
+        agc_layout.addWidget(self.fkk_agc_window_spin)
+        apply_layout.addLayout(agc_layout)
+
+        # Frequency band
+        freq_layout = QHBoxLayout()
+        freq_layout.addWidget(QLabel("Freq:"))
+        self.fkk_fmin_spin = QDoubleSpinBox()
+        self.fkk_fmin_spin.setRange(0, 500)
+        self.fkk_fmin_spin.setValue(0)
+        self.fkk_fmin_spin.setSuffix(" Hz")
+        freq_layout.addWidget(self.fkk_fmin_spin)
+        freq_layout.addWidget(QLabel("-"))
+        self.fkk_fmax_spin = QDoubleSpinBox()
+        self.fkk_fmax_spin.setRange(1, 500)
+        self.fkk_fmax_spin.setValue(self.nyquist_freq)
+        self.fkk_fmax_spin.setSuffix(" Hz")
+        freq_layout.addWidget(self.fkk_fmax_spin)
+        apply_layout.addLayout(freq_layout)
+
         # Apply button
         self.fkk_apply_btn = QPushButton("Apply FKK Filter")
         self.fkk_apply_btn.setStyleSheet("""
@@ -651,11 +680,18 @@ class ControlPanel(QWidget):
 
     def _on_fkk_apply_clicked(self):
         """Handle FKK apply button click."""
+        f_min = self.fkk_fmin_spin.value()
+        f_max = self.fkk_fmax_spin.value()
+
         config = FKKConfig(
             v_min=self.fkk_vmin_spin.value(),
             v_max=self.fkk_vmax_spin.value(),
             mode=self.fkk_filter_mode_combo.currentData(),
-            taper_width=0.1
+            taper_width=0.1,
+            apply_agc=self.fkk_agc_checkbox.isChecked(),
+            agc_window_ms=self.fkk_agc_window_spin.value(),
+            f_min=f_min if f_min > 0 else None,
+            f_max=f_max if f_max < self.nyquist_freq else None
         )
         self.fkk_apply_requested.emit(config)
 

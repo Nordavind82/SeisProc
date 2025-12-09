@@ -2827,7 +2827,18 @@ class MainWindow(QMainWindow):
                     sample_rate=self.input_data.sample_rate,
                     metadata={**self.input_data.metadata, 'fkk_filtered': True}
                 )
-                self._update_processed_view()
+
+                # Calculate difference
+                difference_traces = self.input_data.traces - self.processed_data.traces
+                self.difference_data = SeismicData(
+                    traces=difference_traces,
+                    sample_rate=self.input_data.sample_rate,
+                    metadata={'description': 'Difference (Input - FKK Filtered)'}
+                )
+
+                # Update viewers
+                self.processed_viewer.set_data(self.processed_data)
+                self.difference_viewer.set_data(self.difference_data)
 
                 self.statusBar().showMessage(
                     f"FKK filter applied: {config.get_summary()}"

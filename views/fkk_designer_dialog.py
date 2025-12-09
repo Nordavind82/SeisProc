@@ -13,9 +13,9 @@ UI Layout:
 import numpy as np
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QGroupBox, QSlider, QDoubleSpinBox, QComboBox,
-    QRadioButton, QButtonGroup, QWidget, QSplitter,
-    QStatusBar, QProgressBar, QMessageBox
+    QGroupBox, QSlider, QDoubleSpinBox, QComboBox, QSpinBox,
+    QRadioButton, QButtonGroup, QWidget, QSplitter, QCheckBox,
+    QStatusBar, QProgressBar, QMessageBox, QScrollArea
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from typing import Optional, Tuple, Dict
@@ -365,6 +365,71 @@ class FKKDesignerDialog(QDialog):
         taper_layout.addWidget(self.taper_spin)
         controls_layout.addLayout(taper_layout)
 
+        # === Quality Improvements Section (v2.0) ===
+        controls_layout.addWidget(QLabel(""))  # Spacer
+
+        # AGC controls
+        agc_layout = QHBoxLayout()
+        self.agc_checkbox = QCheckBox("Apply AGC")
+        self.agc_checkbox.setChecked(self.config.apply_agc)
+        self.agc_checkbox.setToolTip("Apply AGC before filtering and remove after using same scalars")
+        agc_layout.addWidget(self.agc_checkbox)
+        agc_layout.addWidget(QLabel("Window:"))
+        self.agc_window_spin = QDoubleSpinBox()
+        self.agc_window_spin.setRange(50, 5000)
+        self.agc_window_spin.setValue(self.config.agc_window_ms)
+        self.agc_window_spin.setSuffix(" ms")
+        self.agc_window_spin.setMinimumWidth(80)
+        agc_layout.addWidget(self.agc_window_spin)
+        agc_layout.addWidget(QLabel("Max Gain:"))
+        self.agc_gain_spin = QDoubleSpinBox()
+        self.agc_gain_spin.setRange(1, 100)
+        self.agc_gain_spin.setValue(self.config.agc_max_gain)
+        self.agc_gain_spin.setMinimumWidth(60)
+        agc_layout.addWidget(self.agc_gain_spin)
+        controls_layout.addLayout(agc_layout)
+
+        # Frequency band selection
+        freq_band_layout = QHBoxLayout()
+        freq_band_layout.addWidget(QLabel("Freq Band:"))
+        self.f_min_spin = QDoubleSpinBox()
+        self.f_min_spin.setRange(0, 500)
+        self.f_min_spin.setValue(self.config.f_min if self.config.f_min is not None else 0)
+        self.f_min_spin.setSuffix(" Hz")
+        self.f_min_spin.setSpecialValueText("0 Hz")
+        self.f_min_spin.setToolTip("Minimum frequency for filter action (0 = DC)")
+        freq_band_layout.addWidget(self.f_min_spin)
+        freq_band_layout.addWidget(QLabel("to"))
+        nyquist = 0.5 / self.volume.dt
+        self.f_max_spin = QDoubleSpinBox()
+        self.f_max_spin.setRange(1, nyquist)
+        self.f_max_spin.setValue(self.config.f_max if self.config.f_max is not None else nyquist)
+        self.f_max_spin.setSuffix(" Hz")
+        self.f_max_spin.setToolTip("Maximum frequency for filter action (Nyquist = {:.0f} Hz)".format(nyquist))
+        freq_band_layout.addWidget(self.f_max_spin)
+        freq_band_layout.addStretch()
+        controls_layout.addLayout(freq_band_layout)
+
+        # Temporal tapering (ms on top/bottom)
+        temporal_taper_layout = QHBoxLayout()
+        temporal_taper_layout.addWidget(QLabel("Temporal Taper:"))
+        temporal_taper_layout.addWidget(QLabel("Top:"))
+        self.taper_top_spin = QDoubleSpinBox()
+        self.taper_top_spin.setRange(0, 1000)
+        self.taper_top_spin.setValue(self.config.taper_ms_top)
+        self.taper_top_spin.setSuffix(" ms")
+        self.taper_top_spin.setToolTip("Taper length at top of traces")
+        temporal_taper_layout.addWidget(self.taper_top_spin)
+        temporal_taper_layout.addWidget(QLabel("Bottom:"))
+        self.taper_bottom_spin = QDoubleSpinBox()
+        self.taper_bottom_spin.setRange(0, 1000)
+        self.taper_bottom_spin.setValue(self.config.taper_ms_bottom)
+        self.taper_bottom_spin.setSuffix(" ms")
+        self.taper_bottom_spin.setToolTip("Taper length at bottom of traces")
+        temporal_taper_layout.addWidget(self.taper_bottom_spin)
+        temporal_taper_layout.addStretch()
+        controls_layout.addLayout(temporal_taper_layout)
+
         # Preset selection
         preset_layout = QHBoxLayout()
         preset_layout.addWidget(QLabel("Preset:"))
@@ -433,6 +498,15 @@ class FKKDesignerDialog(QDialog):
         self.taper_slider.valueChanged.connect(self._on_taper_slider_changed)
         self.taper_spin.valueChanged.connect(self._on_taper_spin_changed)
         self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)
+
+        # Quality improvement controls (v2.0)
+        self.agc_checkbox.stateChanged.connect(self._on_agc_changed)
+        self.agc_window_spin.valueChanged.connect(self._on_agc_window_changed)
+        self.agc_gain_spin.valueChanged.connect(self._on_agc_gain_changed)
+        self.f_min_spin.valueChanged.connect(self._on_freq_band_changed)
+        self.f_max_spin.valueChanged.connect(self._on_freq_band_changed)
+        self.taper_top_spin.valueChanged.connect(self._on_temporal_taper_changed)
+        self.taper_bottom_spin.valueChanged.connect(self._on_temporal_taper_changed)
 
         # Actions
         self.compute_btn.clicked.connect(self._compute_spectrum)
@@ -542,6 +616,37 @@ class FKKDesignerDialog(QDialog):
         self.config.taper_width = value
         self._request_apply_filter()
 
+    def _on_agc_changed(self, state: int):
+        """Handle AGC checkbox change."""
+        self.config.apply_agc = (state == Qt.CheckState.Checked.value)
+        self._request_apply_filter()
+
+    def _on_agc_window_changed(self, value: float):
+        """Handle AGC window change."""
+        self.config.agc_window_ms = value
+        if self.config.apply_agc:
+            self._request_apply_filter()
+
+    def _on_agc_gain_changed(self, value: float):
+        """Handle AGC max gain change."""
+        self.config.agc_max_gain = value
+        if self.config.apply_agc:
+            self._request_apply_filter()
+
+    def _on_freq_band_changed(self, value: float):
+        """Handle frequency band change."""
+        f_min = self.f_min_spin.value()
+        f_max = self.f_max_spin.value()
+        self.config.f_min = f_min if f_min > 0 else None
+        self.config.f_max = f_max if f_max < (0.5 / self.volume.dt) else None
+        self._request_apply_filter()
+
+    def _on_temporal_taper_changed(self, value: float):
+        """Handle temporal taper change."""
+        self.config.taper_ms_top = self.taper_top_spin.value()
+        self.config.taper_ms_bottom = self.taper_bottom_spin.value()
+        self._request_apply_filter()
+
     def _on_preset_changed(self, index: int):
         """Handle preset selection."""
         name = self.preset_combo.currentData()
@@ -563,7 +668,15 @@ class FKKDesignerDialog(QDialog):
         self.taper_spin.blockSignals(True)
         self.az_min_spin.blockSignals(True)
         self.az_max_spin.blockSignals(True)
+        self.agc_checkbox.blockSignals(True)
+        self.agc_window_spin.blockSignals(True)
+        self.agc_gain_spin.blockSignals(True)
+        self.f_min_spin.blockSignals(True)
+        self.f_max_spin.blockSignals(True)
+        self.taper_top_spin.blockSignals(True)
+        self.taper_bottom_spin.blockSignals(True)
 
+        # Core parameters
         self.v_min_slider.setValue(int(config.v_min))
         self.v_min_spin.setValue(config.v_min)
         self.v_max_slider.setValue(int(config.v_max))
@@ -578,6 +691,18 @@ class FKKDesignerDialog(QDialog):
         else:
             self.mode_pass.setChecked(True)
 
+        # Quality improvement parameters (v2.0)
+        self.agc_checkbox.setChecked(config.apply_agc)
+        self.agc_window_spin.setValue(config.agc_window_ms)
+        self.agc_gain_spin.setValue(config.agc_max_gain)
+
+        nyquist = 0.5 / self.volume.dt
+        self.f_min_spin.setValue(config.f_min if config.f_min is not None else 0)
+        self.f_max_spin.setValue(config.f_max if config.f_max is not None else nyquist)
+
+        self.taper_top_spin.setValue(config.taper_ms_top)
+        self.taper_bottom_spin.setValue(config.taper_ms_bottom)
+
         # Unblock signals
         self.v_min_slider.blockSignals(False)
         self.v_min_spin.blockSignals(False)
@@ -587,6 +712,13 @@ class FKKDesignerDialog(QDialog):
         self.taper_spin.blockSignals(False)
         self.az_min_spin.blockSignals(False)
         self.az_max_spin.blockSignals(False)
+        self.agc_checkbox.blockSignals(False)
+        self.agc_window_spin.blockSignals(False)
+        self.agc_gain_spin.blockSignals(False)
+        self.f_min_spin.blockSignals(False)
+        self.f_max_spin.blockSignals(False)
+        self.taper_top_spin.blockSignals(False)
+        self.taper_bottom_spin.blockSignals(False)
 
     # =========================================================================
     # Processing
