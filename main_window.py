@@ -168,6 +168,9 @@ class MainWindow(QMainWindow):
         self.control_panel.fk_config_selected.connect(self._on_fk_config_selected)
         self.control_panel.fkk_design_requested.connect(self._on_fkk_design_requested)
         self.control_panel.fkk_apply_requested.connect(self._on_fkk_apply_requested)
+        # PSTM signals
+        self.control_panel.pstm_apply_requested.connect(self._on_pstm_apply_requested)
+        self.control_panel.pstm_wizard_requested.connect(self._on_pstm_wizard_requested)
         # Connect auto-scale button to auto-scale method
         auto_scale_btn = self.control_panel.findChild(QPushButton, "Auto Scale from Data")
         if not auto_scale_btn:
@@ -308,6 +311,15 @@ class MainWindow(QMainWindow):
         fkk_test_action.setToolTip("Generate synthetic 3D volume for testing FKK filter")
         fkk_test_action.triggered.connect(self._generate_test_3d_volume)
         process_menu.addAction(fkk_test_action)
+
+        process_menu.addSeparator()
+
+        # Migration section
+        pstm_action = QAction("&Kirchhoff PSTM...", self)
+        pstm_action.setShortcut("Ctrl+M")
+        pstm_action.setToolTip("Apply Pre-Stack Time Migration to current gather")
+        pstm_action.triggered.connect(self._open_pstm_from_menu)
+        process_menu.addAction(pstm_action)
 
         # View menu
         view_menu = menubar.addMenu("&View")
@@ -2905,6 +2917,269 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"FKK filter applied: {config.get_summary()}"
         )
+
+    # =========================================================================
+    # PSTM (Pre-Stack Time Migration) Handlers
+    # =========================================================================
+
+    def _on_pstm_apply_requested(self, velocity: float, aperture: float, max_angle: float):
+        """
+        Handle PSTM apply request from control panel.
+
+        Args:
+            velocity: Constant velocity in m/s
+            aperture: Migration aperture in meters
+            max_angle: Maximum migration angle in degrees
+        """
+        if self.input_data is None:
+            QMessageBox.warning(
+                self,
+                "No Data",
+                "Please load seismic data first."
+            )
+            return
+
+        # Check if we have geometry headers
+        if self.headers_df is None or self.headers_df.empty:
+            QMessageBox.warning(
+                self,
+                "No Geometry",
+                "No trace headers available.\n\n"
+                "PSTM requires source/receiver coordinates from trace headers.\n"
+                "Please ensure your SEG-Y file has geometry information."
+            )
+            return
+
+        try:
+            self.statusBar().showMessage("Preparing PSTM migration...")
+            QApplication.processEvents()
+
+            # Import PSTM components
+            from processors.migration import KirchhoffMigrator
+            from models.velocity_model import create_constant_velocity
+            from models.migration_geometry import MigrationGeometry
+
+            # Create constant velocity model
+            velocity_model = create_constant_velocity(velocity, is_time=True)
+
+            # Create geometry from headers
+            geometry = self._create_geometry_from_headers()
+            if geometry is None:
+                return  # Error already shown
+
+            # Create migrator
+            migrator = KirchhoffMigrator(
+                velocity=velocity_model,
+                aperture=aperture,
+                max_angle=max_angle,
+                dt=self.input_data.sample_rate,
+                prefer_gpu=self.control_panel.use_gpu() if hasattr(self.control_panel, 'use_gpu') else True,
+            )
+
+            self.statusBar().showMessage(f"Running PSTM (v={velocity:.0f} m/s, aperture={aperture:.0f}m)...")
+            QApplication.processEvents()
+
+            # Migrate the current gather
+            output_image, output_fold = migrator.migrate_gather(
+                gather=self.input_data,
+                geometry=geometry,
+            )
+
+            # Convert output to SeismicData for display
+            # The migrated image is the zero-offset section
+            import torch
+            if isinstance(output_image, torch.Tensor):
+                migrated_traces = output_image.cpu().numpy()
+            else:
+                migrated_traces = output_image
+
+            # Ensure 2D array (time x traces)
+            if migrated_traces.ndim == 1:
+                migrated_traces = migrated_traces.reshape(-1, 1)
+
+            self.processed_data = SeismicData(
+                traces=migrated_traces,
+                sample_rate=self.input_data.sample_rate,
+                metadata={
+                    **self.input_data.metadata,
+                    'pstm_migrated': True,
+                    'pstm_velocity': velocity,
+                    'pstm_aperture': aperture,
+                    'pstm_max_angle': max_angle,
+                }
+            )
+
+            # Calculate difference (input - migrated)
+            # Note: Shapes may differ, so handle carefully
+            if self.processed_data.traces.shape == self.input_data.traces.shape:
+                difference_traces = self.input_data.traces - self.processed_data.traces
+                self.difference_data = SeismicData(
+                    traces=difference_traces,
+                    sample_rate=self.input_data.sample_rate,
+                    metadata={'description': 'Difference (Input - PSTM)'}
+                )
+                self.difference_viewer.set_data(self.difference_data)
+            else:
+                # Clear difference view if shapes don't match
+                self.difference_viewer.clear()
+                self.difference_data = None
+
+            # Update processed viewer
+            self.processed_viewer.set_data(self.processed_data)
+
+            self.statusBar().showMessage(
+                f"PSTM completed: velocity={velocity:.0f} m/s, "
+                f"aperture={aperture:.0f}m, max_angle={max_angle:.0f}°"
+            )
+
+        except Exception as e:
+            logger.error(f"PSTM migration failed: {e}", exc_info=True)
+            QMessageBox.critical(
+                self,
+                "PSTM Error",
+                f"Migration failed:\n\n{str(e)}"
+            )
+            self.statusBar().showMessage("PSTM migration failed")
+
+    def _on_pstm_wizard_requested(self):
+        """Handle request to open PSTM wizard dialog."""
+        # Placeholder for Phase 2 - full PSTM wizard with velocity picking,
+        # multi-gather processing, QC displays, etc.
+        QMessageBox.information(
+            self,
+            "PSTM Wizard",
+            "Full PSTM Wizard will be available in Phase 2.\n\n"
+            "For now, use the Quick PSTM panel to apply migration\n"
+            "with constant velocity to the current gather."
+        )
+
+    def _open_pstm_from_menu(self):
+        """Open PSTM panel from Processing menu."""
+        # Switch to PSTM algorithm in control panel
+        if hasattr(self.control_panel, 'algorithm_combo'):
+            # Find Kirchhoff PSTM index (should be 4)
+            combo = self.control_panel.algorithm_combo
+            for i in range(combo.count()):
+                if 'PSTM' in combo.itemText(i) or 'Kirchhoff' in combo.itemText(i):
+                    combo.setCurrentIndex(i)
+                    self.statusBar().showMessage(
+                        "PSTM selected - configure parameters and click 'Apply PSTM'"
+                    )
+                    return
+
+            QMessageBox.warning(
+                self,
+                "PSTM Not Available",
+                "Kirchhoff PSTM algorithm not found in algorithm list."
+            )
+
+    def _create_geometry_from_headers(self):
+        """
+        Create MigrationGeometry from current gather's trace headers.
+
+        Returns:
+            MigrationGeometry or None if geometry cannot be created
+        """
+        from models.migration_geometry import MigrationGeometry
+
+        if self.headers_df is None or self.headers_df.empty:
+            return None
+
+        # Try to find coordinate columns
+        # Common SEG-Y header names for coordinates
+        sx_keys = ['SourceX', 'SX', 'sx', 'source_x', 'SourceXCoordinate']
+        sy_keys = ['SourceY', 'SY', 'sy', 'source_y', 'SourceYCoordinate']
+        gx_keys = ['GroupX', 'GX', 'gx', 'ReceiverX', 'RX', 'rx', 'receiver_x', 'GroupXCoordinate']
+        gy_keys = ['GroupY', 'GY', 'gy', 'ReceiverY', 'RY', 'ry', 'receiver_y', 'GroupYCoordinate']
+
+        available_cols = set(self.headers_df.columns)
+
+        def find_key(key_options):
+            for k in key_options:
+                if k in available_cols:
+                    return k
+            return None
+
+        sx_key = find_key(sx_keys)
+        sy_key = find_key(sy_keys)
+        gx_key = find_key(gx_keys)
+        gy_key = find_key(gy_keys)
+
+        missing = []
+        if sx_key is None:
+            missing.append("Source X")
+        if sy_key is None:
+            missing.append("Source Y")
+        if gx_key is None:
+            missing.append("Receiver X")
+        if gy_key is None:
+            missing.append("Receiver Y")
+
+        if missing:
+            QMessageBox.warning(
+                self,
+                "Missing Geometry",
+                f"Cannot find coordinate headers for:\n  {', '.join(missing)}\n\n"
+                f"Available headers:\n  {', '.join(sorted(available_cols)[:20])}\n\n"
+                "PSTM requires source and receiver coordinates."
+            )
+            return None
+
+        try:
+            # Get coordinate arrays
+            source_x = self.headers_df[sx_key].values.astype(np.float32)
+            source_y = self.headers_df[sy_key].values.astype(np.float32)
+            receiver_x = self.headers_df[gx_key].values.astype(np.float32)
+            receiver_y = self.headers_df[gy_key].values.astype(np.float32)
+
+            # Check for coordinate scalar (common in SEG-Y)
+            # Coordinates might be in tenths of meters or other units
+            coord_scalar = 1.0
+            if 'SourceGroupScalar' in available_cols:
+                scalar_val = self.headers_df['SourceGroupScalar'].iloc[0]
+                if scalar_val < 0:
+                    coord_scalar = 1.0 / abs(scalar_val)
+                elif scalar_val > 0:
+                    coord_scalar = float(scalar_val)
+
+            # Apply scalar if needed
+            if coord_scalar != 1.0:
+                source_x *= coord_scalar
+                source_y *= coord_scalar
+                receiver_x *= coord_scalar
+                receiver_y *= coord_scalar
+                logger.info(f"Applied coordinate scalar: {coord_scalar}")
+
+            geometry = MigrationGeometry(
+                source_x=source_x,
+                source_y=source_y,
+                receiver_x=receiver_x,
+                receiver_y=receiver_y,
+                metadata={
+                    'sx_key': sx_key,
+                    'sy_key': sy_key,
+                    'gx_key': gx_key,
+                    'gy_key': gy_key,
+                    'coord_scalar': coord_scalar,
+                }
+            )
+
+            stats = geometry.get_statistics()
+            logger.info(
+                f"Created geometry: {stats['n_traces']} traces, "
+                f"offset range: {stats['offset_range'][0]:.0f}-{stats['offset_range'][1]:.0f}m"
+            )
+
+            return geometry
+
+        except Exception as e:
+            logger.error(f"Failed to create geometry: {e}")
+            QMessageBox.warning(
+                self,
+                "Geometry Error",
+                f"Failed to create geometry from headers:\n\n{str(e)}"
+            )
+            return None
 
     def _open_fkk_designer(self):
         """Open 3D FKK filter designer dialog (menu shortcut)."""

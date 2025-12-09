@@ -430,6 +430,100 @@ class FKKDesignerDialog(QDialog):
         temporal_taper_layout.addStretch()
         controls_layout.addLayout(temporal_taper_layout)
 
+        # Temporal pad-copy controls (for high-amplitude top/bottom edges)
+        temporal_pad_label = QLabel("<b>Temporal Pad-Copy</b> (reduces top/bottom edge artifacts):")
+        temporal_pad_label.setToolTip(
+            "Pad top/bottom with copies of edge samples, taper only padded zone.\n"
+            "Use when high-amplitude events at trace start cause artifacts.\n"
+            "Try 50-200ms at top if first breaks cause ringing."
+        )
+        controls_layout.addWidget(temporal_pad_label)
+
+        temporal_pad_layout = QHBoxLayout()
+        temporal_pad_layout.addWidget(QLabel("Top:"))
+        self.pad_time_top_spin = QDoubleSpinBox()
+        self.pad_time_top_spin.setRange(0, 500)
+        self.pad_time_top_spin.setValue(self.config.pad_time_top_ms)
+        self.pad_time_top_spin.setSuffix(" ms")
+        self.pad_time_top_spin.setToolTip("Time to pad at top (0=disabled). Try 50-200ms.")
+        temporal_pad_layout.addWidget(self.pad_time_top_spin)
+        temporal_pad_layout.addWidget(QLabel("Bottom:"))
+        self.pad_time_bottom_spin = QDoubleSpinBox()
+        self.pad_time_bottom_spin.setRange(0, 500)
+        self.pad_time_bottom_spin.setValue(self.config.pad_time_bottom_ms)
+        self.pad_time_bottom_spin.setSuffix(" ms")
+        self.pad_time_bottom_spin.setToolTip("Time to pad at bottom (0=disabled)")
+        temporal_pad_layout.addWidget(self.pad_time_bottom_spin)
+        temporal_pad_layout.addStretch()
+        controls_layout.addLayout(temporal_pad_layout)
+
+        # === Spatial Edge Handling Section ===
+        controls_layout.addWidget(QLabel(""))  # Spacer
+
+        # Edge method selection
+        edge_method_layout = QHBoxLayout()
+        edge_method_layout.addWidget(QLabel("Edge Method:"))
+        self.edge_method_combo = QComboBox()
+        self.edge_method_combo.addItem("None", "none")
+        self.edge_method_combo.addItem("Pad Copy", "pad_copy")
+        self.edge_method_combo.setCurrentIndex(1)  # Default to pad_copy
+        self.edge_method_combo.setToolTip(
+            "Method to reduce edge artifacts:\n"
+            "None: No treatment (may have edge artifacts)\n"
+            "Pad Copy: Pad with copies of edge traces, taper only padded zone"
+        )
+        edge_method_layout.addWidget(self.edge_method_combo)
+        edge_method_layout.addStretch()
+        controls_layout.addLayout(edge_method_layout)
+
+        # Pad traces parameters - prominent controls for edge artifact reduction
+        pad_label = QLabel("<b>Edge Pad Traces</b> (increase if edge artifacts persist):")
+        pad_label.setToolTip(
+            "Number of traces to pad on each side before filtering.\n"
+            "Larger values = better edge artifact suppression.\n"
+            "Try 5-10 for small volumes, 10-30 for larger ones."
+        )
+        controls_layout.addWidget(pad_label)
+
+        pad_traces_layout = QHBoxLayout()
+        pad_traces_layout.addWidget(QLabel("X (lines):"))
+        self.pad_traces_x_spin = QSpinBox()
+        self.pad_traces_x_spin.setRange(0, 100)
+        self.pad_traces_x_spin.setValue(self.config.pad_traces_x)
+        self.pad_traces_x_spin.setSpecialValueText("Auto")
+        self.pad_traces_x_spin.setToolTip(
+            "Traces to pad in X (inline) direction.\n"
+            "0 = Auto (~10% of dimension, min 3, max 20)\n"
+            "Try larger values (20-50) if edge artifacts persist."
+        )
+        pad_traces_layout.addWidget(self.pad_traces_x_spin)
+        pad_traces_layout.addWidget(QLabel("Y (receivers):"))
+        self.pad_traces_y_spin = QSpinBox()
+        self.pad_traces_y_spin.setRange(0, 100)
+        self.pad_traces_y_spin.setValue(self.config.pad_traces_y)
+        self.pad_traces_y_spin.setSpecialValueText("Auto")
+        self.pad_traces_y_spin.setToolTip(
+            "Traces to pad in Y (crossline) direction.\n"
+            "0 = Auto (~10% of dimension, min 3, max 20)\n"
+            "Try larger values (20-50) if edge artifacts persist."
+        )
+        pad_traces_layout.addWidget(self.pad_traces_y_spin)
+        pad_traces_layout.addStretch()
+        controls_layout.addLayout(pad_traces_layout)
+
+        # Padding factor (FFT padding)
+        padding_layout = QHBoxLayout()
+        padding_layout.addWidget(QLabel("FFT Padding:"))
+        self.padding_factor_spin = QDoubleSpinBox()
+        self.padding_factor_spin.setRange(1.0, 4.0)
+        self.padding_factor_spin.setSingleStep(0.5)
+        self.padding_factor_spin.setValue(self.config.padding_factor)
+        self.padding_factor_spin.setSuffix("x")
+        self.padding_factor_spin.setToolTip("Extra FFT padding multiplier (1.0=standard, 2.0=double)")
+        padding_layout.addWidget(self.padding_factor_spin)
+        padding_layout.addStretch()
+        controls_layout.addLayout(padding_layout)
+
         # Preset selection
         preset_layout = QHBoxLayout()
         preset_layout.addWidget(QLabel("Preset:"))
@@ -507,6 +601,16 @@ class FKKDesignerDialog(QDialog):
         self.f_max_spin.valueChanged.connect(self._on_freq_band_changed)
         self.taper_top_spin.valueChanged.connect(self._on_temporal_taper_changed)
         self.taper_bottom_spin.valueChanged.connect(self._on_temporal_taper_changed)
+
+        # Temporal pad-copy controls
+        self.pad_time_top_spin.valueChanged.connect(self._on_temporal_pad_changed)
+        self.pad_time_bottom_spin.valueChanged.connect(self._on_temporal_pad_changed)
+
+        # Spatial edge handling controls
+        self.edge_method_combo.currentIndexChanged.connect(self._on_edge_method_changed)
+        self.pad_traces_x_spin.valueChanged.connect(self._on_pad_traces_changed)
+        self.pad_traces_y_spin.valueChanged.connect(self._on_pad_traces_changed)
+        self.padding_factor_spin.valueChanged.connect(self._on_padding_changed)
 
         # Actions
         self.compute_btn.clicked.connect(self._compute_spectrum)
@@ -647,6 +751,29 @@ class FKKDesignerDialog(QDialog):
         self.config.taper_ms_bottom = self.taper_bottom_spin.value()
         self._request_apply_filter()
 
+    def _on_temporal_pad_changed(self, value: float):
+        """Handle temporal pad-copy change."""
+        self.config.pad_time_top_ms = self.pad_time_top_spin.value()
+        self.config.pad_time_bottom_ms = self.pad_time_bottom_spin.value()
+        self._request_apply_filter()
+
+    def _on_edge_method_changed(self, index: int):
+        """Handle edge method selection change."""
+        self.config.edge_method = self.edge_method_combo.currentData()
+        self._request_apply_filter()
+
+    def _on_pad_traces_changed(self, value: int):
+        """Handle pad traces parameter change."""
+        self.config.pad_traces_x = self.pad_traces_x_spin.value()
+        self.config.pad_traces_y = self.pad_traces_y_spin.value()
+        if self.config.edge_method == 'pad_copy':
+            self._request_apply_filter()
+
+    def _on_padding_changed(self, value: float):
+        """Handle padding factor change."""
+        self.config.padding_factor = value
+        self._request_apply_filter()
+
     def _on_preset_changed(self, index: int):
         """Handle preset selection."""
         name = self.preset_combo.currentData()
@@ -675,6 +802,12 @@ class FKKDesignerDialog(QDialog):
         self.f_max_spin.blockSignals(True)
         self.taper_top_spin.blockSignals(True)
         self.taper_bottom_spin.blockSignals(True)
+        self.pad_time_top_spin.blockSignals(True)
+        self.pad_time_bottom_spin.blockSignals(True)
+        self.edge_method_combo.blockSignals(True)
+        self.pad_traces_x_spin.blockSignals(True)
+        self.pad_traces_y_spin.blockSignals(True)
+        self.padding_factor_spin.blockSignals(True)
 
         # Core parameters
         self.v_min_slider.setValue(int(config.v_min))
@@ -703,6 +836,18 @@ class FKKDesignerDialog(QDialog):
         self.taper_top_spin.setValue(config.taper_ms_top)
         self.taper_bottom_spin.setValue(config.taper_ms_bottom)
 
+        # Temporal pad-copy parameters
+        self.pad_time_top_spin.setValue(config.pad_time_top_ms)
+        self.pad_time_bottom_spin.setValue(config.pad_time_bottom_ms)
+
+        # Spatial edge handling parameters
+        edge_method_index = self.edge_method_combo.findData(config.edge_method)
+        if edge_method_index >= 0:
+            self.edge_method_combo.setCurrentIndex(edge_method_index)
+        self.pad_traces_x_spin.setValue(config.pad_traces_x)
+        self.pad_traces_y_spin.setValue(config.pad_traces_y)
+        self.padding_factor_spin.setValue(config.padding_factor)
+
         # Unblock signals
         self.v_min_slider.blockSignals(False)
         self.v_min_spin.blockSignals(False)
@@ -719,6 +864,12 @@ class FKKDesignerDialog(QDialog):
         self.f_max_spin.blockSignals(False)
         self.taper_top_spin.blockSignals(False)
         self.taper_bottom_spin.blockSignals(False)
+        self.pad_time_top_spin.blockSignals(False)
+        self.pad_time_bottom_spin.blockSignals(False)
+        self.edge_method_combo.blockSignals(False)
+        self.pad_traces_x_spin.blockSignals(False)
+        self.pad_traces_y_spin.blockSignals(False)
+        self.padding_factor_spin.blockSignals(False)
 
     # =========================================================================
     # Processing
@@ -754,7 +905,7 @@ class FKKDesignerDialog(QDialog):
         self.status_bar.showMessage("Applying filter...")
         try:
             self.filtered_volume = self.processor.apply_filter(
-                self.volume, self.config, use_cached_spectrum=True
+                self.volume, self.config
             )
             self._update_output_views()
             self._update_spectrum_views()

@@ -30,6 +30,30 @@ from processors.migration.kirchhoff_migrator import (
     KirchhoffMigrator,
     create_kirchhoff_migrator,
 )
+from processors.migration.antialias import (
+    AntialiasFilter,
+    AntialiasMethod,
+    DipEstimator,
+    get_antialias_filter,
+)
+from processors.migration.traveltime_cache import (
+    TraveltimeTable,
+    TraveltimeCache,
+    TraveltimeTableBuilder,
+    CachedTraveltimeCalculator,
+    create_traveltime_cache,
+    create_cached_calculator,
+)
+from processors.migration.checkpoint import (
+    CheckpointManager,
+    JobCheckpoint,
+    BinCheckpoint,
+    BinStatus,
+    IntermediateVolumeSaver,
+    create_checkpoint_manager,
+    resume_from_checkpoint,
+    find_resumable_jobs,
+)
 
 __all__ = [
     # Base classes
@@ -55,4 +79,25 @@ __all__ = [
     # Main migrator
     'KirchhoffMigrator',
     'create_kirchhoff_migrator',
+    # Antialiasing
+    'AntialiasFilter',
+    'AntialiasMethod',
+    'DipEstimator',
+    'get_antialias_filter',
+    # Traveltime caching
+    'TraveltimeTable',
+    'TraveltimeCache',
+    'TraveltimeTableBuilder',
+    'CachedTraveltimeCalculator',
+    'create_traveltime_cache',
+    'create_cached_calculator',
+    # Checkpointing
+    'CheckpointManager',
+    'JobCheckpoint',
+    'BinCheckpoint',
+    'BinStatus',
+    'IntermediateVolumeSaver',
+    'create_checkpoint_manager',
+    'resume_from_checkpoint',
+    'find_resumable_jobs',
 ]

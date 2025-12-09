@@ -477,10 +477,15 @@ class TFDenoise(BaseProcessor):
         denoised_traces = np.zeros_like(traces)
 
         # Convert frequencies to normalized (0-0.5) based on sample rate
+        # Normalized frequency range: 0 = DC, 0.5 = Nyquist
+        # So fmin_norm = fmin_hz / nyquist_hz
         nyquist_freq = data.nyquist_freq
         sample_rate = 2.0 * nyquist_freq
-        fmin_norm = self.fmin / (2 * nyquist_freq)
-        fmax_norm = self.fmax / (2 * nyquist_freq)
+        fmin_norm = self.fmin / nyquist_freq
+        fmax_norm = self.fmax / nyquist_freq
+        # Clamp to valid range [0, 0.5]
+        fmin_norm = max(0.0, min(fmin_norm, 0.5))
+        fmax_norm = max(0.0, min(fmax_norm, 0.5))
 
         half_aperture = effective_aperture // 2
 

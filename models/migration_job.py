@@ -17,8 +17,8 @@ import logging
 from datetime import datetime
 
 from models.binning import BinningTable
-from processors.migration.base import MigrationConfig, OutputGrid
-from models.velocity import VelocityModel
+from models.migration_config import MigrationConfig, OutputGrid
+from models.velocity_model import VelocityModel
 
 logger = logging.getLogger(__name__)
 
@@ -191,24 +191,24 @@ class MigrationJobConfig:
         n_inline = (self.inline_max - self.inline_min) // self.inline_step + 1
         n_xline = (self.xline_max - self.xline_min) // self.xline_step + 1
 
+        # OutputGrid uses dt in seconds (not ms)
         return OutputGrid(
             n_time=n_time,
             n_inline=n_inline,
             n_xline=n_xline,
-            dt_ms=self.dt_ms,
-            inline_min=self.inline_min,
-            inline_step=self.inline_step,
-            xline_min=self.xline_min,
-            xline_step=self.xline_step,
-            origin_x=self.origin_x,
-            origin_y=self.origin_y,
-            inline_spacing=self.inline_spacing,
-            xline_spacing=self.xline_spacing,
+            dt=self.dt_ms / 1000.0,  # Convert ms to seconds
+            d_inline=self.inline_spacing,
+            d_xline=self.xline_spacing,
+            t0=self.time_min_ms / 1000.0,  # Convert ms to seconds
+            inline_start=self.inline_min,
+            xline_start=self.xline_min,
+            x_origin=self.origin_x,
+            y_origin=self.origin_y,
         )
 
     def get_migration_config(self) -> MigrationConfig:
         """Create MigrationConfig from job configuration."""
-        from processors.migration.base import (
+        from models.migration_config import (
             TraveltimeMode,
             WeightMode,
             InterpolationMode,
@@ -219,12 +219,12 @@ class MigrationJobConfig:
             max_aperture_m=self.max_aperture_m,
             max_angle_deg=self.max_angle_deg,
             max_offset_m=self.max_offset_m,
-            taper_width_samples=self.taper_width_samples,
-            near_offset_taper_m=self.near_offset_taper_m,
-            anti_alias_filter=self.anti_alias_filter,
+            min_offset_m=self.near_offset_taper_m,
+            taper_width=self.taper_width_samples / 100.0,  # Convert to fraction
             traveltime_mode=TraveltimeMode.STRAIGHT_RAY,
-            weight_mode=WeightMode.NONE,
+            weight_mode=WeightMode.SPREADING,
             interpolation_mode=InterpolationMode.LINEAR,
+            antialias_enabled=self.anti_alias_filter,
         )
 
     def get_velocity_model(self) -> VelocityModel:
@@ -232,9 +232,10 @@ class MigrationJobConfig:
         if self.velocity_file:
             return VelocityModel.load(self.velocity_file)
 
+        # Create constant velocity model
         return VelocityModel(
-            v0=self.velocity_v0,
-            gradient=self.velocity_gradient,
+            data=self.velocity_v0,
+            gradient=self.velocity_gradient if self.velocity_gradient != 0.0 else None,
         )
 
     def get_binning_table(self) -> BinningTable:

@@ -15,6 +15,9 @@ from .gain_processor import GainProcessor
 from .chunked_processor import ChunkedProcessor
 from .spectral_analyzer import SpectralAnalyzer
 
+# Migration processors
+from .migration.kirchhoff_migrator import KirchhoffMigrator
+
 # =============================================================================
 # Processor Registry for Multiprocess Workers
 # =============================================================================
@@ -28,6 +31,7 @@ PROCESSOR_REGISTRY: Dict[str, Type[BaseProcessor]] = {
     'ChunkedProcessor': ChunkedProcessor,
     'SpectralAnalyzer': SpectralAnalyzer,
     'ProcessingPipeline': ProcessingPipeline,
+    'KirchhoffMigrator': KirchhoffMigrator,
 }
 
 
@@ -99,6 +103,8 @@ __all__ = [
     'GainProcessor',
     'ChunkedProcessor',
     'SpectralAnalyzer',
+    # Migration
+    'KirchhoffMigrator',
     # AGC functions
     'apply_agc_vectorized',
     'remove_agc',

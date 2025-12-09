@@ -37,6 +37,18 @@ class FKKConfig:
         # Temporal Tapering - reduces top/bottom artifacts
         taper_ms_top: Taper length at top of traces (ms)
         taper_ms_bottom: Taper length at bottom of traces (ms)
+
+        # Temporal Pad-Copy - reduces top/bottom edge artifacts from high amplitudes
+        pad_time_top_ms: Pad top with copies of first sample, taper only padded zone (ms)
+        pad_time_bottom_ms: Pad bottom with copies of last sample, taper only padded zone (ms)
+
+        # Spatial Edge Handling - reduces edge artifacts from FFT
+        edge_method: Method for handling spatial edges:
+            'none' - No edge treatment (may have artifacts)
+            'pad_copy' - Pad with copies of edge traces, taper only the padded zone
+        pad_traces_x: Number of traces to pad in X direction (0=auto based on dimension)
+        pad_traces_y: Number of traces to pad in Y direction (0=auto based on dimension)
+        padding_factor: Extra padding multiplier (1.0=power-of-2, 2.0=double, etc.)
     """
     # Core velocity cone parameters
     v_min: float = 200.0       # m/s
@@ -58,6 +70,16 @@ class FKKConfig:
     # Temporal tapering
     taper_ms_top: float = 0.0    # ms at top
     taper_ms_bottom: float = 0.0  # ms at bottom
+
+    # Temporal pad-copy (for high-amplitude top/bottom edge artifacts)
+    pad_time_top_ms: float = 0.0    # ms to pad at top (0=disabled)
+    pad_time_bottom_ms: float = 0.0  # ms to pad at bottom (0=disabled)
+
+    # Spatial edge handling
+    edge_method: str = 'pad_copy'  # 'none' or 'pad_copy'
+    pad_traces_x: int = 0          # Traces to pad in X (0=auto: ~10% of dimension)
+    pad_traces_y: int = 0          # Traces to pad in Y (0=auto: ~10% of dimension)
+    padding_factor: float = 1.0    # Extra padding multiplier
 
     def __post_init__(self):
         """Validate configuration."""
@@ -100,6 +122,26 @@ class FKKConfig:
         if self.taper_ms_bottom < 0:
             raise ValueError(f"taper_ms_bottom must be non-negative, got {self.taper_ms_bottom}")
 
+        if self.pad_time_top_ms < 0:
+            raise ValueError(f"pad_time_top_ms must be non-negative, got {self.pad_time_top_ms}")
+
+        if self.pad_time_bottom_ms < 0:
+            raise ValueError(f"pad_time_bottom_ms must be non-negative, got {self.pad_time_bottom_ms}")
+
+        # Validate spatial edge handling
+        valid_edge_methods = ('none', 'pad_copy')
+        if self.edge_method not in valid_edge_methods:
+            raise ValueError(f"edge_method must be one of {valid_edge_methods}, got {self.edge_method}")
+
+        if self.pad_traces_x < 0:
+            raise ValueError(f"pad_traces_x must be non-negative, got {self.pad_traces_x}")
+
+        if self.pad_traces_y < 0:
+            raise ValueError(f"pad_traces_y must be non-negative, got {self.pad_traces_y}")
+
+        if self.padding_factor < 1.0:
+            raise ValueError(f"padding_factor must be >= 1.0, got {self.padding_factor}")
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization."""
         return asdict(self)
@@ -128,6 +170,9 @@ class FKKConfig:
         if self.apply_agc:
             parts.append(f"AGC({self.agc_window_ms:.0f}ms)")
 
+        if self.edge_method != 'none':
+            parts.append(f"Edge: {self.edge_method}")
+
         return ", ".join(parts)
 
     def copy(self) -> 'FKKConfig':
@@ -145,7 +190,13 @@ class FKKConfig:
             f_min=self.f_min,
             f_max=self.f_max,
             taper_ms_top=self.taper_ms_top,
-            taper_ms_bottom=self.taper_ms_bottom
+            taper_ms_bottom=self.taper_ms_bottom,
+            pad_time_top_ms=self.pad_time_top_ms,
+            pad_time_bottom_ms=self.pad_time_bottom_ms,
+            edge_method=self.edge_method,
+            pad_traces_x=self.pad_traces_x,
+            pad_traces_y=self.pad_traces_y,
+            padding_factor=self.padding_factor
         )
 
 

@@ -467,7 +467,7 @@ class CurvedRayTraveltime(TraveltimeCalculator):
 
 def get_traveltime_calculator(
     velocity_model: VelocityModel,
-    mode: str = 'auto',
+    mode: Union[str, 'TraveltimeMode'] = 'auto',
     device: Optional[torch.device] = None,
 ) -> TraveltimeCalculator:
     """
@@ -475,12 +475,20 @@ def get_traveltime_calculator(
 
     Args:
         velocity_model: Velocity model
-        mode: 'straight', 'curved', or 'auto'
+        mode: 'straight', 'curved', 'auto', or TraveltimeMode enum
         device: Torch device
 
     Returns:
         Appropriate TraveltimeCalculator instance
     """
+    # Handle TraveltimeMode enum
+    from models.migration_config import TraveltimeMode
+    if isinstance(mode, TraveltimeMode):
+        if mode == TraveltimeMode.STRAIGHT_RAY:
+            mode = 'straight'
+        elif mode == TraveltimeMode.CURVED_RAY:
+            mode = 'curved'
+
     if mode == 'auto':
         # Use curved ray if gradient is significant
         if velocity_model.has_gradient:

@@ -47,6 +47,9 @@ class ControlPanel(QWidget):
     fk_config_selected = pyqtSignal(str)  # FK config name selected for applying
     fkk_design_requested = pyqtSignal()  # Request to open 3D FKK designer
     fkk_apply_requested = pyqtSignal(object)  # FKKConfig for applying
+    # PSTM signals
+    pstm_apply_requested = pyqtSignal(float, float, float)  # velocity, aperture, max_angle
+    pstm_wizard_requested = pyqtSignal()  # Request to open PSTM wizard
 
     def __init__(self, nyquist_freq: float = 250.0, parent=None):
         super().__init__(parent)
@@ -96,13 +99,16 @@ class ControlPanel(QWidget):
         self.tfdenoise_group = self._create_tfdenoise_group()
         self.fk_filter_group = self._create_fk_filter_group()
         self.fkk_filter_group = self._create_fkk_filter_group()
+        self.pstm_group = self._create_pstm_group()
         controls_layout.addWidget(self.bandpass_group)
         controls_layout.addWidget(self.tfdenoise_group)
         controls_layout.addWidget(self.fk_filter_group)
         controls_layout.addWidget(self.fkk_filter_group)
+        controls_layout.addWidget(self.pstm_group)
         self.tfdenoise_group.hide()  # Initially hidden
         self.fk_filter_group.hide()  # Initially hidden
         self.fkk_filter_group.hide()  # Initially hidden
+        self.pstm_group.hide()  # Initially hidden
 
         # Display controls
         controls_layout.addWidget(self._create_display_group())
@@ -138,7 +144,8 @@ class ControlPanel(QWidget):
             "Bandpass Filter",
             "TF-Denoise (S-Transform)",
             "FK Filter",
-            "3D FKK Filter"
+            "3D FKK Filter",
+            "Kirchhoff PSTM"
         ])
         self.algorithm_combo.currentIndexChanged.connect(self._on_algorithm_changed)
         algo_layout.addWidget(self.algorithm_combo)
@@ -500,7 +507,7 @@ class ControlPanel(QWidget):
         mode_layout = QVBoxLayout()
 
         self.fkk_mode_design = QRadioButton("Design (build volume & create filter)")
-        self.fkk_mode_apply = QRadioButton("Apply (use saved preset)")
+        self.fkk_mode_apply = QRadioButton("Apply (direct parameters)")
         self.fkk_mode_design.setChecked(True)
 
         self.fkk_mode_group = QButtonGroup()
@@ -549,17 +556,13 @@ class ControlPanel(QWidget):
         self.fkk_design_widget.setLayout(design_layout)
         layout.addWidget(self.fkk_design_widget)
 
-        # Apply mode controls
+        # Apply mode controls - all parameters directly in layout (no scroll)
         self.fkk_apply_widget = QWidget()
         apply_layout = QVBoxLayout()
         apply_layout.setContentsMargins(0, 0, 0, 0)
+        apply_layout.setSpacing(4)
 
-        apply_info = QLabel("Select preset and configure parameters")
-        apply_info.setStyleSheet("color: #666; font-size: 9pt;")
-        apply_info.setWordWrap(True)
-        apply_layout.addWidget(apply_info)
-
-        # Preset selection
+        # === Preset Selection ===
         preset_layout = QHBoxLayout()
         preset_layout.addWidget(QLabel("Preset:"))
         self.fkk_preset_combo = QComboBox()
@@ -570,51 +573,60 @@ class ControlPanel(QWidget):
         preset_layout.addWidget(self.fkk_preset_combo)
         apply_layout.addLayout(preset_layout)
 
-        # V_min
-        vmin_layout = QHBoxLayout()
-        vmin_layout.addWidget(QLabel("V min:"))
+        # === Core Velocity Parameters ===
+        apply_layout.addWidget(QLabel("<b>Velocity Cone</b>"))
+
+        # V_min / V_max
+        vel_layout = QHBoxLayout()
+        vel_layout.addWidget(QLabel("V:"))
         self.fkk_vmin_spin = QDoubleSpinBox()
         self.fkk_vmin_spin.setRange(50, 10000)
         self.fkk_vmin_spin.setValue(200)
         self.fkk_vmin_spin.setSuffix(" m/s")
-        vmin_layout.addWidget(self.fkk_vmin_spin)
-        apply_layout.addLayout(vmin_layout)
-
-        # V_max
-        vmax_layout = QHBoxLayout()
-        vmax_layout.addWidget(QLabel("V max:"))
+        vel_layout.addWidget(self.fkk_vmin_spin)
+        vel_layout.addWidget(QLabel("-"))
         self.fkk_vmax_spin = QDoubleSpinBox()
         self.fkk_vmax_spin.setRange(100, 20000)
         self.fkk_vmax_spin.setValue(1500)
         self.fkk_vmax_spin.setSuffix(" m/s")
-        vmax_layout.addWidget(self.fkk_vmax_spin)
-        apply_layout.addLayout(vmax_layout)
+        vel_layout.addWidget(self.fkk_vmax_spin)
+        apply_layout.addLayout(vel_layout)
 
-        # Mode
-        mode_filter_layout = QHBoxLayout()
-        mode_filter_layout.addWidget(QLabel("Filter:"))
+        # Azimuth range
+        az_layout = QHBoxLayout()
+        az_layout.addWidget(QLabel("Az:"))
+        self.fkk_azmin_spin = QDoubleSpinBox()
+        self.fkk_azmin_spin.setRange(0, 360)
+        self.fkk_azmin_spin.setValue(0)
+        self.fkk_azmin_spin.setSuffix("°")
+        az_layout.addWidget(self.fkk_azmin_spin)
+        az_layout.addWidget(QLabel("-"))
+        self.fkk_azmax_spin = QDoubleSpinBox()
+        self.fkk_azmax_spin.setRange(0, 360)
+        self.fkk_azmax_spin.setValue(360)
+        self.fkk_azmax_spin.setSuffix("°")
+        az_layout.addWidget(self.fkk_azmax_spin)
+        apply_layout.addLayout(az_layout)
+
+        # Taper width and Mode
+        taper_mode_layout = QHBoxLayout()
+        taper_mode_layout.addWidget(QLabel("Taper:"))
+        self.fkk_taper_spin = QDoubleSpinBox()
+        self.fkk_taper_spin.setRange(0.01, 0.5)
+        self.fkk_taper_spin.setSingleStep(0.05)
+        self.fkk_taper_spin.setValue(0.1)
+        taper_mode_layout.addWidget(self.fkk_taper_spin)
+        taper_mode_layout.addWidget(QLabel("Mode:"))
         self.fkk_filter_mode_combo = QComboBox()
-        self.fkk_filter_mode_combo.addItem("Reject (remove)", "reject")
-        self.fkk_filter_mode_combo.addItem("Pass (keep)", "pass")
-        mode_filter_layout.addWidget(self.fkk_filter_mode_combo)
-        apply_layout.addLayout(mode_filter_layout)
+        self.fkk_filter_mode_combo.addItem("Reject", "reject")
+        self.fkk_filter_mode_combo.addItem("Pass", "pass")
+        taper_mode_layout.addWidget(self.fkk_filter_mode_combo)
+        apply_layout.addLayout(taper_mode_layout)
 
-        # AGC checkbox
-        agc_layout = QHBoxLayout()
-        self.fkk_agc_checkbox = QCheckBox("Apply AGC")
-        self.fkk_agc_checkbox.setToolTip("Normalize amplitudes before filtering")
-        agc_layout.addWidget(self.fkk_agc_checkbox)
-        agc_layout.addWidget(QLabel("Window:"))
-        self.fkk_agc_window_spin = QDoubleSpinBox()
-        self.fkk_agc_window_spin.setRange(50, 2000)
-        self.fkk_agc_window_spin.setValue(500)
-        self.fkk_agc_window_spin.setSuffix(" ms")
-        agc_layout.addWidget(self.fkk_agc_window_spin)
-        apply_layout.addLayout(agc_layout)
-
-        # Frequency band
+        # === Frequency Band ===
+        apply_layout.addWidget(QLabel("<b>Frequency Band</b>"))
         freq_layout = QHBoxLayout()
-        freq_layout.addWidget(QLabel("Freq:"))
+        freq_layout.addWidget(QLabel("F:"))
         self.fkk_fmin_spin = QDoubleSpinBox()
         self.fkk_fmin_spin.setRange(0, 500)
         self.fkk_fmin_spin.setValue(0)
@@ -627,6 +639,129 @@ class ControlPanel(QWidget):
         self.fkk_fmax_spin.setSuffix(" Hz")
         freq_layout.addWidget(self.fkk_fmax_spin)
         apply_layout.addLayout(freq_layout)
+
+        # === AGC Controls ===
+        apply_layout.addWidget(QLabel("<b>AGC</b>"))
+        agc_layout = QHBoxLayout()
+        self.fkk_agc_checkbox = QCheckBox("Enable")
+        self.fkk_agc_checkbox.setToolTip("Apply AGC before filtering, remove after")
+        agc_layout.addWidget(self.fkk_agc_checkbox)
+        agc_layout.addWidget(QLabel("Win:"))
+        self.fkk_agc_window_spin = QDoubleSpinBox()
+        self.fkk_agc_window_spin.setRange(50, 5000)
+        self.fkk_agc_window_spin.setValue(500)
+        self.fkk_agc_window_spin.setSuffix(" ms")
+        agc_layout.addWidget(self.fkk_agc_window_spin)
+        agc_layout.addWidget(QLabel("Gain:"))
+        self.fkk_agc_gain_spin = QDoubleSpinBox()
+        self.fkk_agc_gain_spin.setRange(1, 100)
+        self.fkk_agc_gain_spin.setValue(10)
+        agc_layout.addWidget(self.fkk_agc_gain_spin)
+        apply_layout.addLayout(agc_layout)
+
+        # === Temporal Taper ===
+        apply_layout.addWidget(QLabel("<b>Temporal Taper</b>"))
+        temp_taper_layout = QHBoxLayout()
+        temp_taper_layout.addWidget(QLabel("Top:"))
+        self.fkk_taper_top_spin = QDoubleSpinBox()
+        self.fkk_taper_top_spin.setRange(0, 1000)
+        self.fkk_taper_top_spin.setValue(0)
+        self.fkk_taper_top_spin.setSuffix(" ms")
+        temp_taper_layout.addWidget(self.fkk_taper_top_spin)
+        temp_taper_layout.addWidget(QLabel("Bot:"))
+        self.fkk_taper_bottom_spin = QDoubleSpinBox()
+        self.fkk_taper_bottom_spin.setRange(0, 1000)
+        self.fkk_taper_bottom_spin.setValue(0)
+        self.fkk_taper_bottom_spin.setSuffix(" ms")
+        temp_taper_layout.addWidget(self.fkk_taper_bottom_spin)
+        apply_layout.addLayout(temp_taper_layout)
+
+        # === Temporal Pad-Copy ===
+        apply_layout.addWidget(QLabel("<b>Temporal Pad-Copy</b>"))
+        temp_pad_info = QLabel("(reduces top edge artifacts from first breaks)")
+        temp_pad_info.setStyleSheet("color: #666; font-size: 9pt;")
+        apply_layout.addWidget(temp_pad_info)
+
+        temp_pad_layout = QHBoxLayout()
+        temp_pad_layout.addWidget(QLabel("Top:"))
+        self.fkk_pad_time_top_spin = QDoubleSpinBox()
+        self.fkk_pad_time_top_spin.setRange(0, 500)
+        self.fkk_pad_time_top_spin.setValue(0)
+        self.fkk_pad_time_top_spin.setSuffix(" ms")
+        self.fkk_pad_time_top_spin.setToolTip("Time to pad at top (0=disabled). Try 50-200ms.")
+        temp_pad_layout.addWidget(self.fkk_pad_time_top_spin)
+        temp_pad_layout.addWidget(QLabel("Bot:"))
+        self.fkk_pad_time_bottom_spin = QDoubleSpinBox()
+        self.fkk_pad_time_bottom_spin.setRange(0, 500)
+        self.fkk_pad_time_bottom_spin.setValue(0)
+        self.fkk_pad_time_bottom_spin.setSuffix(" ms")
+        self.fkk_pad_time_bottom_spin.setToolTip("Time to pad at bottom (0=disabled)")
+        temp_pad_layout.addWidget(self.fkk_pad_time_bottom_spin)
+        apply_layout.addLayout(temp_pad_layout)
+
+        # === Spatial Edge Handling ===
+        apply_layout.addWidget(QLabel("<b>Edge Handling</b>"))
+
+        # Edge method
+        edge_method_layout = QHBoxLayout()
+        edge_method_layout.addWidget(QLabel("Method:"))
+        self.fkk_edge_method_combo = QComboBox()
+        self.fkk_edge_method_combo.addItem("None", "none")
+        self.fkk_edge_method_combo.addItem("Pad Copy", "pad_copy")
+        self.fkk_edge_method_combo.setCurrentIndex(1)  # Default to pad_copy
+        self.fkk_edge_method_combo.setToolTip(
+            "None: No edge treatment (may have artifacts)\n"
+            "Pad Copy: Pad with copies of edge traces, taper only padded zone"
+        )
+        edge_method_layout.addWidget(self.fkk_edge_method_combo)
+        apply_layout.addLayout(edge_method_layout)
+
+        # Pad traces label with guidance
+        pad_info = QLabel("Edge Pad (increase if artifacts):")
+        pad_info.setToolTip(
+            "Number of traces to pad on each side.\n"
+            "Larger values = better artifact suppression.\n"
+            "Try 20-50 if edge artifacts persist."
+        )
+        apply_layout.addWidget(pad_info)
+
+        # Pad traces X/Y with larger range
+        pad_traces_layout = QHBoxLayout()
+        pad_traces_layout.addWidget(QLabel("X:"))
+        self.fkk_pad_traces_x_spin = QSpinBox()
+        self.fkk_pad_traces_x_spin.setRange(0, 100)
+        self.fkk_pad_traces_x_spin.setValue(0)
+        self.fkk_pad_traces_x_spin.setSpecialValueText("Auto")
+        self.fkk_pad_traces_x_spin.setToolTip(
+            "Traces to pad in X direction.\n"
+            "0 = Auto (~10%, min 3, max 20)\n"
+            "Try 20-50 if artifacts persist."
+        )
+        pad_traces_layout.addWidget(self.fkk_pad_traces_x_spin)
+        pad_traces_layout.addWidget(QLabel("Y:"))
+        self.fkk_pad_traces_y_spin = QSpinBox()
+        self.fkk_pad_traces_y_spin.setRange(0, 100)
+        self.fkk_pad_traces_y_spin.setValue(0)
+        self.fkk_pad_traces_y_spin.setSpecialValueText("Auto")
+        self.fkk_pad_traces_y_spin.setToolTip(
+            "Traces to pad in Y direction.\n"
+            "0 = Auto (~10%, min 3, max 20)\n"
+            "Try 20-50 if artifacts persist."
+        )
+        pad_traces_layout.addWidget(self.fkk_pad_traces_y_spin)
+        apply_layout.addLayout(pad_traces_layout)
+
+        # Padding factor (FFT padding)
+        padding_layout = QHBoxLayout()
+        padding_layout.addWidget(QLabel("FFT Pad:"))
+        self.fkk_padding_factor_spin = QDoubleSpinBox()
+        self.fkk_padding_factor_spin.setRange(1.0, 4.0)
+        self.fkk_padding_factor_spin.setSingleStep(0.5)
+        self.fkk_padding_factor_spin.setValue(1.0)
+        self.fkk_padding_factor_spin.setSuffix("x")
+        self.fkk_padding_factor_spin.setToolTip("Extra FFT padding multiplier")
+        padding_layout.addWidget(self.fkk_padding_factor_spin)
+        apply_layout.addLayout(padding_layout)
 
         # Apply button
         self.fkk_apply_btn = QPushButton("Apply FKK Filter")
@@ -673,10 +808,34 @@ class ControlPanel(QWidget):
         preset_name = self.fkk_preset_combo.currentData()
         if preset_name and preset_name in FKK_PRESETS:
             preset = FKK_PRESETS[preset_name]
+            # Core velocity parameters
             self.fkk_vmin_spin.setValue(preset.v_min)
             self.fkk_vmax_spin.setValue(preset.v_max)
+            self.fkk_azmin_spin.setValue(preset.azimuth_min)
+            self.fkk_azmax_spin.setValue(preset.azimuth_max)
+            self.fkk_taper_spin.setValue(preset.taper_width)
             mode_idx = 0 if preset.mode == 'reject' else 1
             self.fkk_filter_mode_combo.setCurrentIndex(mode_idx)
+            # AGC
+            self.fkk_agc_checkbox.setChecked(preset.apply_agc)
+            self.fkk_agc_window_spin.setValue(preset.agc_window_ms)
+            self.fkk_agc_gain_spin.setValue(preset.agc_max_gain)
+            # Frequency band
+            self.fkk_fmin_spin.setValue(preset.f_min if preset.f_min is not None else 0)
+            self.fkk_fmax_spin.setValue(preset.f_max if preset.f_max is not None else self.nyquist_freq)
+            # Temporal taper
+            self.fkk_taper_top_spin.setValue(preset.taper_ms_top)
+            self.fkk_taper_bottom_spin.setValue(preset.taper_ms_bottom)
+            # Temporal pad-copy
+            self.fkk_pad_time_top_spin.setValue(preset.pad_time_top_ms)
+            self.fkk_pad_time_bottom_spin.setValue(preset.pad_time_bottom_ms)
+            # Edge handling
+            edge_idx = self.fkk_edge_method_combo.findData(preset.edge_method)
+            if edge_idx >= 0:
+                self.fkk_edge_method_combo.setCurrentIndex(edge_idx)
+            self.fkk_pad_traces_x_spin.setValue(preset.pad_traces_x)
+            self.fkk_pad_traces_y_spin.setValue(preset.pad_traces_y)
+            self.fkk_padding_factor_spin.setValue(preset.padding_factor)
 
     def _on_fkk_apply_clicked(self):
         """Handle FKK apply button click."""
@@ -684,16 +843,149 @@ class ControlPanel(QWidget):
         f_max = self.fkk_fmax_spin.value()
 
         config = FKKConfig(
+            # Core velocity parameters
             v_min=self.fkk_vmin_spin.value(),
             v_max=self.fkk_vmax_spin.value(),
+            azimuth_min=self.fkk_azmin_spin.value(),
+            azimuth_max=self.fkk_azmax_spin.value(),
+            taper_width=self.fkk_taper_spin.value(),
             mode=self.fkk_filter_mode_combo.currentData(),
-            taper_width=0.1,
+            # AGC
             apply_agc=self.fkk_agc_checkbox.isChecked(),
             agc_window_ms=self.fkk_agc_window_spin.value(),
+            agc_max_gain=self.fkk_agc_gain_spin.value(),
+            # Frequency band
             f_min=f_min if f_min > 0 else None,
-            f_max=f_max if f_max < self.nyquist_freq else None
+            f_max=f_max if f_max < self.nyquist_freq else None,
+            # Temporal taper
+            taper_ms_top=self.fkk_taper_top_spin.value(),
+            taper_ms_bottom=self.fkk_taper_bottom_spin.value(),
+            # Temporal pad-copy
+            pad_time_top_ms=self.fkk_pad_time_top_spin.value(),
+            pad_time_bottom_ms=self.fkk_pad_time_bottom_spin.value(),
+            # Edge handling
+            edge_method=self.fkk_edge_method_combo.currentData(),
+            pad_traces_x=self.fkk_pad_traces_x_spin.value(),
+            pad_traces_y=self.fkk_pad_traces_y_spin.value(),
+            padding_factor=self.fkk_padding_factor_spin.value()
         )
         self.fkk_apply_requested.emit(config)
+
+    def set_fkk_config(self, config: FKKConfig):
+        """Set FKK parameters from config (e.g., from designer)."""
+        # Core velocity parameters
+        self.fkk_vmin_spin.setValue(config.v_min)
+        self.fkk_vmax_spin.setValue(config.v_max)
+        self.fkk_azmin_spin.setValue(config.azimuth_min)
+        self.fkk_azmax_spin.setValue(config.azimuth_max)
+        self.fkk_taper_spin.setValue(config.taper_width)
+        mode_idx = 0 if config.mode == 'reject' else 1
+        self.fkk_filter_mode_combo.setCurrentIndex(mode_idx)
+        # AGC
+        self.fkk_agc_checkbox.setChecked(config.apply_agc)
+        self.fkk_agc_window_spin.setValue(config.agc_window_ms)
+        self.fkk_agc_gain_spin.setValue(config.agc_max_gain)
+        # Frequency band
+        self.fkk_fmin_spin.setValue(config.f_min if config.f_min is not None else 0)
+        self.fkk_fmax_spin.setValue(config.f_max if config.f_max is not None else self.nyquist_freq)
+        # Temporal taper
+        self.fkk_taper_top_spin.setValue(config.taper_ms_top)
+        self.fkk_taper_bottom_spin.setValue(config.taper_ms_bottom)
+        # Temporal pad-copy
+        self.fkk_pad_time_top_spin.setValue(config.pad_time_top_ms)
+        self.fkk_pad_time_bottom_spin.setValue(config.pad_time_bottom_ms)
+        # Edge handling
+        edge_idx = self.fkk_edge_method_combo.findData(config.edge_method)
+        if edge_idx >= 0:
+            self.fkk_edge_method_combo.setCurrentIndex(edge_idx)
+        self.fkk_pad_traces_x_spin.setValue(config.pad_traces_x)
+        self.fkk_pad_traces_y_spin.setValue(config.pad_traces_y)
+        self.fkk_padding_factor_spin.setValue(config.padding_factor)
+        # Set preset to Custom
+        self.fkk_preset_combo.setCurrentIndex(0)
+
+    def _create_pstm_group(self) -> QGroupBox:
+        """Create Kirchhoff PSTM parameters group."""
+        group = QGroupBox("Kirchhoff PSTM Parameters")
+        layout = QVBoxLayout()
+
+        # Velocity
+        vel_layout = QHBoxLayout()
+        vel_layout.addWidget(QLabel("Velocity (m/s):"))
+        self.pstm_velocity_spin = QDoubleSpinBox()
+        self.pstm_velocity_spin.setRange(500, 8000)
+        self.pstm_velocity_spin.setValue(2500)
+        self.pstm_velocity_spin.setSingleStep(100)
+        self.pstm_velocity_spin.setDecimals(0)
+        self.pstm_velocity_spin.setToolTip("Constant migration velocity in m/s")
+        vel_layout.addWidget(self.pstm_velocity_spin)
+        layout.addLayout(vel_layout)
+
+        # Aperture
+        aperture_layout = QHBoxLayout()
+        aperture_layout.addWidget(QLabel("Aperture (m):"))
+        self.pstm_aperture_spin = QDoubleSpinBox()
+        self.pstm_aperture_spin.setRange(100, 20000)
+        self.pstm_aperture_spin.setValue(3000)
+        self.pstm_aperture_spin.setSingleStep(100)
+        self.pstm_aperture_spin.setDecimals(0)
+        self.pstm_aperture_spin.setToolTip("Maximum migration aperture in meters")
+        aperture_layout.addWidget(self.pstm_aperture_spin)
+        layout.addLayout(aperture_layout)
+
+        # Max angle
+        angle_layout = QHBoxLayout()
+        angle_layout.addWidget(QLabel("Max Angle (deg):"))
+        self.pstm_angle_spin = QDoubleSpinBox()
+        self.pstm_angle_spin.setRange(10, 85)
+        self.pstm_angle_spin.setValue(60)
+        self.pstm_angle_spin.setSingleStep(5)
+        self.pstm_angle_spin.setDecimals(0)
+        self.pstm_angle_spin.setToolTip("Maximum migration angle from vertical")
+        angle_layout.addWidget(self.pstm_angle_spin)
+        layout.addLayout(angle_layout)
+
+        # Info label
+        info_label = QLabel("Applies migration to current gather")
+        info_label.setStyleSheet("color: #666; font-size: 9pt;")
+        layout.addWidget(info_label)
+
+        # Apply button
+        self.pstm_apply_btn = QPushButton("Apply PSTM")
+        self.pstm_apply_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2196F3;
+                color: white;
+                font-weight: bold;
+                padding: 8px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #1976D2;
+            }
+            QPushButton:pressed {
+                background-color: #1565C0;
+            }
+        """)
+        self.pstm_apply_btn.clicked.connect(self._on_pstm_apply)
+        layout.addWidget(self.pstm_apply_btn)
+
+        # Wizard button
+        self.pstm_wizard_btn = QPushButton("Open PSTM Wizard...")
+        self.pstm_wizard_btn.setToolTip("Configure and run full dataset migration")
+        self.pstm_wizard_btn.clicked.connect(lambda: self.pstm_wizard_requested.emit())
+        layout.addWidget(self.pstm_wizard_btn)
+
+        group.setLayout(layout)
+        return group
+
+    def _on_pstm_apply(self):
+        """Handle PSTM apply button click."""
+        self.pstm_apply_requested.emit(
+            self.pstm_velocity_spin.value(),
+            self.pstm_aperture_spin.value(),
+            self.pstm_angle_spin.value()
+        )
 
     def _create_display_group(self) -> QGroupBox:
         """Create display controls group."""
@@ -855,6 +1147,7 @@ class ControlPanel(QWidget):
         self.tfdenoise_group.hide()
         self.fk_filter_group.hide()
         self.fkk_filter_group.hide()
+        self.pstm_group.hide()
 
         if index == 0:  # Bandpass Filter
             self.bandpass_group.show()
@@ -874,6 +1167,11 @@ class ControlPanel(QWidget):
         elif index == 3:  # 3D FKK Filter
             self.fkk_filter_group.show()
             # Enable GPU for 3D FKK filter if available
+            if self.gpu_checkbox is not None and self.gpu_available:
+                self.gpu_checkbox.setEnabled(True)
+        elif index == 4:  # Kirchhoff PSTM
+            self.pstm_group.show()
+            # Enable GPU for PSTM if available
             if self.gpu_checkbox is not None and self.gpu_available:
                 self.gpu_checkbox.setEnabled(True)
 

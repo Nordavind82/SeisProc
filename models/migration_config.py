@@ -21,6 +21,14 @@ class TraveltimeMode(Enum):
     """Traveltime computation mode."""
     STRAIGHT_RAY = "straight_ray"
     CURVED_RAY = "curved_ray"
+    VTI = "vti"  # VTI anisotropic
+
+
+class AnisotropyMethod(Enum):
+    """VTI anisotropy computation method."""
+    ANELLIPTIC = "anelliptic"  # Alkhalifah's approximation (recommended)
+    EXACT = "exact"            # Full phase velocity integration
+    WEAK = "weak"              # Weak anisotropy approximation
 
 
 class InterpolationMode(Enum):
@@ -231,6 +239,7 @@ class MigrationConfig:
     # Traveltime
     traveltime_mode: TraveltimeMode = TraveltimeMode.STRAIGHT_RAY
     use_anisotropy: bool = False
+    anisotropy_method: AnisotropyMethod = AnisotropyMethod.ANELLIPTIC
 
     # Amplitude
     weight_mode: WeightMode = WeightMode.SPREADING
@@ -287,6 +296,9 @@ class MigrationConfig:
 
     def get_summary(self) -> str:
         """Get human-readable configuration summary."""
+        aniso_str = ""
+        if self.use_anisotropy:
+            aniso_str = f"\n  Anisotropy: VTI ({self.anisotropy_method.value})"
         return (
             f"Migration Config:\n"
             f"  Output: {self.output_grid.n_inline}x{self.output_grid.n_xline} "
@@ -296,6 +308,7 @@ class MigrationConfig:
             f"  Traveltime: {self.traveltime_mode.value}\n"
             f"  Weights: {self.weight_mode.value}\n"
             f"  Antialiasing: {'enabled' if self.antialias_enabled else 'disabled'}"
+            f"{aniso_str}"
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -309,6 +322,7 @@ class MigrationConfig:
             'taper_width': self.taper_width,
             'traveltime_mode': self.traveltime_mode.value,
             'use_anisotropy': self.use_anisotropy,
+            'anisotropy_method': self.anisotropy_method.value,
             'weight_mode': self.weight_mode.value,
             'preserve_amplitudes': self.preserve_amplitudes,
             'antialias_enabled': self.antialias_enabled,
@@ -329,12 +343,14 @@ class MigrationConfig:
         traveltime_mode = TraveltimeMode(d.pop('traveltime_mode', 'straight_ray'))
         weight_mode = WeightMode(d.pop('weight_mode', 'spreading'))
         interpolation_mode = InterpolationMode(d.pop('interpolation_mode', 'sinc'))
+        anisotropy_method = AnisotropyMethod(d.pop('anisotropy_method', 'anelliptic'))
 
         return cls(
             output_grid=output_grid,
             traveltime_mode=traveltime_mode,
             weight_mode=weight_mode,
             interpolation_mode=interpolation_mode,
+            anisotropy_method=anisotropy_method,
             **d
         )
 

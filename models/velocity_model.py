@@ -494,3 +494,186 @@ def interval_to_rms_velocity(
             v_rms[i] = v_int[i]
 
     return t_axis, v_rms
+
+
+def create_2d_velocity(
+    data: np.ndarray,
+    z_axis: np.ndarray,
+    x_axis: np.ndarray,
+    is_time: bool = True,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> VelocityModel:
+    """
+    Create 2D velocity model v(x,z).
+
+    Args:
+        data: 2D velocity array (n_z, n_x) in m/s
+        z_axis: Z (depth/time) axis
+        x_axis: X (horizontal) axis in meters
+        is_time: If True, z is two-way time in seconds
+        metadata: Additional metadata
+
+    Returns:
+        VelocityModel with 2D velocity field
+    """
+    data = np.asarray(data, dtype=np.float32)
+    z_axis = np.asarray(z_axis, dtype=np.float32)
+    x_axis = np.asarray(x_axis, dtype=np.float32)
+
+    if data.ndim != 2:
+        raise ValueError(f"Data must be 2D, got shape {data.shape}")
+    if data.shape[0] != len(z_axis):
+        raise ValueError(f"Data z-dimension ({data.shape[0]}) must match z_axis length ({len(z_axis)})")
+    if data.shape[1] != len(x_axis):
+        raise ValueError(f"Data x-dimension ({data.shape[1]}) must match x_axis length ({len(x_axis)})")
+
+    return VelocityModel(
+        data=data,
+        z_axis=z_axis,
+        x_axis=x_axis,
+        is_time=is_time,
+        metadata=metadata or {'model_type': '2d_field'},
+    )
+
+
+def create_3d_velocity(
+    data: np.ndarray,
+    z_axis: np.ndarray,
+    x_axis: np.ndarray,
+    y_axis: np.ndarray,
+    is_time: bool = True,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> VelocityModel:
+    """
+    Create 3D velocity model v(x,y,z).
+
+    Args:
+        data: 3D velocity array (n_z, n_x, n_y) in m/s
+        z_axis: Z (depth/time) axis
+        x_axis: X (horizontal) axis in meters
+        y_axis: Y (horizontal) axis in meters
+        is_time: If True, z is two-way time in seconds
+        metadata: Additional metadata
+
+    Returns:
+        VelocityModel with 3D velocity cube
+    """
+    data = np.asarray(data, dtype=np.float32)
+    z_axis = np.asarray(z_axis, dtype=np.float32)
+    x_axis = np.asarray(x_axis, dtype=np.float32)
+    y_axis = np.asarray(y_axis, dtype=np.float32)
+
+    if data.ndim != 3:
+        raise ValueError(f"Data must be 3D, got shape {data.shape}")
+    if data.shape[0] != len(z_axis):
+        raise ValueError(f"Data z-dimension ({data.shape[0]}) must match z_axis length ({len(z_axis)})")
+    if data.shape[1] != len(x_axis):
+        raise ValueError(f"Data x-dimension ({data.shape[1]}) must match x_axis length ({len(x_axis)})")
+    if data.shape[2] != len(y_axis):
+        raise ValueError(f"Data y-dimension ({data.shape[2]}) must match y_axis length ({len(y_axis)})")
+
+    return VelocityModel(
+        data=data,
+        z_axis=z_axis,
+        x_axis=x_axis,
+        y_axis=y_axis,
+        is_time=is_time,
+        metadata=metadata or {'model_type': '3d_cube'},
+    )
+
+
+def create_2d_gradient_velocity(
+    v0: float,
+    z_gradient: float,
+    x_gradient: float,
+    z_max: float,
+    x_max: float,
+    dz: float = 0.004,
+    dx: float = 25.0,
+    is_time: bool = True,
+) -> VelocityModel:
+    """
+    Create 2D velocity model with linear gradients in z and x.
+
+    v(x,z) = v0 + z_gradient * z + x_gradient * x
+
+    Args:
+        v0: Velocity at origin (m/s)
+        z_gradient: Vertical gradient (m/s per unit z)
+        x_gradient: Horizontal gradient (m/s per meter)
+        z_max: Maximum z value
+        x_max: Maximum x value (meters)
+        dz: Z sampling
+        dx: X sampling (meters)
+        is_time: If True, z is time in seconds
+
+    Returns:
+        VelocityModel with 2D linear gradient
+    """
+    z_axis = np.arange(0, z_max + dz, dz, dtype=np.float32)
+    x_axis = np.arange(0, x_max + dx, dx, dtype=np.float32)
+
+    # Create 2D grid
+    zz, xx = np.meshgrid(z_axis, x_axis, indexing='ij')
+    data = (v0 + z_gradient * zz + x_gradient * xx).astype(np.float32)
+
+    return VelocityModel(
+        data=data,
+        z_axis=z_axis,
+        x_axis=x_axis,
+        is_time=is_time,
+        metadata={
+            'model_type': '2d_linear_gradient',
+            'v0': v0,
+            'z_gradient': z_gradient,
+            'x_gradient': x_gradient,
+        },
+    )
+
+
+def create_layered_velocity(
+    layer_depths: np.ndarray,
+    layer_velocities: np.ndarray,
+    z_max: float,
+    dz: float = 0.004,
+    is_time: bool = True,
+) -> VelocityModel:
+    """
+    Create 1D layered velocity model.
+
+    Args:
+        layer_depths: Top depth of each layer (first should be 0)
+        layer_velocities: Velocity of each layer (m/s)
+        z_max: Maximum z value
+        dz: Z sampling interval
+        is_time: If True, z is time in seconds
+
+    Returns:
+        VelocityModel with step-wise constant layers
+    """
+    layer_depths = np.asarray(layer_depths)
+    layer_velocities = np.asarray(layer_velocities)
+
+    if len(layer_depths) != len(layer_velocities):
+        raise ValueError("layer_depths and layer_velocities must have same length")
+
+    z_axis = np.arange(0, z_max + dz, dz, dtype=np.float32)
+    data = np.zeros_like(z_axis)
+
+    # Assign velocities layer by layer
+    for i in range(len(layer_depths)):
+        if i < len(layer_depths) - 1:
+            mask = (z_axis >= layer_depths[i]) & (z_axis < layer_depths[i + 1])
+        else:
+            mask = z_axis >= layer_depths[i]
+        data[mask] = layer_velocities[i]
+
+    return VelocityModel(
+        data=data.astype(np.float32),
+        z_axis=z_axis,
+        is_time=is_time,
+        metadata={
+            'model_type': 'layered',
+            'n_layers': len(layer_velocities),
+        },
+    )
