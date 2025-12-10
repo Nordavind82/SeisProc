@@ -6,6 +6,8 @@ numpy>=1.24.0
 scipy>=1.10.0
 pandas>=2.0.0
 PyWavelets>=1.4.0  # For DWT denoising
+emd-signal>=1.4.0  # For EMD/EEMD denoising
+ssqueezepy>=0.6.0  # For Synchrosqueezing Transform
 
 # Deep Learning & GPU Acceleration
 torch>=2.0.0

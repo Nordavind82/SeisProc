@@ -3,11 +3,16 @@ Volume Header Selection Dialog
 
 Dialog for selecting headers to build a 3D volume from 2D gathers.
 User selects inline and crossline header keys.
+
+Features:
+- Automatic distance calculation from coordinate headers
+- User can override calculated dx/dy values
+- Shows distance source (coordinates, header_diff, or default)
 """
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QGroupBox, QFormLayout, QMessageBox,
-    QProgressDialog, QApplication
+    QProgressDialog, QApplication, QDoubleSpinBox
 )
 from PyQt6.QtCore import Qt
 import pandas as pd
@@ -17,7 +22,9 @@ import numpy as np
 from utils.volume_builder import (
     get_available_volume_headers,
     estimate_volume_size,
+    estimate_volume_size_fast,
     build_volume_from_gathers,
+    calculate_spatial_distances,
     VolumeGeometry
 )
 from models.seismic_volume import SeismicVolume
@@ -35,6 +42,7 @@ class VolumeHeaderDialog(QDialog):
         self,
         headers_df: pd.DataFrame,
         n_samples: int,
+        coord_scalar: float = 1.0,
         parent=None
     ):
         """
@@ -43,16 +51,24 @@ class VolumeHeaderDialog(QDialog):
         Args:
             headers_df: DataFrame with trace headers
             n_samples: Number of time samples per trace
+            coord_scalar: Coordinate scalar from SEG-Y (e.g., -100 means divide by 100)
             parent: Parent widget
         """
         super().__init__(parent)
         self.setWindowTitle("Build 3D Volume - Select Headers")
-        self.setMinimumWidth(450)
+        self.setMinimumWidth(500)
 
         self.headers_df = headers_df
         self.n_samples = n_samples
+        self.coord_scalar = coord_scalar
         self.selected_inline = None
         self.selected_xline = None
+
+        # Store calculated distances
+        self._calculated_dx = 25.0
+        self._calculated_dy = 25.0
+        self._dx_source = 'default'
+        self._dy_source = 'default'
 
         self._init_ui()
         self._update_preview()
@@ -191,7 +207,62 @@ class VolumeHeaderDialog(QDialog):
             self.xline_combo.currentIndexChanged.connect(self._update_preview)
             form_layout.addRow("Crossline (Y) Key:", self.xline_combo)
 
+            # Auto-detect button
+            self.auto_btn = QPushButton("Auto-detect Best")
+            self.auto_btn.setToolTip("Find header combination with best coverage")
+            self.auto_btn.clicked.connect(self._on_auto_detect)
+            form_layout.addRow("", self.auto_btn)
+
         layout.addWidget(header_group)
+
+        # Spatial Distance Group - for FKK filter accuracy
+        distance_group = QGroupBox("Spatial Distances (for FKK Filter)")
+        distance_layout = QFormLayout(distance_group)
+
+        # Info about distance calculation
+        dist_info = QLabel(
+            "Distances are calculated from coordinates.\n"
+            "Adjust if incorrect for proper FKK velocity filtering."
+        )
+        dist_info.setStyleSheet("color: #666; font-size: 10px;")
+        dist_info.setWordWrap(True)
+        distance_layout.addRow(dist_info)
+
+        # dx spinbox (inline spacing)
+        dx_layout = QHBoxLayout()
+        self.dx_spin = QDoubleSpinBox()
+        self.dx_spin.setRange(1.0, 1000.0)
+        self.dx_spin.setValue(25.0)
+        self.dx_spin.setSuffix(" m")
+        self.dx_spin.setDecimals(1)
+        self.dx_spin.setToolTip("Inline spacing in meters (X direction)")
+        dx_layout.addWidget(self.dx_spin)
+        self.dx_source_label = QLabel("(default)")
+        self.dx_source_label.setStyleSheet("color: #888; font-size: 10px;")
+        dx_layout.addWidget(self.dx_source_label)
+        distance_layout.addRow("dx (inline):", dx_layout)
+
+        # dy spinbox (crossline spacing)
+        dy_layout = QHBoxLayout()
+        self.dy_spin = QDoubleSpinBox()
+        self.dy_spin.setRange(1.0, 1000.0)
+        self.dy_spin.setValue(25.0)
+        self.dy_spin.setSuffix(" m")
+        self.dy_spin.setDecimals(1)
+        self.dy_spin.setToolTip("Crossline spacing in meters (Y direction)")
+        dy_layout.addWidget(self.dy_spin)
+        self.dy_source_label = QLabel("(default)")
+        self.dy_source_label.setStyleSheet("color: #888; font-size: 10px;")
+        dy_layout.addWidget(self.dy_source_label)
+        distance_layout.addRow("dy (crossline):", dy_layout)
+
+        # Recalculate button
+        self.recalc_dist_btn = QPushButton("Recalculate from Coordinates")
+        self.recalc_dist_btn.setToolTip("Recalculate distances from coordinate headers")
+        self.recalc_dist_btn.clicked.connect(self._recalculate_distances)
+        distance_layout.addRow("", self.recalc_dist_btn)
+
+        layout.addWidget(distance_group)
 
         # Preview group
         preview_group = QGroupBox("Volume Preview")
@@ -215,6 +286,53 @@ class VolumeHeaderDialog(QDialog):
 
         layout.addLayout(button_layout)
 
+    def _recalculate_distances(self):
+        """Recalculate distances from coordinates and update spinboxes."""
+        if not hasattr(self, 'inline_combo') or not hasattr(self, 'xline_combo'):
+            return
+
+        inline_display = self.inline_combo.currentText()
+        xline_display = self.xline_combo.currentText()
+        inline_key = self.display_to_header.get(inline_display, inline_display)
+        xline_key = self.display_to_header.get(xline_display, xline_display)
+
+        distances = calculate_spatial_distances(
+            self.headers_df, inline_key, xline_key, self.coord_scalar
+        )
+
+        self._calculated_dx = distances['dx']
+        self._calculated_dy = distances['dy']
+        self._dx_source = distances['dx_source']
+        self._dy_source = distances['dy_source']
+
+        # Update spinboxes only if values were calculated
+        self.dx_spin.blockSignals(True)
+        self.dy_spin.blockSignals(True)
+        if distances['dx'] is not None:
+            self.dx_spin.setValue(distances['dx'])
+        if distances['dy'] is not None:
+            self.dy_spin.setValue(distances['dy'])
+        self.dx_spin.blockSignals(False)
+        self.dy_spin.blockSignals(False)
+
+        # Update source labels
+        source_style_ok = "color: green; font-size: 10px;"
+        source_style_error = "color: red; font-size: 10px; font-weight: bold;"
+
+        if distances['dx_source'] is not None:
+            self.dx_source_label.setText(f"(from {distances['dx_source']})")
+            self.dx_source_label.setStyleSheet(source_style_ok)
+        else:
+            self.dx_source_label.setText("(ENTER VALUE)")
+            self.dx_source_label.setStyleSheet(source_style_error)
+
+        if distances['dy_source'] is not None:
+            self.dy_source_label.setText(f"(from {distances['dy_source']})")
+            self.dy_source_label.setStyleSheet(source_style_ok)
+        else:
+            self.dy_source_label.setText("(ENTER VALUE)")
+            self.dy_source_label.setStyleSheet(source_style_error)
+
     def _update_preview(self):
         """Update the volume size preview."""
         # Safety guards - widgets may not exist yet during init
@@ -237,29 +355,102 @@ class VolumeHeaderDialog(QDialog):
                 self.headers_df,
                 inline_key,
                 xline_key,
-                self.n_samples
+                self.n_samples,
+                coord_scalar=self.coord_scalar
             )
 
+            # Update distance spinboxes from estimate
+            self._calculated_dx = estimate['dx']
+            self._calculated_dy = estimate['dy']
+            self._dx_source = estimate['dx_source']
+            self._dy_source = estimate['dy_source']
+
+            # Update spinboxes if values were calculated
+            if hasattr(self, 'dx_spin'):
+                self.dx_spin.blockSignals(True)
+                self.dy_spin.blockSignals(True)
+
+                # Only update spinbox if we got a calculated value
+                if estimate['dx'] is not None:
+                    self.dx_spin.setValue(estimate['dx'])
+                if estimate['dy'] is not None:
+                    self.dy_spin.setValue(estimate['dy'])
+
+                self.dx_spin.blockSignals(False)
+                self.dy_spin.blockSignals(False)
+
+                # Update source labels
+                source_style_ok = "color: green; font-size: 10px;"
+                source_style_error = "color: red; font-size: 10px; font-weight: bold;"
+
+                if estimate['dx_source'] is not None:
+                    self.dx_source_label.setText(f"(from {estimate['dx_source']})")
+                    self.dx_source_label.setStyleSheet(source_style_ok)
+                else:
+                    self.dx_source_label.setText("(ENTER VALUE)")
+                    self.dx_source_label.setStyleSheet(source_style_error)
+
+                if estimate['dy_source'] is not None:
+                    self.dy_source_label.setText(f"(from {estimate['dy_source']})")
+                    self.dy_source_label.setStyleSheet(source_style_ok)
+                else:
+                    self.dy_source_label.setText("(ENTER VALUE)")
+                    self.dy_source_label.setStyleSheet(source_style_error)
+
+            # Build preview text
             preview_text = (
                 f"Shape: {estimate['n_samples']} x {estimate['n_inlines']} x {estimate['n_xlines']}\n"
-                f"       (samples x inlines x xlines)\n\n"
+                f"       (samples × inlines × xlines)\n\n"
                 f"Size: {estimate['size_mb']:.1f} MB ({estimate['size_gb']:.2f} GB)\n\n"
-                f"Traces: {estimate['n_traces']:,} available\n"
-                f"        {estimate['theoretical_traces']:,} theoretical\n"
-                f"        {estimate['coverage_percent']:.1f}% coverage\n\n"
-                f"Inline range: {estimate['inline_range'][0]} - {estimate['inline_range'][1]}\n"
+                f"Traces: {estimate['n_traces']:,} input\n"
+                f"        {estimate['n_unique_positions']:,} unique positions\n"
+                f"        {estimate['theoretical_traces']:,} grid cells ({estimate['n_inlines']}×{estimate['n_xlines']})\n"
+                f"        {estimate['coverage_percent']:.1f}% grid coverage\n"
+            )
+
+            # Show duplicate info if any
+            if estimate['n_duplicates'] > 0:
+                preview_text += f"        {estimate['n_duplicates']:,} duplicate positions (will be overwritten)\n"
+
+            preview_text += (
+                f"\nInline range: {estimate['inline_range'][0]} - {estimate['inline_range'][1]}\n"
                 f"Xline range: {estimate['xline_range'][0]} - {estimate['xline_range'][1]}"
             )
+
+            # Add spacing info
+            dx_str = f"{estimate['dx']:.1f}m" if estimate['dx'] is not None else "NOT SET"
+            dy_str = f"{estimate['dy']:.1f}m" if estimate['dy'] is not None else "NOT SET"
+            preview_text += f"\n\nSpacing: dx={dx_str}, dy={dy_str}"
+
             self.preview_label.setText(preview_text)
 
             # Check for warnings
             warnings = []
             if estimate['size_mb'] > 2000:
-                warnings.append(f"Large volume ({estimate['size_gb']:.1f} GB) may require significant memory")
-            if estimate['coverage_percent'] < 50:
-                warnings.append(f"Low coverage ({estimate['coverage_percent']:.0f}%) - many traces may be missing")
+                warnings.append(f"⚠ Large volume ({estimate['size_gb']:.1f} GB) may require significant memory")
+
+            # Coverage warning - check both grid coverage and trace usage
+            grid_coverage = estimate['coverage_percent']
+            trace_usage = (estimate['n_unique_positions'] / estimate['n_traces']) * 100 if estimate['n_traces'] > 0 else 0
+
+            if grid_coverage < 50:
+                warnings.append(f"⚠ Low grid coverage ({grid_coverage:.0f}%) - many grid cells are empty")
+            if trace_usage < 90:
+                warnings.append(f"⚠ Only {trace_usage:.0f}% of traces mapped - check header selection")
+            if estimate['n_duplicates'] > estimate['n_traces'] * 0.1:
+                warnings.append(f"⚠ Many duplicate positions ({estimate['n_duplicates']}) - traces may be overwritten")
+
             if estimate['n_inlines'] < 4 or estimate['n_xlines'] < 4:
-                warnings.append("Very small volume - may not be suitable for FKK filtering")
+                warnings.append("⚠ Very small volume - may not be suitable for FKK filtering")
+
+            # Suggest better combination if coverage is low
+            if grid_coverage < 80 and trace_usage < 90:
+                best = self._find_best_header_combination()
+                if best and (best['inline'] != inline_key or best['xline'] != xline_key):
+                    warnings.append(
+                        f"💡 Suggested: {best['inline']} × {best['xline']} "
+                        f"({best['coverage']:.0f}% coverage)"
+                    )
 
             if warnings:
                 self.warning_label.setText("\n".join(warnings))
@@ -272,6 +463,158 @@ class VolumeHeaderDialog(QDialog):
         except Exception as e:
             self.preview_label.setText(f"Error: {str(e)}")
             self.build_btn.setEnabled(False)
+
+    def _find_best_header_combination(self):
+        """
+        Find header combination that gives best coverage.
+
+        Scoring prioritizes:
+        1. High coverage percentage (traces that map to unique grid positions)
+        2. Low number of duplicates (traces overwriting each other)
+        3. Grid size close to trace count (efficient use of memory)
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+
+        if len(self.available_headers) < 2:
+            return None
+
+        n_traces = len(self.headers_df)
+        best_score = -1
+        best_combo = None
+
+        logger.info(f"Auto-detecting best headers for {n_traces} traces from {len(self.available_headers)} available headers")
+
+        # Check all combinations (limit to prevent excessive computation)
+        headers_to_check = self.available_headers[:15]
+
+        for i, h1 in enumerate(headers_to_check):
+            for h2 in headers_to_check[i+1:]:
+                try:
+                    # Use fast estimate (no distance calculation)
+                    estimate = estimate_volume_size_fast(
+                        self.headers_df, h1, h2, self.n_samples
+                    )
+
+                    # Calculate score based on multiple factors:
+                    # 1. Coverage: what % of grid is filled
+                    coverage = estimate['coverage_percent']
+
+                    # 2. Efficiency: what % of traces map to unique positions (no duplicates)
+                    unique_ratio = (estimate['n_unique_positions'] / n_traces) * 100 if n_traces > 0 else 0
+
+                    # 3. Grid efficiency: how close is grid size to trace count
+                    #    Ideal: n_inlines * n_xlines == n_traces (100% coverage, no wasted space)
+                    grid_size = estimate['theoretical_traces']
+                    size_ratio = min(n_traces / grid_size, grid_size / n_traces) * 100 if grid_size > 0 else 0
+
+                    # Combined score: prioritize unique mapping, then coverage, then size efficiency
+                    # Perfect score = 100 + 100 + 100 = 300
+                    score = unique_ratio * 1.5 + coverage * 1.0 + size_ratio * 0.5
+
+                    logger.debug(f"  {h1} x {h2}: coverage={coverage:.1f}%, unique={unique_ratio:.1f}%, "
+                               f"size_ratio={size_ratio:.1f}%, score={score:.1f}")
+
+                    if score > best_score:
+                        best_score = score
+                        best_combo = {
+                            'inline': h1,
+                            'xline': h2,
+                            'coverage': coverage,
+                            'unique_ratio': unique_ratio,
+                            'n_inlines': estimate['n_inlines'],
+                            'n_xlines': estimate['n_xlines'],
+                            'score': score
+                        }
+                except Exception as e:
+                    logger.debug(f"  {h1} x {h2}: failed - {e}")
+
+        if best_combo:
+            logger.info(f"Best combination: {best_combo['inline']} x {best_combo['xline']} "
+                       f"({best_combo['n_inlines']}x{best_combo['n_xlines']}) "
+                       f"coverage={best_combo['coverage']:.1f}%, unique={best_combo['unique_ratio']:.1f}%")
+
+        return best_combo
+
+    def _on_auto_detect(self):
+        """Handle auto-detect button click - find and set best header combination."""
+        import logging
+        logger = logging.getLogger(__name__)
+
+        # Show busy cursor
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+
+        try:
+            best = self._find_best_header_combination()
+
+            if best is None:
+                QApplication.restoreOverrideCursor()
+                QMessageBox.warning(
+                    self,
+                    "Auto-detect Failed",
+                    "Could not find a suitable header combination.\n"
+                    "Please select headers manually."
+                )
+                return
+
+            logger.info(f"Auto-detected best combination: {best['inline']} x {best['xline']} "
+                       f"({best['coverage']:.1f}% coverage)")
+
+            # Find the display items for the best headers
+            inline_display = None
+            xline_display = None
+
+            for display_item, header in self.display_to_header.items():
+                if header == best['inline']:
+                    inline_display = display_item
+                if header == best['xline']:
+                    xline_display = display_item
+
+            if inline_display and xline_display:
+                # Block signals to prevent multiple preview updates
+                self.inline_combo.blockSignals(True)
+                self.xline_combo.blockSignals(True)
+
+                self.inline_combo.setCurrentText(inline_display)
+                self.xline_combo.setCurrentText(xline_display)
+
+                self.inline_combo.blockSignals(False)
+                self.xline_combo.blockSignals(False)
+
+                # Update preview once
+                self._update_preview()
+
+                # Build detailed message
+                msg = (
+                    f"Best combination found:\n\n"
+                    f"Inline: {best['inline']} ({best.get('n_inlines', '?')} values)\n"
+                    f"Crossline: {best['xline']} ({best.get('n_xlines', '?')} values)\n\n"
+                    f"Grid coverage: {best['coverage']:.1f}%\n"
+                    f"Unique mapping: {best.get('unique_ratio', 0):.1f}%"
+                )
+
+                QMessageBox.information(
+                    self,
+                    "Auto-detect Complete",
+                    msg
+                )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Auto-detect Error",
+                    f"Found combination ({best['inline']} x {best['xline']}) "
+                    f"but could not set in UI."
+                )
+
+        except Exception as e:
+            logger.error(f"Auto-detect failed: {e}")
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"Auto-detect failed:\n{str(e)}"
+            )
+        finally:
+            QApplication.restoreOverrideCursor()
 
     def get_selected_headers(self) -> Tuple[str, str]:
         """
@@ -287,12 +630,22 @@ class VolumeHeaderDialog(QDialog):
             self.display_to_header.get(xline_display, xline_display)
         )
 
+    def get_spatial_distances(self) -> Tuple[float, float]:
+        """
+        Get the spatial distances (dx, dy) from spinboxes.
+
+        Returns:
+            Tuple of (dx, dy) in meters
+        """
+        return (self.dx_spin.value(), self.dy_spin.value())
+
 
 def build_volume_with_dialog(
     traces_data: np.ndarray,
     headers_df: pd.DataFrame,
     sample_rate_ms: float,
     coordinate_units: str = 'meters',
+    coord_scalar: float = 1.0,
     parent=None
 ) -> Optional[Tuple[SeismicVolume, VolumeGeometry]]:
     """
@@ -303,6 +656,7 @@ def build_volume_with_dialog(
         headers_df: DataFrame with trace headers
         sample_rate_ms: Sample rate in milliseconds
         coordinate_units: 'meters' or 'feet'
+        coord_scalar: Coordinate scalar from SEG-Y headers
         parent: Parent widget
 
     Returns:
@@ -311,11 +665,12 @@ def build_volume_with_dialog(
     n_samples = traces_data.shape[0]
 
     # Show header selection dialog
-    dialog = VolumeHeaderDialog(headers_df, n_samples, parent)
+    dialog = VolumeHeaderDialog(headers_df, n_samples, coord_scalar, parent)
     if dialog.exec() != QDialog.DialogCode.Accepted:
         return None
 
     inline_key, xline_key = dialog.get_selected_headers()
+    dx, dy = dialog.get_spatial_distances()
 
     # Show progress dialog
     progress = QProgressDialog(
@@ -341,6 +696,9 @@ def build_volume_with_dialog(
             xline_key=xline_key,
             sample_rate_ms=sample_rate_ms,
             coordinate_units=coordinate_units,
+            dx=dx,
+            dy=dy,
+            coord_scalar=coord_scalar,
             progress_callback=update_progress
         )
 

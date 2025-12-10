@@ -88,6 +88,7 @@ class MigrationJobConfig:
     origin_y: float = 0.0
     inline_spacing: float = 25.0
     xline_spacing: float = 25.0
+    grid_azimuth_deg: float = 0.0  # Inline direction azimuth from north
 
     # Migration parameters
     max_aperture_m: float = 3000.0
@@ -204,6 +205,7 @@ class MigrationJobConfig:
             xline_start=self.xline_min,
             x_origin=self.origin_x,
             y_origin=self.origin_y,
+            inline_azimuth=self.grid_azimuth_deg,
         )
 
     def get_migration_config(self) -> MigrationConfig:
@@ -271,6 +273,7 @@ class MigrationJobConfig:
             'origin_y': self.origin_y,
             'inline_spacing': self.inline_spacing,
             'xline_spacing': self.xline_spacing,
+            'grid_azimuth_deg': self.grid_azimuth_deg,
             'max_aperture_m': self.max_aperture_m,
             'max_angle_deg': self.max_angle_deg,
             'max_offset_m': self.max_offset_m,

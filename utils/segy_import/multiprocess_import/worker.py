@@ -6,15 +6,27 @@ Workers write directly to a shared Zarr array at their assigned offset.
 """
 
 import gc
+import struct
 import numpy as np
 import segyio
 import zarr
 import pandas as pd
 import time
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Tuple
 from pathlib import Path
 from multiprocessing import Queue
+
+
+# Standard SEG-Y trace header field byte positions that segyio supports natively
+# These are fields where segyio.TraceField enum value == byte position
+SEGYIO_NATIVE_FIELDS = {
+    1, 5, 9, 13, 17, 21, 25, 29, 31, 33, 35, 37, 41, 45, 49, 53, 57, 61, 65,
+    69, 71, 73, 77, 81, 85, 89, 91, 95, 99, 103, 107, 109, 111, 113, 115, 117,
+    119, 121, 123, 125, 127, 129, 131, 133, 135, 137, 139, 141, 143, 145, 147,
+    149, 151, 153, 155, 157, 159, 161, 163, 165, 167, 169, 171, 173, 175, 177,
+    179, 181, 183, 185, 187, 189, 193, 197, 201, 203, 205, 209, 211, 213, 217
+}
 
 
 @dataclass
@@ -26,7 +38,7 @@ class WorkerTask:
     start_trace: int          # Inclusive (global index)
     end_trace: int            # Exclusive (global index)
     n_samples: int            # Samples per trace
-    header_mapping_dict: Dict[str, int]  # Serialized: {name: byte_location}
+    header_mapping_dict: Dict[str, Tuple[int, str]]  # Serialized: {name: (byte_location, format)}
     chunk_size: int = 10000
     report_interval: int = 5000  # Report progress every N traces
 
@@ -145,16 +157,24 @@ def _read_headers_batch(
     f,
     start: int,
     end: int,
-    header_mapping: Dict[str, int]
+    header_mapping: Dict[str, Tuple[int, str]]
 ) -> List[Dict[str, int]]:
     """
-    Read headers in batch using segyio attributes.
+    Read headers in batch by reading raw trace header bytes.
+
+    This function reads raw header bytes directly instead of using segyio.attributes()
+    because segyio.attributes() interprets byte positions as TraceField enum values,
+    which doesn't work correctly for non-standard header positions.
+
+    For example, byte position 201 in the raw header contains user-defined inline data,
+    but segyio.attributes(201) returns ShotPointScalar (a 2-byte field at enum value 201).
 
     Args:
         f: Open segyio file handle
         start: Start trace index
         end: End trace index
-        header_mapping: Dict of {name: byte_location}
+        header_mapping: Dict of {name: (byte_location, format_code)}
+            where format_code is 'i' for 4-byte int, 'h' for 2-byte int
 
     Returns:
         List of header dictionaries
@@ -162,14 +182,39 @@ def _read_headers_batch(
     n_traces = end - start
     headers = [{} for _ in range(n_traces)]
 
-    for name, byte_loc in header_mapping.items():
-        try:
-            values = f.attributes(byte_loc)[start:end]
-            for i, val in enumerate(values):
-                headers[i][name] = int(val)
-        except (KeyError, IndexError, TypeError):
-            for i in range(n_traces):
-                headers[i][name] = 0
+    # Format code sizes and struct format strings (big-endian as per SEG-Y)
+    FORMAT_INFO = {
+        'i': (4, '>i'),  # 4-byte signed int, big-endian
+        'h': (2, '>h'),  # 2-byte signed int, big-endian
+        'I': (4, '>I'),  # 4-byte unsigned int, big-endian
+        'H': (2, '>H'),  # 2-byte unsigned int, big-endian
+    }
+
+    for trace_offset, local_idx in enumerate(range(start, end)):
+        # Get raw 240-byte trace header via buf property
+        header_obj = f.header[local_idx]
+        raw_header = bytes(header_obj.buf)
+
+        # Read each field from raw bytes
+        for name, (byte_loc, fmt_code) in header_mapping.items():
+            try:
+                # Byte location is 1-based in SEG-Y, convert to 0-based
+                offset = byte_loc - 1
+
+                # Get format info
+                size, struct_fmt = FORMAT_INFO.get(fmt_code, (4, '>i'))
+
+                # Extract bytes and unpack
+                raw_bytes = raw_header[offset:offset + size]
+
+                if len(raw_bytes) == size:
+                    value = struct.unpack(struct_fmt, raw_bytes)[0]
+                    headers[trace_offset][name] = int(value)
+                else:
+                    headers[trace_offset][name] = 0
+
+            except (KeyError, IndexError, TypeError, struct.error) as e:
+                headers[trace_offset][name] = 0
 
     return headers
 

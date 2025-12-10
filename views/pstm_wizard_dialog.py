@@ -53,15 +53,20 @@ class PSTMWizard(QWizard):
         self.job_setup_page = JobSetupPage(self)
         self.velocity_page = VelocityModelPage(self)
         self.header_page = HeaderMappingPage(self)
-        self.output_grid_page = OutputGridPage(self)
+        self.input_grid_page = InputGridPage(self)  # Scan and detect input grid
+        self.image_output_page = ImageOutputPage(self)  # User-defined output grid
         self.binning_page = BinningConfigPage(self)
         self.advanced_page = AdvancedOptionsPage(self)
         self.review_page = ReviewLaunchPage(self)
 
+        # Keep output_grid_page as alias for backward compatibility
+        self.output_grid_page = self.image_output_page
+
         self.addPage(self.job_setup_page)
         self.addPage(self.velocity_page)
         self.addPage(self.header_page)
-        self.addPage(self.output_grid_page)
+        self.addPage(self.input_grid_page)
+        self.addPage(self.image_output_page)
         self.addPage(self.binning_page)
         self.addPage(self.advanced_page)
         self.addPage(self.review_page)
@@ -81,16 +86,29 @@ class PSTMWizard(QWizard):
             'velocity_v0': 2500.0,
             'velocity_gradient': 0.0,
             'velocity_file': '',
-            # Output grid
+            # Output grid - time axis
             'time_min_ms': 0,
             'time_max_ms': 4000,
             'dt_ms': 4.0,
+            # Output grid - corner points (3 corners define rectangular grid)
+            'corner1_il': 1, 'corner1_xl': 1, 'corner1_x': 0.0, 'corner1_y': 0.0,  # Origin (IL min, XL min)
+            'corner2_il': 100, 'corner2_xl': 1, 'corner2_x': 2475.0, 'corner2_y': 0.0,  # IL max, XL min
+            'corner3_il': 1, 'corner3_xl': 100, 'corner3_x': 0.0, 'corner3_y': 2475.0,  # IL min, XL max
+            # Computed corner 4 (IL max, XL max)
+            'corner4_il': 100, 'corner4_xl': 100, 'corner4_x': 2475.0, 'corner4_y': 2475.0,
+            # Bin sizes
+            'bin_size_il': 25.0,
+            'bin_size_xl': 25.0,
+            # Legacy fields for backward compatibility
             'inline_min': 1,
             'inline_max': 100,
             'inline_step': 1,
             'xline_min': 1,
             'xline_max': 100,
             'xline_step': 1,
+            # Grid origin (computed from corner1)
+            'x_origin': 0.0,
+            'y_origin': 0.0,
             # Binning
             'binning_preset': 'full_stack',
             'binning_table': [],
@@ -102,6 +120,12 @@ class PSTMWizard(QWizard):
             'checkpoint_enabled': True,
             'use_gpu': True,
             'n_workers': 4,
+            # Performance tuning
+            'use_time_domain': False,
+            'tile_size': 100,
+            'use_kdtree': False,
+            'use_time_dependent_aperture': True,
+            'sample_batch_size': 200,
             # Header mapping
             'header_mapping': {},
         }
@@ -139,16 +163,66 @@ class PSTMWizard(QWizard):
         self._config['velocity_gradient'] = self.velocity_page.gradient_spin.value()
         self._config['velocity_file'] = self.velocity_page.vel_file_edit.text()
 
-        # Output Grid
-        self._config['time_min_ms'] = self.output_grid_page.time_min_spin.value()
-        self._config['time_max_ms'] = self.output_grid_page.time_max_spin.value()
-        self._config['dt_ms'] = self.output_grid_page.dt_spin.value()
-        self._config['inline_min'] = self.output_grid_page.il_min_spin.value()
-        self._config['inline_max'] = self.output_grid_page.il_max_spin.value()
-        self._config['inline_step'] = self.output_grid_page.il_step_spin.value()
-        self._config['xline_min'] = self.output_grid_page.xl_min_spin.value()
-        self._config['xline_max'] = self.output_grid_page.xl_max_spin.value()
-        self._config['xline_step'] = self.output_grid_page.xl_step_spin.value()
+        # Input Grid (from scan results)
+        scan_results = self.input_grid_page.get_scan_results()
+        if scan_results:
+            # Store scanned input grid geometry
+            self._config['input_il_min'] = scan_results['il_min']
+            self._config['input_il_max'] = scan_results['il_max']
+            self._config['input_xl_min'] = scan_results['xl_min']
+            self._config['input_xl_max'] = scan_results['xl_max']
+            self._config['input_bin_il'] = scan_results['bin_il']
+            self._config['input_bin_xl'] = scan_results['bin_xl']
+            self._config['input_il_extent'] = scan_results['il_distance']
+            self._config['input_xl_extent'] = scan_results['xl_distance']
+            # Grid origin from corner 1 coordinates
+            self._config['x_origin'] = scan_results['c1_x']
+            self._config['y_origin'] = scan_results['c1_y']
+            # Grid azimuth (inline direction from north)
+            self._config['grid_azimuth_deg'] = scan_results.get('grid_azimuth_deg', 0.0)
+            # Time axis from input
+            self._config['input_dt_ms'] = scan_results.get('dt_ms', 4.0)
+            self._config['input_n_samples'] = scan_results.get('n_samples', 1000)
+            self._config['input_t_max_ms'] = scan_results.get('t_max_ms', 4000.0)
+            # Store all corners for reference
+            self._config['corner1_il'] = scan_results['il_min']
+            self._config['corner1_xl'] = scan_results['xl_min']
+            self._config['corner1_x'] = scan_results['c1_x']
+            self._config['corner1_y'] = scan_results['c1_y']
+            self._config['corner2_il'] = scan_results['il_max']
+            self._config['corner2_xl'] = scan_results['xl_min']
+            self._config['corner2_x'] = scan_results['c2_x']
+            self._config['corner2_y'] = scan_results['c2_y']
+            self._config['corner3_il'] = scan_results['il_min']
+            self._config['corner3_xl'] = scan_results['xl_max']
+            self._config['corner3_x'] = scan_results['c3_x']
+            self._config['corner3_y'] = scan_results['c3_y']
+            self._config['corner4_il'] = scan_results['il_max']
+            self._config['corner4_xl'] = scan_results['xl_max']
+            self._config['corner4_x'] = scan_results['c4_x']
+            self._config['corner4_y'] = scan_results['c4_y']
+
+        # Image Output Parameters (user-defined output grid)
+        output_params = self.image_output_page.get_output_params()
+        self._config['inline_min'] = output_params['il_start']
+        self._config['inline_max'] = output_params['il_end']
+        self._config['inline_step'] = output_params['il_step']
+        self._config['xline_min'] = output_params['xl_start']
+        self._config['xline_max'] = output_params['xl_end']
+        self._config['xline_step'] = output_params['xl_step']
+        self._config['time_min_ms'] = output_params['time_start_ms']
+        self._config['time_max_ms'] = output_params['time_end_ms']
+        self._config['dt_ms'] = output_params['dt_ms']
+        # Output bin sizes (can differ from input)
+        self._config['output_bin_il'] = output_params['output_bin_il']
+        self._config['output_bin_xl'] = output_params['output_bin_xl']
+        # Ensure grid origin and azimuth are set from output params if available
+        if 'x_origin' in output_params:
+            self._config['x_origin'] = output_params['x_origin']
+        if 'y_origin' in output_params:
+            self._config['y_origin'] = output_params['y_origin']
+        if 'grid_azimuth_deg' in output_params:
+            self._config['grid_azimuth_deg'] = output_params['grid_azimuth_deg']
 
         # Binning
         self._config['binning_preset'] = self.binning_page.preset_combo.currentText()
@@ -162,6 +236,14 @@ class PSTMWizard(QWizard):
         self._config['checkpoint_enabled'] = self.advanced_page.checkpoint_check.isChecked()
         self._config['use_gpu'] = self.advanced_page.gpu_check.isChecked()
         self._config['n_workers'] = self.advanced_page.workers_spin.value()
+
+        # Performance tuning (NEW)
+        algorithm_text = self.advanced_page.algorithm_combo.currentText()
+        self._config['use_time_domain'] = 'Time-Domain' in algorithm_text
+        self._config['tile_size'] = self.advanced_page.tile_size_spin.value()
+        self._config['use_kdtree'] = self.advanced_page.kdtree_check.isChecked()
+        self._config['use_time_dependent_aperture'] = self.advanced_page.time_dep_aperture_check.isChecked()
+        self._config['sample_batch_size'] = self.advanced_page.sample_batch_spin.value()
 
         # Header mapping
         self._config['header_mapping'] = self.header_page.get_mapping()
@@ -803,155 +885,767 @@ class HeaderMappingPage(QWizardPage):
         return True
 
 
-class OutputGridPage(QWizardPage):
-    """Page 4: Define output grid geometry."""
+class InputGridPage(QWizardPage):
+    """Page 4: Scan and display input data grid geometry (read-only from scan)."""
 
     def __init__(self, wizard: PSTMWizard):
         super().__init__(wizard)
         self.wizard_ref = wizard
-        self.setTitle("Output Grid")
-        self.setSubTitle("Define the output image grid dimensions and geometry")
+        self.setTitle("Input Data Grid")
+        self.setSubTitle("Scan input data to determine grid geometry and bin sizes")
+
+        self._scan_results = None
 
         layout = QVBoxLayout(self)
+
+        # Scan button and status
+        scan_layout = QHBoxLayout()
+        self.scan_btn = QPushButton("Scan Input Data")
+        self.scan_btn.setToolTip("Scan input file to detect grid geometry from trace headers")
+        self.scan_btn.clicked.connect(self._scan_input_data)
+        scan_layout.addWidget(self.scan_btn)
+
+        self.scan_status_label = QLabel("Click 'Scan Input Data' to analyze the input file")
+        self.scan_status_label.setStyleSheet("color: gray; font-style: italic;")
+        scan_layout.addWidget(self.scan_status_label)
+        scan_layout.addStretch()
+        layout.addLayout(scan_layout)
+
+        # Grid geometry display (read-only, populated by scan)
+        grid_group = QGroupBox("Detected Grid Geometry")
+        grid_layout = QGridLayout(grid_group)
+
+        # Headers
+        grid_layout.addWidget(QLabel(""), 0, 0)
+        grid_layout.addWidget(QLabel("Inline"), 0, 1)
+        grid_layout.addWidget(QLabel("Crossline"), 0, 2)
+        grid_layout.addWidget(QLabel("X (m)"), 0, 3)
+        grid_layout.addWidget(QLabel("Y (m)"), 0, 4)
+
+        # Min corner
+        grid_layout.addWidget(QLabel("Min (IL min, XL min):"), 1, 0)
+        self.min_il_label = QLabel("-")
+        self.min_xl_label = QLabel("-")
+        self.min_x_label = QLabel("-")
+        self.min_y_label = QLabel("-")
+        grid_layout.addWidget(self.min_il_label, 1, 1)
+        grid_layout.addWidget(self.min_xl_label, 1, 2)
+        grid_layout.addWidget(self.min_x_label, 1, 3)
+        grid_layout.addWidget(self.min_y_label, 1, 4)
+
+        # Max corner
+        grid_layout.addWidget(QLabel("Max (IL max, XL max):"), 2, 0)
+        self.max_il_label = QLabel("-")
+        self.max_xl_label = QLabel("-")
+        self.max_x_label = QLabel("-")
+        self.max_y_label = QLabel("-")
+        grid_layout.addWidget(self.max_il_label, 2, 1)
+        grid_layout.addWidget(self.max_xl_label, 2, 2)
+        grid_layout.addWidget(self.max_x_label, 2, 3)
+        grid_layout.addWidget(self.max_y_label, 2, 4)
+
+        layout.addWidget(grid_group)
+
+        # Calculated bin sizes (read-only)
+        bin_group = QGroupBox("Calculated Bin Sizes")
+        bin_layout = QGridLayout(bin_group)
+
+        bin_layout.addWidget(QLabel("Inline Bin Size:"), 0, 0)
+        self.bin_il_label = QLabel("-")
+        self.bin_il_label.setStyleSheet("font-weight: bold;")
+        bin_layout.addWidget(self.bin_il_label, 0, 1)
+
+        bin_layout.addWidget(QLabel("Crossline Bin Size:"), 0, 2)
+        self.bin_xl_label = QLabel("-")
+        self.bin_xl_label.setStyleSheet("font-weight: bold;")
+        bin_layout.addWidget(self.bin_xl_label, 0, 3)
+
+        layout.addWidget(bin_group)
+
+        # Summary display
+        summary_group = QGroupBox("Grid Summary")
+        summary_layout = QVBoxLayout(summary_group)
+        self.summary_label = QLabel("No data scanned yet")
+        self.summary_label.setFont(QFont("Courier", 10))
+        summary_layout.addWidget(self.summary_label)
+        layout.addWidget(summary_group)
+
+        layout.addStretch()
+
+    def initializePage(self):
+        """Auto-scan when page is shown if not already scanned."""
+        if self._scan_results is None:
+            # Auto-trigger scan
+            self._scan_input_data()
+
+    def _scan_input_data(self):
+        """Scan input data to find grid geometry from actual trace positions."""
+        input_file = self.wizard_ref._config.get('input_file', '')
+        if not input_file:
+            input_file = self.wizard_ref.job_setup_page.input_edit.text()
+        if not input_file:
+            QMessageBox.warning(self, "No Input", "Please select an input file first.")
+            return
+
+        self.scan_status_label.setText("Scanning input data...")
+        self.scan_status_label.setStyleSheet("color: blue;")
+        from PyQt6.QtWidgets import QApplication
+        QApplication.processEvents()
+
+        try:
+            from pathlib import Path
+            import pandas as pd
+            import numpy as np
+            import json
+            import math
+
+            input_path = Path(input_file)
+            headers_path = input_path / 'headers.parquet' if input_path.is_dir() else None
+            metadata_path = input_path / 'metadata.json' if input_path.is_dir() else None
+
+            if not headers_path or not headers_path.exists():
+                QMessageBox.warning(self, "No Headers",
+                    "Headers file not found.\nPlease use a Zarr dataset with headers.parquet.")
+                self.scan_status_label.setText("Scan failed: no headers file")
+                self.scan_status_label.setStyleSheet("color: red;")
+                return
+
+            # Read time axis parameters from metadata.json
+            dt_ms = 4.0  # default
+            n_samples = 1000  # default
+            t_max_ms = 4000.0  # default
+
+            if metadata_path and metadata_path.exists():
+                try:
+                    with open(metadata_path, 'r') as f:
+                        metadata = json.load(f)
+                    dt_ms = float(metadata.get('sample_rate', 4.0))
+                    n_samples = int(metadata.get('n_samples', 1000))
+                    t_max_ms = float(metadata.get('duration_ms', (n_samples - 1) * dt_ms))
+                    logger.info(f"Read time axis from metadata: dt={dt_ms}ms, n_samples={n_samples}, t_max={t_max_ms}ms")
+                except Exception as e:
+                    logger.warning(f"Could not read metadata.json: {e}")
+
+            # Read headers
+            df = pd.read_parquet(headers_path)
+            n_traces = len(df)
+
+            self.scan_status_label.setText(f"Analyzing {n_traces:,} traces...")
+            QApplication.processEvents()
+
+            # Find coordinate scalar
+            coord_scalar = 1.0
+            for scalar_name in ['scalar_coord', 'coordinate_scalar', 'scalco', 'ScalarCoord']:
+                if scalar_name in df.columns:
+                    scalar_val = df[scalar_name].mode().iloc[0] if len(df[scalar_name].mode()) > 0 else df[scalar_name].iloc[0]
+                    if scalar_val < 0:
+                        coord_scalar = 1.0 / abs(scalar_val)
+                    elif scalar_val > 0:
+                        coord_scalar = float(scalar_val)
+                    break
+
+            # Find IL/XL columns - NO FALLBACKS, user must have correct mapping
+            il_col = xl_col = None
+
+            for col in df.columns:
+                col_lower = col.lower()
+                if 'inline' in col_lower or col_lower == 'il':
+                    il_col = col
+                elif 'crossline' in col_lower or 'xline' in col_lower or col_lower == 'xl':
+                    xl_col = col
+
+            # Find coordinate columns
+            src_x_col = src_y_col = rec_x_col = rec_y_col = None
+            for col in df.columns:
+                col_lower = col.lower()
+                if 'source_x' in col_lower or col_lower == 'sx':
+                    src_x_col = col
+                elif 'source_y' in col_lower or col_lower == 'sy':
+                    src_y_col = col
+                elif 'receiver_x' in col_lower or 'group_x' in col_lower or col_lower in ['gx', 'rx']:
+                    rec_x_col = col
+                elif 'receiver_y' in col_lower or 'group_y' in col_lower or col_lower in ['gy', 'ry']:
+                    rec_y_col = col
+
+            # Check if IL/XL columns exist and have valid data
+            if not il_col or not xl_col:
+                QMessageBox.warning(self, "Missing Headers",
+                    f"Could not find inline/crossline columns in headers.\n\n"
+                    f"Inline column: {'found' if il_col else 'NOT FOUND'}\n"
+                    f"Crossline column: {'found' if xl_col else 'NOT FOUND'}\n\n"
+                    f"Available columns:\n{', '.join(df.columns)}\n\n"
+                    f"Please check your header mapping during SEG-Y import.")
+                self.scan_status_label.setText("Scan failed: no IL/XL columns")
+                self.scan_status_label.setStyleSheet("color: red;")
+                return
+
+            # Check if columns have valid data (not all same value)
+            il_unique = df[il_col].nunique()
+            xl_unique = df[xl_col].nunique()
+
+            if il_unique <= 1:
+                il_val = df[il_col].iloc[0] if len(df) > 0 else 'N/A'
+                QMessageBox.warning(self, "Invalid Inline Data",
+                    f"Inline column '{il_col}' has no valid data!\n\n"
+                    f"All {len(df):,} traces have the same value: {il_val}\n\n"
+                    f"This usually means:\n"
+                    f"1. Wrong byte position in header mapping, or\n"
+                    f"2. SEG-Y import bug reading non-standard headers\n\n"
+                    f"Please re-import with correct header mapping.")
+                self.scan_status_label.setText(f"Scan failed: inline column all same value ({il_val})")
+                self.scan_status_label.setStyleSheet("color: red;")
+                return
+
+            if xl_unique <= 1:
+                xl_val = df[xl_col].iloc[0] if len(df) > 0 else 'N/A'
+                QMessageBox.warning(self, "Invalid Crossline Data",
+                    f"Crossline column '{xl_col}' has no valid data!\n\n"
+                    f"All {len(df):,} traces have the same value: {xl_val}\n\n"
+                    f"Please re-import with correct header mapping.")
+                self.scan_status_label.setText(f"Scan failed: crossline column all same value ({xl_val})")
+                self.scan_status_label.setStyleSheet("color: red;")
+                return
+
+            if not src_x_col or not src_y_col:
+                QMessageBox.warning(self, "Missing Headers",
+                    "Could not find coordinate columns in headers.")
+                self.scan_status_label.setText("Scan failed: no coordinate columns")
+                self.scan_status_label.setStyleSheet("color: red;")
+                return
+
+            # Compute midpoint coordinates
+            if rec_x_col and rec_y_col:
+                df['_mid_x'] = ((df[src_x_col] + df[rec_x_col]) / 2) * coord_scalar
+                df['_mid_y'] = ((df[src_y_col] + df[rec_y_col]) / 2) * coord_scalar
+            else:
+                df['_mid_x'] = df[src_x_col] * coord_scalar
+                df['_mid_y'] = df[src_y_col] * coord_scalar
+
+            # Find traces at IL/XL extremes
+            il_min = df[il_col].min()
+            il_max = df[il_col].max()
+            xl_min = df[xl_col].min()
+            xl_max = df[xl_col].max()
+
+            self.scan_status_label.setText("Finding corner coordinates...")
+            QApplication.processEvents()
+
+            # Get coordinates at min IL (average across all XL at min IL)
+            min_il_traces = df[df[il_col] == il_min]
+            min_il_x = min_il_traces['_mid_x'].mean()
+            min_il_y = min_il_traces['_mid_y'].mean()
+
+            # Get coordinates at max IL
+            max_il_traces = df[df[il_col] == il_max]
+            max_il_x = max_il_traces['_mid_x'].mean()
+            max_il_y = max_il_traces['_mid_y'].mean()
+
+            # Get coordinates at min XL
+            min_xl_traces = df[df[xl_col] == xl_min]
+            min_xl_x = min_xl_traces['_mid_x'].mean()
+            min_xl_y = min_xl_traces['_mid_y'].mean()
+
+            # Get coordinates at max XL
+            max_xl_traces = df[df[xl_col] == xl_max]
+            max_xl_x = max_xl_traces['_mid_x'].mean()
+            max_xl_y = max_xl_traces['_mid_y'].mean()
+
+            # Find actual corner coordinates (traces near IL min/XL min, etc.)
+            # Corner 1: IL min, XL min
+            corner1_traces = df[(df[il_col] == il_min) & (df[xl_col] == df[df[il_col] == il_min][xl_col].min())]
+            if len(corner1_traces) == 0:
+                corner1_traces = df[df[il_col] == il_min].nsmallest(10, xl_col)
+            c1_x = corner1_traces['_mid_x'].mean()
+            c1_y = corner1_traces['_mid_y'].mean()
+            c1_xl = int(corner1_traces[xl_col].mean())
+
+            # Corner 2: IL max, XL min
+            corner2_traces = df[(df[il_col] == il_max) & (df[xl_col] == df[df[il_col] == il_max][xl_col].min())]
+            if len(corner2_traces) == 0:
+                corner2_traces = df[df[il_col] == il_max].nsmallest(10, xl_col)
+            c2_x = corner2_traces['_mid_x'].mean()
+            c2_y = corner2_traces['_mid_y'].mean()
+            c2_xl = int(corner2_traces[xl_col].mean())
+
+            # Corner 3: IL min, XL max
+            corner3_traces = df[(df[il_col] == il_min) & (df[xl_col] == df[df[il_col] == il_min][xl_col].max())]
+            if len(corner3_traces) == 0:
+                corner3_traces = df[df[il_col] == il_min].nlargest(10, xl_col)
+            c3_x = corner3_traces['_mid_x'].mean()
+            c3_y = corner3_traces['_mid_y'].mean()
+            c3_xl = int(corner3_traces[xl_col].mean())
+
+            # Calculate bin sizes from IL/XL differences and coordinate distances
+            self.scan_status_label.setText("Calculating bin sizes...")
+            QApplication.processEvents()
+
+            # Inline bin size: distance along inline direction / number of inlines
+            n_il = int(il_max - il_min)
+            n_xl = int(xl_max - xl_min)
+
+            # Distance from min IL to max IL (at constant XL)
+            il_distance = np.sqrt((max_il_x - min_il_x)**2 + (max_il_y - min_il_y)**2)
+            # Distance from min XL to max XL (at constant IL)
+            xl_distance = np.sqrt((max_xl_x - min_xl_x)**2 + (max_xl_y - min_xl_y)**2)
+
+            bin_il = il_distance / n_il if n_il > 0 else 25.0
+            bin_xl = xl_distance / n_xl if n_xl > 0 else 25.0
+
+            # Calculate grid azimuth (angle of inline direction from north/Y-axis)
+            # Inline direction vector: from corner1 (IL min) to corner2 (IL max) at constant XL
+            il_dx = c2_x - c1_x
+            il_dy = c2_y - c1_y
+            # Azimuth measured clockwise from north (Y-axis positive)
+            # atan2(dx, dy) gives angle from Y-axis
+            grid_azimuth_rad = math.atan2(il_dx, il_dy)
+            grid_azimuth_deg = math.degrees(grid_azimuth_rad)
+            # Normalize to 0-360
+            if grid_azimuth_deg < 0:
+                grid_azimuth_deg += 360.0
+
+            # Store results
+            self._scan_results = {
+                'n_traces': n_traces,
+                'il_col': il_col,  # Column used for inline
+                'xl_col': xl_col,  # Column used for crossline
+                'il_min': int(il_min), 'il_max': int(il_max), 'n_il': n_il + 1,
+                'xl_min': int(xl_min), 'xl_max': int(xl_max), 'n_xl': n_xl + 1,
+                'c1_x': c1_x, 'c1_y': c1_y,  # IL min, XL min corner
+                'c2_x': c2_x, 'c2_y': c2_y,  # IL max, XL min corner
+                'c3_x': c3_x, 'c3_y': c3_y,  # IL min, XL max corner
+                'c4_x': c2_x + (c3_x - c1_x), 'c4_y': c2_y + (c3_y - c1_y),  # IL max, XL max (computed)
+                'bin_il': bin_il,
+                'bin_xl': bin_xl,
+                'il_distance': il_distance,
+                'xl_distance': xl_distance,
+                'coord_scalar': coord_scalar,
+                # Time axis parameters from metadata
+                'dt_ms': dt_ms,
+                'n_samples': n_samples,
+                't_max_ms': t_max_ms,
+                # Grid azimuth (inline direction from north)
+                'grid_azimuth_deg': grid_azimuth_deg,
+            }
+
+            # Update display
+            self._update_display()
+
+            self.scan_status_label.setText(f"Scan complete: {n_traces:,} traces analyzed")
+            self.scan_status_label.setStyleSheet("color: green;")
+
+        except Exception as e:
+            import traceback
+            logger.error(f"Scan failed: {e}\n{traceback.format_exc()}")
+            QMessageBox.warning(self, "Scan Error", f"Failed to scan input data:\n{e}")
+            self.scan_status_label.setText(f"Scan failed: {e}")
+            self.scan_status_label.setStyleSheet("color: red;")
+
+    def _update_display(self):
+        """Update display with scan results."""
+        if not self._scan_results:
+            return
+
+        r = self._scan_results
+
+        # Update corner labels
+        self.min_il_label.setText(str(r['il_min']))
+        self.min_xl_label.setText(str(r['xl_min']))
+        self.min_x_label.setText(f"{r['c1_x']:.1f}")
+        self.min_y_label.setText(f"{r['c1_y']:.1f}")
+
+        self.max_il_label.setText(str(r['il_max']))
+        self.max_xl_label.setText(str(r['xl_max']))
+        self.max_x_label.setText(f"{r['c4_x']:.1f}")
+        self.max_y_label.setText(f"{r['c4_y']:.1f}")
+
+        # Update bin sizes
+        self.bin_il_label.setText(f"{r['bin_il']:.2f} m")
+        self.bin_xl_label.setText(f"{r['bin_xl']:.2f} m")
+
+        # Update summary
+        summary = f"INPUT DATA GRID SUMMARY:\n"
+        summary += f"{'='*40}\n"
+        summary += f"Total traces:     {r['n_traces']:,}\n"
+        summary += f"Inline column:    {r.get('il_col', 'inline')}\n"
+        summary += f"Crossline column: {r.get('xl_col', 'crossline')}\n"
+        summary += f"Inline range:     {r['il_min']} - {r['il_max']} ({r['n_il']} lines)\n"
+        summary += f"Crossline range:  {r['xl_min']} - {r['xl_max']} ({r['n_xl']} lines)\n"
+        summary += f"IL extent:        {r['il_distance']:.1f} m\n"
+        summary += f"XL extent:        {r['xl_distance']:.1f} m\n"
+        summary += f"Inline bin:       {r['bin_il']:.2f} m\n"
+        summary += f"Crossline bin:    {r['bin_xl']:.2f} m\n"
+        summary += f"Grid azimuth:     {r.get('grid_azimuth_deg', 0):.1f}°\n"
+        summary += f"\nTIME AXIS:\n"
+        summary += f"Sample rate:      {r.get('dt_ms', 4.0):.2f} ms\n"
+        summary += f"Num samples:      {r.get('n_samples', 1000)}\n"
+        summary += f"Max time:         {r.get('t_max_ms', 4000):.1f} ms\n"
+        if r.get('coord_scalar', 1.0) != 1.0:
+            summary += f"Coord scalar:     {r['coord_scalar']:.6f}\n"
+
+        self.summary_label.setText(summary)
+
+    def get_scan_results(self):
+        """Return scan results for use by other pages."""
+        return self._scan_results
+
+    def isComplete(self) -> bool:
+        """Page is complete when scan has been performed."""
+        return self._scan_results is not None
+
+
+class ImageOutputPage(QWizardPage):
+    """Page 5: Define output image grid parameters (user-defined, can differ from input grid)."""
+
+    def __init__(self, wizard: PSTMWizard):
+        super().__init__(wizard)
+        self.wizard_ref = wizard
+        self.setTitle("Image Output Parameters")
+        self.setSubTitle("Define the output image grid for migration (bin sizes can differ from input)")
+
+        # Store input grid info for reference
+        self._input_bin_il = 25.0
+        self._input_bin_xl = 25.0
+        self._input_il_extent = 0.0
+        self._input_xl_extent = 0.0
+        self._origin_x = 0.0
+        self._origin_y = 0.0
+        self._grid_azimuth_deg = 0.0
+        self._il_min_input = 1
+        self._xl_min_input = 1
+        self._updating_from_bin_change = False  # Prevent recursive updates
+
+        layout = QVBoxLayout(self)
+
+        # Output bin sizes group (NEW)
+        bin_group = QGroupBox("Output Bin Sizes")
+        bin_layout = QGridLayout(bin_group)
+
+        bin_layout.addWidget(QLabel("Inline Bin Size (m):"), 0, 0)
+        self.output_bin_il_spin = QDoubleSpinBox()
+        self.output_bin_il_spin.setRange(3.125, 200.0)
+        self.output_bin_il_spin.setValue(25.0)
+        self.output_bin_il_spin.setDecimals(3)
+        self.output_bin_il_spin.setSingleStep(6.25)
+        self.output_bin_il_spin.valueChanged.connect(self._on_bin_size_changed)
+        bin_layout.addWidget(self.output_bin_il_spin, 0, 1)
+
+        bin_layout.addWidget(QLabel("Crossline Bin Size (m):"), 0, 2)
+        self.output_bin_xl_spin = QDoubleSpinBox()
+        self.output_bin_xl_spin.setRange(3.125, 200.0)
+        self.output_bin_xl_spin.setValue(25.0)
+        self.output_bin_xl_spin.setDecimals(3)
+        self.output_bin_xl_spin.setSingleStep(6.25)
+        self.output_bin_xl_spin.valueChanged.connect(self._on_bin_size_changed)
+        bin_layout.addWidget(self.output_bin_xl_spin, 0, 3)
+
+        # Use input bin sizes button
+        use_input_bins_btn = QPushButton("Use Input Bin Sizes")
+        use_input_bins_btn.setToolTip("Set output bin sizes to match input data")
+        use_input_bins_btn.clicked.connect(self._use_input_bin_sizes)
+        bin_layout.addWidget(use_input_bins_btn, 1, 0, 1, 2)
+
+        # Input bin size info label
+        self.input_bin_info_label = QLabel("Input bins: - m x - m")
+        self.input_bin_info_label.setStyleSheet("color: gray; font-style: italic;")
+        bin_layout.addWidget(self.input_bin_info_label, 1, 2, 1, 2)
+
+        layout.addWidget(bin_group)
+
+        # IL/XL output range
+        range_group = QGroupBox("Output Inline/Crossline Range")
+        range_layout = QGridLayout(range_group)
+
+        range_layout.addWidget(QLabel("Inline Start:"), 0, 0)
+        self.il_start_spin = QSpinBox()
+        self.il_start_spin.setRange(1, 1000000)
+        self.il_start_spin.setValue(1)
+        self.il_start_spin.valueChanged.connect(self._update_preview)
+        range_layout.addWidget(self.il_start_spin, 0, 1)
+
+        range_layout.addWidget(QLabel("Inline End:"), 0, 2)
+        self.il_end_spin = QSpinBox()
+        self.il_end_spin.setRange(1, 1000000)
+        self.il_end_spin.setValue(100)
+        self.il_end_spin.valueChanged.connect(self._update_preview)
+        range_layout.addWidget(self.il_end_spin, 0, 3)
+
+        range_layout.addWidget(QLabel("Inline Step:"), 0, 4)
+        self.il_step_spin = QSpinBox()
+        self.il_step_spin.setRange(1, 100)
+        self.il_step_spin.setValue(1)
+        self.il_step_spin.valueChanged.connect(self._update_preview)
+        range_layout.addWidget(self.il_step_spin, 0, 5)
+
+        range_layout.addWidget(QLabel("Crossline Start:"), 1, 0)
+        self.xl_start_spin = QSpinBox()
+        self.xl_start_spin.setRange(1, 1000000)
+        self.xl_start_spin.setValue(1)
+        self.xl_start_spin.valueChanged.connect(self._update_preview)
+        range_layout.addWidget(self.xl_start_spin, 1, 1)
+
+        range_layout.addWidget(QLabel("Crossline End:"), 1, 2)
+        self.xl_end_spin = QSpinBox()
+        self.xl_end_spin.setRange(1, 1000000)
+        self.xl_end_spin.setValue(100)
+        self.xl_end_spin.valueChanged.connect(self._update_preview)
+        range_layout.addWidget(self.xl_end_spin, 1, 3)
+
+        range_layout.addWidget(QLabel("Crossline Step:"), 1, 4)
+        self.xl_step_spin = QSpinBox()
+        self.xl_step_spin.setRange(1, 100)
+        self.xl_step_spin.setValue(1)
+        self.xl_step_spin.valueChanged.connect(self._update_preview)
+        range_layout.addWidget(self.xl_step_spin, 1, 5)
+
+        # Use full range button
+        full_range_btn = QPushButton("Use Full Input Range")
+        full_range_btn.setToolTip("Set IL/XL range to cover full input extent at current output bin size")
+        full_range_btn.clicked.connect(self._use_full_range)
+        range_layout.addWidget(full_range_btn, 2, 0, 1, 2)
+
+        layout.addWidget(range_group)
 
         # Time parameters
         time_group = QGroupBox("Time Axis")
         time_layout = QGridLayout(time_group)
 
-        time_layout.addWidget(QLabel("Min Time (ms):"), 0, 0)
-        self.time_min_spin = QDoubleSpinBox()
-        self.time_min_spin.setRange(0, 20000)
-        self.time_min_spin.setValue(0)
-        self.time_min_spin.valueChanged.connect(self._update_preview)
-        time_layout.addWidget(self.time_min_spin, 0, 1)
+        time_layout.addWidget(QLabel("Start Time (ms):"), 0, 0)
+        self.time_start_spin = QDoubleSpinBox()
+        self.time_start_spin.setRange(0, 20000)
+        self.time_start_spin.setValue(0)
+        self.time_start_spin.valueChanged.connect(self._update_preview)
+        time_layout.addWidget(self.time_start_spin, 0, 1)
 
-        time_layout.addWidget(QLabel("Max Time (ms):"), 0, 2)
-        self.time_max_spin = QDoubleSpinBox()
-        self.time_max_spin.setRange(100, 20000)
-        self.time_max_spin.setValue(4000)
-        self.time_max_spin.valueChanged.connect(self._update_preview)
-        time_layout.addWidget(self.time_max_spin, 0, 3)
+        time_layout.addWidget(QLabel("End Time (ms):"), 0, 2)
+        self.time_end_spin = QDoubleSpinBox()
+        self.time_end_spin.setRange(100, 20000)
+        self.time_end_spin.setValue(4000)
+        self.time_end_spin.valueChanged.connect(self._update_preview)
+        time_layout.addWidget(self.time_end_spin, 0, 3)
 
         time_layout.addWidget(QLabel("Sample Rate (ms):"), 1, 0)
         self.dt_spin = QDoubleSpinBox()
         self.dt_spin.setRange(0.5, 16)
         self.dt_spin.setValue(4)
-        self.dt_spin.setDecimals(1)
+        self.dt_spin.setDecimals(2)
         self.dt_spin.valueChanged.connect(self._update_preview)
         time_layout.addWidget(self.dt_spin, 1, 1)
 
+        # Use input time axis button
+        use_input_time_btn = QPushButton("Use Input Time Axis")
+        use_input_time_btn.setToolTip("Set time parameters from input data")
+        use_input_time_btn.clicked.connect(self._use_input_time_axis)
+        time_layout.addWidget(use_input_time_btn, 1, 2, 1, 2)
+
         layout.addWidget(time_group)
 
-        # Spatial parameters
-        spatial_group = QGroupBox("Spatial Grid")
-        spatial_layout = QGridLayout(spatial_group)
-
-        # Inline
-        spatial_layout.addWidget(QLabel("Inline Min:"), 0, 0)
-        self.il_min_spin = QSpinBox()
-        self.il_min_spin.setRange(1, 100000)
-        self.il_min_spin.setValue(1)
-        self.il_min_spin.valueChanged.connect(self._update_preview)
-        spatial_layout.addWidget(self.il_min_spin, 0, 1)
-
-        spatial_layout.addWidget(QLabel("Inline Max:"), 0, 2)
-        self.il_max_spin = QSpinBox()
-        self.il_max_spin.setRange(1, 100000)
-        self.il_max_spin.setValue(100)
-        self.il_max_spin.valueChanged.connect(self._update_preview)
-        spatial_layout.addWidget(self.il_max_spin, 0, 3)
-
-        spatial_layout.addWidget(QLabel("Inline Step:"), 0, 4)
-        self.il_step_spin = QSpinBox()
-        self.il_step_spin.setRange(1, 100)
-        self.il_step_spin.setValue(1)
-        self.il_step_spin.valueChanged.connect(self._update_preview)
-        spatial_layout.addWidget(self.il_step_spin, 0, 5)
-
-        # Crossline
-        spatial_layout.addWidget(QLabel("Crossline Min:"), 1, 0)
-        self.xl_min_spin = QSpinBox()
-        self.xl_min_spin.setRange(1, 100000)
-        self.xl_min_spin.setValue(1)
-        self.xl_min_spin.valueChanged.connect(self._update_preview)
-        spatial_layout.addWidget(self.xl_min_spin, 1, 1)
-
-        spatial_layout.addWidget(QLabel("Crossline Max:"), 1, 2)
-        self.xl_max_spin = QSpinBox()
-        self.xl_max_spin.setRange(1, 100000)
-        self.xl_max_spin.setValue(100)
-        self.xl_max_spin.valueChanged.connect(self._update_preview)
-        spatial_layout.addWidget(self.xl_max_spin, 1, 3)
-
-        spatial_layout.addWidget(QLabel("Crossline Step:"), 1, 4)
-        self.xl_step_spin = QSpinBox()
-        self.xl_step_spin.setRange(1, 100)
-        self.xl_step_spin.setValue(1)
-        self.xl_step_spin.valueChanged.connect(self._update_preview)
-        spatial_layout.addWidget(self.xl_step_spin, 1, 5)
-
-        layout.addWidget(spatial_group)
-
-        # Auto-detect button
-        auto_layout = QHBoxLayout()
-        auto_btn = QPushButton("Auto-Detect from Input")
-        auto_btn.setToolTip("Detect grid parameters from input file headers")
-        auto_btn.clicked.connect(self._auto_detect_grid)
-        auto_layout.addWidget(auto_btn)
-        auto_layout.addStretch()
-        layout.addLayout(auto_layout)
-
-        # Grid preview
-        preview_group = QGroupBox("Grid Preview")
+        # Output preview
+        preview_group = QGroupBox("Output Grid Preview")
         preview_layout = QVBoxLayout(preview_group)
-        self.grid_preview_label = QLabel()
-        self.grid_preview_label.setFont(QFont("Courier", 10))
-        preview_layout.addWidget(self.grid_preview_label)
+        self.preview_label = QLabel()
+        self.preview_label.setFont(QFont("Courier", 10))
+        preview_layout.addWidget(self.preview_label)
         layout.addWidget(preview_group)
 
         layout.addStretch()
 
+    def initializePage(self):
+        """Initialize from input grid scan results."""
+        input_grid_page = self.wizard_ref.input_grid_page
+        scan_results = input_grid_page.get_scan_results()
+
+        if scan_results:
+            # Store input grid info
+            self._input_bin_il = scan_results['bin_il']
+            self._input_bin_xl = scan_results['bin_xl']
+            self._input_il_extent = scan_results['il_distance']
+            self._input_xl_extent = scan_results['xl_distance']
+            self._origin_x = scan_results['c1_x']
+            self._origin_y = scan_results['c1_y']
+            self._grid_azimuth_deg = scan_results.get('grid_azimuth_deg', 0.0)
+            self._il_min_input = scan_results['il_min']
+            self._xl_min_input = scan_results['xl_min']
+
+            # Update input bin info label
+            self.input_bin_info_label.setText(
+                f"Input bins: {self._input_bin_il:.2f} m x {self._input_bin_xl:.2f} m"
+            )
+
+            # Set output bin sizes to match input (default)
+            self.output_bin_il_spin.setValue(self._input_bin_il)
+            self.output_bin_xl_spin.setValue(self._input_bin_xl)
+
+            # Set IL/XL ranges from scan (will be recalculated if bin size changes)
+            self.il_start_spin.setValue(scan_results['il_min'])
+            self.il_end_spin.setValue(scan_results['il_max'])
+            self.xl_start_spin.setValue(scan_results['xl_min'])
+            self.xl_end_spin.setValue(scan_results['xl_max'])
+
+            # Set time axis from input metadata
+            self.time_start_spin.setValue(0)
+            self.time_end_spin.setValue(scan_results.get('t_max_ms', 4000))
+            self.dt_spin.setValue(scan_results.get('dt_ms', 4.0))
+
         self._update_preview()
 
+    def _use_input_bin_sizes(self):
+        """Set output bin sizes to match input data."""
+        self.output_bin_il_spin.setValue(self._input_bin_il)
+        self.output_bin_xl_spin.setValue(self._input_bin_xl)
+
+    def _use_input_time_axis(self):
+        """Set time parameters from input data."""
+        input_grid_page = self.wizard_ref.input_grid_page
+        scan_results = input_grid_page.get_scan_results()
+
+        if scan_results:
+            self.time_start_spin.setValue(0)
+            self.time_end_spin.setValue(scan_results.get('t_max_ms', 4000))
+            self.dt_spin.setValue(scan_results.get('dt_ms', 4.0))
+
+    def _on_bin_size_changed(self):
+        """Handle output bin size change - recalculate IL/XL range to maintain extent."""
+        if self._updating_from_bin_change:
+            return
+
+        self._updating_from_bin_change = True
+        try:
+            output_bin_il = self.output_bin_il_spin.value()
+            output_bin_xl = self.output_bin_xl_spin.value()
+
+            # Calculate new IL/XL range to maintain same spatial extent
+            if self._input_il_extent > 0 and output_bin_il > 0:
+                n_output_il = max(1, int(round(self._input_il_extent / output_bin_il)))
+                self.il_start_spin.setValue(1)  # Output starts at 1
+                self.il_end_spin.setValue(n_output_il)
+
+            if self._input_xl_extent > 0 and output_bin_xl > 0:
+                n_output_xl = max(1, int(round(self._input_xl_extent / output_bin_xl)))
+                self.xl_start_spin.setValue(1)  # Output starts at 1
+                self.xl_end_spin.setValue(n_output_xl)
+
+            self._update_preview()
+        finally:
+            self._updating_from_bin_change = False
+
+    def _use_full_range(self):
+        """Set output range to cover full input extent at current output bin size."""
+        output_bin_il = self.output_bin_il_spin.value()
+        output_bin_xl = self.output_bin_xl_spin.value()
+
+        # Calculate IL/XL range to cover full input extent
+        if self._input_il_extent > 0 and output_bin_il > 0:
+            n_output_il = max(1, int(round(self._input_il_extent / output_bin_il)))
+            self.il_start_spin.setValue(1)
+            self.il_end_spin.setValue(n_output_il)
+            self.il_step_spin.setValue(1)
+
+        if self._input_xl_extent > 0 and output_bin_xl > 0:
+            n_output_xl = max(1, int(round(self._input_xl_extent / output_bin_xl)))
+            self.xl_start_spin.setValue(1)
+            self.xl_end_spin.setValue(n_output_xl)
+            self.xl_step_spin.setValue(1)
+
     def _update_preview(self):
-        """Update grid preview text."""
-        # Calculate dimensions
-        n_time = int((self.time_max_spin.value() - self.time_min_spin.value()) / self.dt_spin.value()) + 1
-        n_inline = (self.il_max_spin.value() - self.il_min_spin.value()) // self.il_step_spin.value() + 1
-        n_xline = (self.xl_max_spin.value() - self.xl_min_spin.value()) // self.xl_step_spin.value() + 1
+        """Update output grid preview with extent comparison."""
+        il_start = self.il_start_spin.value()
+        il_end = self.il_end_spin.value()
+        il_step = self.il_step_spin.value()
+        xl_start = self.xl_start_spin.value()
+        xl_end = self.xl_end_spin.value()
+        xl_step = self.xl_step_spin.value()
+        t_start = self.time_start_spin.value()
+        t_end = self.time_end_spin.value()
+        dt = self.dt_spin.value()
+        output_bin_il = self.output_bin_il_spin.value()
+        output_bin_xl = self.output_bin_xl_spin.value()
 
-        # Estimate memory (float32 = 4 bytes)
-        memory_bytes = n_time * n_inline * n_xline * 4
-        memory_mb = memory_bytes / (1024 * 1024)
-        memory_gb = memory_bytes / (1024 * 1024 * 1024)
+        n_il = max(1, (il_end - il_start) // il_step + 1)
+        n_xl = max(1, (xl_end - xl_start) // xl_step + 1)
+        n_time = max(1, int((t_end - t_start) / dt) + 1)
 
-        text = f"Output Grid Dimensions:\n"
-        text += f"  Time samples:   {n_time:,}\n"
-        text += f"  Inlines:        {n_inline:,}\n"
-        text += f"  Crosslines:     {n_xline:,}\n"
-        text += f"  Total points:   {n_time * n_inline * n_xline:,}\n\n"
+        # Calculate output extent
+        output_il_extent = (n_il - 1) * output_bin_il
+        output_xl_extent = (n_xl - 1) * output_bin_xl
+
+        # Memory estimate
+        bytes_per_volume = n_time * n_il * n_xl * 4  # float32
+        memory_mb = bytes_per_volume / (1024 * 1024)
+        memory_gb = bytes_per_volume / (1024 * 1024 * 1024)
+
+        text = "OUTPUT IMAGE GRID:\n"
+        text += f"{'='*40}\n"
+        text += f"Inline:      {il_start} - {il_end} (step {il_step}) = {n_il} lines\n"
+        text += f"Crossline:   {xl_start} - {xl_end} (step {xl_step}) = {n_xl} lines\n"
+        text += f"Time:        {t_start:.0f} - {t_end:.0f} ms @ {dt:.2f} ms = {n_time} samples\n"
+        text += f"\n"
+        text += f"Output bin size:   {output_bin_il:.3f} m x {output_bin_xl:.3f} m\n"
+        text += f"Output extent:     {output_il_extent/1000:.3f} km x {output_xl_extent/1000:.3f} km\n"
+        text += f"Input extent:      {self._input_il_extent/1000:.3f} km x {self._input_xl_extent/1000:.3f} km\n"
+        text += f"\n"
+        text += f"Total output points: {n_time * n_il * n_xl:,}\n"
 
         if memory_gb >= 1:
-            text += f"Memory per volume: {memory_gb:.2f} GB"
+            text += f"Memory per volume:   {memory_gb:.2f} GB\n"
         else:
-            text += f"Memory per volume: {memory_mb:.1f} MB"
+            text += f"Memory per volume:   {memory_mb:.1f} MB\n"
 
-        self.grid_preview_label.setText(text)
+        # Extent comparison and warnings
+        warnings = []
+        if self._input_il_extent > 0:
+            il_ratio = output_il_extent / self._input_il_extent
+            if abs(il_ratio - 1.0) > 0.01:
+                if il_ratio < 1.0:
+                    warnings.append(f"IL extent {100*(1-il_ratio):.1f}% smaller than input")
+                else:
+                    warnings.append(f"IL extent {100*(il_ratio-1):.1f}% larger than input")
 
-    def _auto_detect_grid(self):
-        """Auto-detect grid from input file."""
-        # Placeholder - would read from actual file
-        QMessageBox.information(
-            self,
-            "Auto-Detect",
-            "Grid auto-detection would analyze the input file headers\n"
-            "to determine inline/crossline ranges.\n\n"
-            "This feature requires the file to be scanned."
-        )
+        if self._input_xl_extent > 0:
+            xl_ratio = output_xl_extent / self._input_xl_extent
+            if abs(xl_ratio - 1.0) > 0.01:
+                if xl_ratio < 1.0:
+                    warnings.append(f"XL extent {100*(1-xl_ratio):.1f}% smaller than input")
+                else:
+                    warnings.append(f"XL extent {100*(xl_ratio-1):.1f}% larger than input")
+
+        if warnings:
+            text += f"\nNOTES:\n"
+            for w in warnings:
+                text += f"  - {w}\n"
+
+        self.preview_label.setText(text)
+
+    def get_output_params(self):
+        """Get output parameters dictionary including bin sizes and grid info."""
+        return {
+            'il_start': self.il_start_spin.value(),
+            'il_end': self.il_end_spin.value(),
+            'il_step': self.il_step_spin.value(),
+            'xl_start': self.xl_start_spin.value(),
+            'xl_end': self.xl_end_spin.value(),
+            'xl_step': self.xl_step_spin.value(),
+            'time_start_ms': self.time_start_spin.value(),
+            'time_end_ms': self.time_end_spin.value(),
+            'dt_ms': self.dt_spin.value(),
+            # Output bin sizes
+            'output_bin_il': self.output_bin_il_spin.value(),
+            'output_bin_xl': self.output_bin_xl_spin.value(),
+            # Grid origin and azimuth (from input, for coordinate calculation)
+            'x_origin': self._origin_x,
+            'y_origin': self._origin_y,
+            'grid_azimuth_deg': self._grid_azimuth_deg,
+            # Input bin sizes for reference
+            'input_bin_il': self._input_bin_il,
+            'input_bin_xl': self._input_bin_xl,
+        }
+
+
+# Keep OutputGridPage as alias for backward compatibility
+OutputGridPage = ImageOutputPage
 
 
 class BinningConfigPage(QWizardPage):
-    """Page 5: Configure offset/azimuth binning."""
+    """Page 6: Configure offset/azimuth binning."""
 
     PRESETS = {
         'Custom': [],
@@ -1201,6 +1895,75 @@ class AdvancedOptionsPage(QWizardPage):
 
         layout.addWidget(proc_group)
 
+        # Performance tuning group (NEW)
+        perf_group = QGroupBox("Performance Tuning")
+        perf_layout = QGridLayout(perf_group)
+
+        # Algorithm mode
+        perf_layout.addWidget(QLabel("Migration Algorithm:"), 0, 0)
+        self.algorithm_combo = QComboBox()
+        self.algorithm_combo.addItems([
+            "Depth-Domain (Standard)",
+            "Time-Domain (Fast)",
+        ])
+        self.algorithm_combo.setCurrentIndex(0)
+        self.algorithm_combo.setToolTip(
+            "Depth-Domain: Standard Kirchhoff with depth loop.\n"
+            "  - Works with any velocity model (constant, gradient, or file)\n"
+            "  - Most accurate, but slower\n\n"
+            "Time-Domain: Direct time mapping using t_out = sqrt(t_in² + 4h²/v_rms²)\n"
+            "  - ~50-100x faster than depth-domain\n"
+            "  - For constant velocity: uses exact equation\n"
+            "  - For gradient velocity: uses RMS velocity approximation\n"
+            "  - For strong gradients, depth-domain may be more accurate"
+        )
+        perf_layout.addWidget(self.algorithm_combo, 0, 1)
+
+        # Tile size
+        perf_layout.addWidget(QLabel("Tile Size:"), 1, 0)
+        self.tile_size_spin = QSpinBox()
+        self.tile_size_spin.setRange(25, 1000)
+        self.tile_size_spin.setValue(100)
+        self.tile_size_spin.setSingleStep(25)
+        self.tile_size_spin.setToolTip(
+            "Number of output points per GPU tile.\n"
+            "Larger = better GPU utilization, but more memory.\n"
+            "Try 100-500 for best performance."
+        )
+        perf_layout.addWidget(self.tile_size_spin, 1, 1)
+
+        # KD-tree option
+        self.kdtree_check = QCheckBox("Use KD-tree Spatial Index")
+        self.kdtree_check.setChecked(False)
+        self.kdtree_check.setToolTip(
+            "Build KD-tree for fast aperture queries.\n"
+            "Recommended for datasets with >10K traces spread over large area."
+        )
+        perf_layout.addWidget(self.kdtree_check, 2, 0, 1, 2)
+
+        # Time-dependent aperture
+        self.time_dep_aperture_check = QCheckBox("Time-Dependent Aperture")
+        self.time_dep_aperture_check.setChecked(True)
+        self.time_dep_aperture_check.setToolTip(
+            "Aperture grows with depth: aperture(t) = v*t/2*tan(angle)\n"
+            "Reduces computation at shallow times (5-20x speedup)"
+        )
+        perf_layout.addWidget(self.time_dep_aperture_check, 3, 0, 1, 2)
+
+        # Sample batch size (for time-domain mode)
+        perf_layout.addWidget(QLabel("Sample Batch Size:"), 4, 0)
+        self.sample_batch_spin = QSpinBox()
+        self.sample_batch_spin.setRange(50, 500)
+        self.sample_batch_spin.setValue(200)
+        self.sample_batch_spin.setSingleStep(50)
+        self.sample_batch_spin.setToolTip(
+            "For time-domain mode: samples processed per batch.\n"
+            "Larger = faster but more memory."
+        )
+        perf_layout.addWidget(self.sample_batch_spin, 4, 1)
+
+        layout.addWidget(perf_group)
+
         layout.addStretch()
 
 
@@ -1290,15 +2053,25 @@ class ReviewLaunchPage(QWizardPage):
             text += f"  File:     {w.velocity_page.vel_file_edit.text()}\n"
         text += "\n"
 
-        # Output grid
+        # Output grid - use image_output_page which has the actual widgets
         text += "OUTPUT GRID\n"
         text += "-" * 30 + "\n"
-        n_time = int((w.output_grid_page.time_max_spin.value() - w.output_grid_page.time_min_spin.value()) / w.output_grid_page.dt_spin.value()) + 1
-        n_il = (w.output_grid_page.il_max_spin.value() - w.output_grid_page.il_min_spin.value()) // w.output_grid_page.il_step_spin.value() + 1
-        n_xl = (w.output_grid_page.xl_max_spin.value() - w.output_grid_page.xl_min_spin.value()) // w.output_grid_page.xl_step_spin.value() + 1
-        text += f"  Time:     {w.output_grid_page.time_min_spin.value():.0f} - {w.output_grid_page.time_max_spin.value():.0f} ms @ {w.output_grid_page.dt_spin.value():.1f} ms\n"
-        text += f"  Inlines:  {w.output_grid_page.il_min_spin.value()} - {w.output_grid_page.il_max_spin.value()} (step {w.output_grid_page.il_step_spin.value()})\n"
-        text += f"  Xlines:   {w.output_grid_page.xl_min_spin.value()} - {w.output_grid_page.xl_max_spin.value()} (step {w.output_grid_page.xl_step_spin.value()})\n"
+        img_page = w.image_output_page
+        t_start = img_page.time_start_spin.value()
+        t_end = img_page.time_end_spin.value()
+        dt = img_page.dt_spin.value()
+        il_start = img_page.il_start_spin.value()
+        il_end = img_page.il_end_spin.value()
+        il_step = img_page.il_step_spin.value()
+        xl_start = img_page.xl_start_spin.value()
+        xl_end = img_page.xl_end_spin.value()
+        xl_step = img_page.xl_step_spin.value()
+        n_time = int((t_end - t_start) / dt) + 1
+        n_il = (il_end - il_start) // il_step + 1
+        n_xl = (xl_end - xl_start) // xl_step + 1
+        text += f"  Time:     {t_start:.0f} - {t_end:.0f} ms @ {dt:.1f} ms\n"
+        text += f"  Inlines:  {il_start} - {il_end} (step {il_step})\n"
+        text += f"  Xlines:   {xl_start} - {xl_end} (step {xl_step})\n"
         text += f"  Grid:     {n_time} x {n_il} x {n_xl}\n\n"
 
         # Binning
@@ -1325,11 +2098,15 @@ class ReviewLaunchPage(QWizardPage):
     def _update_resource_estimate(self):
         """Update resource estimate."""
         w = self.wizard_ref
+        img_page = w.image_output_page
 
         # Calculate grid size
-        n_time = int((w.output_grid_page.time_max_spin.value() - w.output_grid_page.time_min_spin.value()) / w.output_grid_page.dt_spin.value()) + 1
-        n_il = (w.output_grid_page.il_max_spin.value() - w.output_grid_page.il_min_spin.value()) // w.output_grid_page.il_step_spin.value() + 1
-        n_xl = (w.output_grid_page.xl_max_spin.value() - w.output_grid_page.xl_min_spin.value()) // w.output_grid_page.xl_step_spin.value() + 1
+        t_start = img_page.time_start_spin.value()
+        t_end = img_page.time_end_spin.value()
+        dt = img_page.dt_spin.value()
+        n_time = int((t_end - t_start) / dt) + 1
+        n_il = (img_page.il_end_spin.value() - img_page.il_start_spin.value()) // img_page.il_step_spin.value() + 1
+        n_xl = (img_page.xl_end_spin.value() - img_page.xl_start_spin.value()) // img_page.xl_step_spin.value() + 1
 
         bins = w.binning_page.get_binning_table()
         n_bins = len([b for b in bins if b.get('enabled', True)])

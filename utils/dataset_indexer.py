@@ -515,11 +515,36 @@ class DatasetIndexer:
                     return df[name].values
             return None
 
-        # Extract coordinate arrays
+        # Find and apply coordinate scalar (SEG-Y convention)
+        coord_scalar = 1.0
+        scalar_col_names = ['scalar_coord', 'coordinate_scalar', 'scalco', 'ScalarCoord', 'SCALCO']
+        for scalar_name in scalar_col_names:
+            if scalar_name in df.columns:
+                # Use most common scalar value
+                scalar_val = df[scalar_name].mode().iloc[0] if len(df[scalar_name].mode()) > 0 else df[scalar_name].iloc[0]
+                if scalar_val < 0:
+                    coord_scalar = 1.0 / abs(scalar_val)
+                elif scalar_val > 0:
+                    coord_scalar = float(scalar_val)
+                logger.info(f"Applying coordinate scalar: {scalar_val} (multiplier: {coord_scalar})")
+                break
+
+        # Extract coordinate arrays and apply scalar
         source_x = get_column('source_x')
         source_y = get_column('source_y')
         receiver_x = get_column('receiver_x')
         receiver_y = get_column('receiver_y')
+
+        # Apply coordinate scalar to all coordinate arrays
+        if coord_scalar != 1.0:
+            if source_x is not None:
+                source_x = source_x.astype(np.float64) * coord_scalar
+            if source_y is not None:
+                source_y = source_y.astype(np.float64) * coord_scalar
+            if receiver_x is not None:
+                receiver_x = receiver_x.astype(np.float64) * coord_scalar
+            if receiver_y is not None:
+                receiver_y = receiver_y.astype(np.float64) * coord_scalar
 
         # Get offset and azimuth (may be precomputed or need calculation)
         offsets = get_column('offset')

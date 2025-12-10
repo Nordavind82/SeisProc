@@ -42,12 +42,9 @@ class MigrationWorker(QThread):
             # Import migration components
             from pathlib import Path
             import numpy as np
-            from processors.migration import KirchhoffMigrator
-            from models.velocity_model import create_constant_velocity, create_linear_gradient_velocity
-            from models.migration_geometry import MigrationGeometry
             from utils.dataset_indexer import DatasetIndexer, BinnedDataset
             from models.binning import BinningTable, OffsetAzimuthBin
-            from seisio.gather_readers import ZarrDataReader, create_gather_iterator
+            from seisio.gather_readers import ZarrDataReader
             from utils.segy_import.data_storage import DataStorage
             import json
 
@@ -119,52 +116,25 @@ class MigrationWorker(QThread):
                 "info"
             )
 
-            # Create velocity model
-            self.log_message.emit("Creating velocity model...", "info")
-            velocity_model = self._create_velocity_model()
+            # Create high-performance MigrationEngine with ConfigAdapter
+            import torch
+            from processors.migration.migration_engine import MigrationEngine
+            from processors.migration.config_adapter import ConfigAdapter
 
-            # Create MigrationConfig
-            from models.migration_config import MigrationConfig, OutputGrid, TraveltimeMode
+            # Create config adapter to map wizard config to engine params
+            config_adapter = ConfigAdapter(self.config)
 
-            # Build output grid from config
-            output_grid = OutputGrid(
-                n_time=int(self.config.get('time_max_ms', 6000) / self.config.get('dt_ms', 4)),
-                n_inline=max(1, (self.config.get('inline_max', 100) - self.config.get('inline_min', 1)) // self.config.get('inline_step', 1) + 1),
-                n_xline=max(1, (self.config.get('xline_max', 100) - self.config.get('xline_min', 1)) // self.config.get('xline_step', 1) + 1),
-                dt=self.config.get('dt_ms', 4.0) / 1000.0,  # Convert to seconds
-                d_inline=25.0,  # Default 25m
-                d_xline=25.0,   # Default 25m
-                t0=self.config.get('time_min_ms', 0) / 1000.0,
-                inline_start=self.config.get('inline_min', 1),
-                xline_start=self.config.get('xline_min', 1),
-            )
+            # Validate configuration
+            is_valid, validation_msg = config_adapter.validate()
+            if not is_valid:
+                self.log_message.emit(f"Config validation warning: {validation_msg}", "warning")
 
-            # Determine traveltime mode
-            tt_mode_str = self.config.get('traveltime_mode', 'straight_ray')
-            if 'curved' in tt_mode_str.lower():
-                traveltime_mode = TraveltimeMode.CURVED_RAY
-            else:
-                traveltime_mode = TraveltimeMode.STRAIGHT_RAY
+            # Log migration parameters summary
+            self.log_message.emit(config_adapter.get_summary(), "info")
 
-            migration_config = MigrationConfig(
-                output_grid=output_grid,
-                max_aperture_m=self.config.get('max_aperture_m', 5000.0),
-                max_angle_deg=self.config.get('max_angle_deg', 60.0),
-                traveltime_mode=traveltime_mode,
-                antialias_enabled=self.config.get('antialias_enabled', True),
-            )
-
-            self.log_message.emit(
-                f"Output grid: {output_grid.n_inline}x{output_grid.n_xline}x{output_grid.n_time} "
-                f"({output_grid.memory_gb:.2f} GB)",
-                "info"
-            )
-
-            # Create migrator
-            migrator = KirchhoffMigrator(
-                velocity=velocity_model,
-                config=migration_config,
-            )
+            # Create migration engine (auto-selects MPS > CUDA > CPU)
+            engine = MigrationEngine()
+            self.log_message.emit(f"Using MigrationEngine on device: {engine.device}", "info")
 
             # Setup binning
             bins_config = self.config.get('binning_table', [])
@@ -256,110 +226,228 @@ class MigrationWorker(QThread):
                 }
                 self.progress_updated.emit(progress)
 
-                # Process traces in chunks
-                # Use smaller chunks for better progress updates on large datasets
-                chunk_size = min(500, max(100, n_bin_traces // 100))  # Adaptive chunk size
-                n_chunks = (n_bin_traces + chunk_size - 1) // chunk_size
-                migrated_traces = []
-
-                self.log_message.emit(
-                    f"  Processing {n_bin_traces:,} traces in {n_chunks} chunks of ~{chunk_size}",
-                    "info"
-                )
-
                 import time as time_module
                 bin_start_time = time_module.time()
 
-                for chunk_idx, chunk_start in enumerate(range(0, n_bin_traces, chunk_size)):
-                    if self._cancelled:
-                        break
+                # Read ALL trace data for this bin at once
+                self.log_message.emit(f"  Reading {n_bin_traces:,} traces...", "info")
+                read_start = time_module.time()
+                trace_data = data_reader.read_traces(np.array(trace_numbers))
+                read_time = time_module.time() - read_start
+                self.log_message.emit(f"  Read complete: {read_time:.2f}s", "debug")
 
-                    while self._paused and not self._cancelled:
-                        time.sleep(0.1)
+                # Get geometry for all traces in this bin
+                all_entries = [dataset_index.entries[t] for t in trace_numbers]
+                source_x = np.array([e.source_x or 0 for e in all_entries], dtype=np.float32)
+                source_y = np.array([e.source_y or 0 for e in all_entries], dtype=np.float32)
+                receiver_x = np.array([e.receiver_x or 0 for e in all_entries], dtype=np.float32)
+                receiver_y = np.array([e.receiver_y or 0 for e in all_entries], dtype=np.float32)
 
-                    chunk_end = min(chunk_start + chunk_size, n_bin_traces)
-                    chunk_traces = trace_numbers[chunk_start:chunk_end]
-                    actual_chunk_size = len(chunk_traces)
+                # trace_data is (n_traces, n_samples), need (n_samples, n_traces) for engine
+                traces_for_engine = trace_data.T.astype(np.float32)
 
-                    # Log every 10 chunks or first chunk
-                    if chunk_idx % 10 == 0 or chunk_idx == 0:
-                        elapsed = time_module.time() - bin_start_time
-                        if chunk_idx > 0:
-                            rate = chunk_start / elapsed
-                            eta = (n_bin_traces - chunk_start) / rate if rate > 0 else 0
-                            self.log_message.emit(
-                                f"  Chunk {chunk_idx+1}/{n_chunks}: traces {chunk_start:,}-{chunk_end:,} "
-                                f"({rate:.0f} traces/s, ETA: {eta/60:.1f} min)",
-                                "debug"
-                            )
-                        else:
-                            self.log_message.emit(
-                                f"  Chunk {chunk_idx+1}/{n_chunks}: traces {chunk_start:,}-{chunk_end:,}",
-                                "debug"
-                            )
+                # Create progress callback for the engine
+                def engine_progress(pct: float, msg: str):
+                    progress['bin_percent'] = pct * 100
+                    progress['overall_percent'] = ((bins_processed - 1 + pct) / max(total_bins, 1)) * 100
+                    self.progress_updated.emit(progress)
+                    if msg:
+                        self.log_message.emit(f"  {msg}", "info")
 
-                    # Read trace data - returns (n_traces, n_samples)
-                    read_start = time_module.time()
-                    trace_data = data_reader.read_traces(np.array(chunk_traces))
-                    read_time = time_module.time() - read_start
+                # Check which algorithm to use
+                p = config_adapter.params
+                use_time_domain = p.use_time_domain
+                use_time_dep_aperture = getattr(p, 'use_time_dependent_aperture', True)
 
-                    # Get geometry for these traces
-                    entries = [dataset_index.entries[t] for t in chunk_traces]
+                # For time-domain with non-constant velocity, use RMS velocity version
+                velocity_type = self.config.get('velocity_type', 'constant')
+                use_rms_velocity = use_time_domain and velocity_type != 'constant'
 
-                    # Build geometry arrays for the entire chunk
-                    source_x = np.array([e.source_x or 0 for e in entries], dtype=np.float32)
-                    source_y = np.array([e.source_y or 0 for e in entries], dtype=np.float32)
-                    receiver_x = np.array([e.receiver_x or 0 for e in entries], dtype=np.float32)
-                    receiver_y = np.array([e.receiver_y or 0 for e in entries], dtype=np.float32)
-
-                    # Create SeismicData object
-                    # SeismicData expects (n_samples, n_traces) format
-                    from models.seismic_data import SeismicData
-                    gather = SeismicData(
-                        traces=trace_data.T,  # Transpose to (n_samples, n_traces)
-                        sample_rate=sample_rate_ms,
+                if use_rms_velocity:
+                    self.log_message.emit(
+                        f"  Using RMS velocity for time-domain migration with {velocity_type} velocity",
+                        "info"
                     )
 
-                    # Create geometry for this chunk
-                    geometry = MigrationGeometry(
+                # Compute and log expected workload
+                n_output_points = p.n_il * p.n_xl
+                n_tile_size = p.tile_size
+                n_tiles = (n_output_points + n_tile_size - 1) // n_tile_size
+                n_depths = p.n_samples
+
+                if use_time_domain:
+                    # Time-domain migration (fast)
+                    self.log_message.emit(f"  Algorithm: TIME-DOMAIN (fast)", "info")
+                    engine_params = config_adapter.get_time_domain_params(
+                        traces=traces_for_engine,
                         source_x=source_x,
                         source_y=source_y,
                         receiver_x=receiver_x,
                         receiver_y=receiver_y,
+                        normalize=False,
+                        progress_callback=engine_progress,
+                        enable_profiling=True,
+                        use_time_dependent_aperture=use_time_dep_aperture,
+                    )
+                else:
+                    # Depth-domain migration (standard)
+                    self.log_message.emit(f"  Algorithm: DEPTH-DOMAIN (standard)", "info")
+                    engine_params = config_adapter.get_engine_params(
+                        traces=traces_for_engine,
+                        source_x=source_x,
+                        source_y=source_y,
+                        receiver_x=receiver_x,
+                        receiver_y=receiver_y,
+                        normalize=False,
+                        progress_callback=engine_progress,
+                        enable_profiling=True,
+                        use_time_dependent_aperture=use_time_dep_aperture,
                     )
 
-                    # Migrate the entire chunk as a gather
-                    migrate_start = time_module.time()
-                    try:
-                        image, fold = migrator.migrate_gather(gather, geometry)
-                        migrate_time = time_module.time() - migrate_start
-                        migrated_traces.extend([None] * actual_chunk_size)
+                self.log_message.emit(
+                    f"  Migration workload: {n_output_points:,} output points × {n_depths:,} depths × {n_bin_traces:,} traces",
+                    "info"
+                )
+                self.log_message.emit(
+                    f"  Processing in {n_tiles:,} tiles of {n_tile_size} points each",
+                    "info"
+                )
 
-                        # Log timing for first chunk
-                        if chunk_idx == 0:
-                            self.log_message.emit(
-                                f"  First chunk timing: read={read_time:.2f}s, migrate={migrate_time:.2f}s",
-                                "debug"
+                # Run Kirchhoff migration using MigrationEngine
+                self.log_message.emit(f"  Starting Kirchhoff migration...", "info")
+                migrate_start = time_module.time()
+
+                try:
+                    if use_time_domain:
+                        if use_rms_velocity:
+                            # Create velocity model for RMS computation
+                            from processors.migration.velocity_model import create_velocity_model
+                            velocity_model = create_velocity_model(
+                                velocity_type=velocity_type,
+                                v0=self.config.get('velocity_v0', 2500.0),
+                                gradient=self.config.get('velocity_gradient', 0.0),
+                                velocity_file=self.config.get('velocity_file', None),
                             )
-                    except Exception as e:
-                        # Log error but continue
-                        logger.warning(f"Migration error for chunk {chunk_idx}: {e}")
-                        self.log_message.emit(f"  Chunk {chunk_idx} error: {e}", "warning")
-                        migrated_traces.extend([None] * actual_chunk_size)
+                            # Use RMS velocity time-domain method
+                            accumulated_image, accumulated_fold = engine.migrate_bin_time_domain_rms(
+                                traces=traces_for_engine,
+                                source_x=source_x,
+                                source_y=source_y,
+                                receiver_x=receiver_x,
+                                receiver_y=receiver_y,
+                                origin_x=engine_params['origin_x'],
+                                origin_y=engine_params['origin_y'],
+                                il_spacing=engine_params['il_spacing'],
+                                xl_spacing=engine_params['xl_spacing'],
+                                azimuth_deg=engine_params['azimuth_deg'],
+                                n_il=engine_params['n_il'],
+                                n_xl=engine_params['n_xl'],
+                                dt_ms=engine_params['dt_ms'],
+                                t_min_ms=engine_params['t_min_ms'],
+                                n_times=p.n_samples,
+                                velocity_model=velocity_model,
+                                max_aperture_m=engine_params['max_aperture_m'],
+                                max_angle_deg=engine_params['max_angle_deg'],
+                                tile_size=p.tile_size,
+                                normalize=False,
+                                progress_callback=engine_progress,
+                                enable_profiling=True,
+                                use_time_dependent_aperture=use_time_dep_aperture,
+                            )
+                        else:
+                            # Use constant velocity time-domain method
+                            accumulated_image, accumulated_fold = engine.migrate_bin_time_domain(**engine_params)
+                    else:
+                        accumulated_image, accumulated_fold = engine.migrate_bin_full(**engine_params)
+                    migrate_time = time_module.time() - migrate_start
 
-                    # Update progress
-                    traces_done = chunk_end
-                    progress['bin_percent'] = (traces_done / n_bin_traces) * 100
-                    progress['overall_percent'] = ((bins_processed - 1 + traces_done / n_bin_traces) / max(total_bins, 1)) * 100
-                    progress['traces_processed'] = traces_done
-                    self.progress_updated.emit(progress)
+                    self.log_message.emit(
+                        f"  Migration complete: {migrate_time:.2f}s "
+                        f"({n_bin_traces/migrate_time:.0f} traces/s)",
+                        "info"
+                    )
+
+                    # Clear GPU memory
+                    if torch.backends.mps.is_available():
+                        torch.mps.empty_cache()
+                    elif torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                except Exception as e:
+                    logger.error(f"Migration error for bin {bin_name}: {e}", exc_info=True)
+                    self.log_message.emit(f"  Migration error: {e}", "error")
+                    # Create empty output on error
+                    output_shape = (
+                        config_adapter.params.n_samples,
+                        config_adapter.params.n_il,
+                        config_adapter.params.n_xl,
+                    )
+                    accumulated_image = np.zeros(output_shape, dtype=np.float32)
+                    accumulated_fold = np.zeros(output_shape, dtype=np.float32)
+                    migrate_time = time_module.time() - migrate_start
 
                 bin_elapsed = time_module.time() - bin_start_time
-                traces_per_sec = len(migrated_traces) / bin_elapsed if bin_elapsed > 0 else 0
+                traces_per_sec = n_bin_traces / bin_elapsed if bin_elapsed > 0 else 0
 
                 self.log_message.emit(
-                    f"Completed bin: {bin_name} - {len(migrated_traces):,} traces in {bin_elapsed:.1f}s "
-                    f"({traces_per_sec:.0f} traces/s)",
+                    f"Completed bin: {bin_name} - {n_bin_traces:,} traces in {bin_elapsed:.1f}s "
+                    f"({traces_per_sec:.0f} traces/s, max fold: {accumulated_fold.max():.0f})",
+                    "info"
+                )
+
+                # For compatibility with output storage
+                migrated_traces = list(range(n_bin_traces))
+
+                # Save output in Zarr/Parquet format (same as SEG-Y import)
+                # This allows the migrated data to be loaded and navigated in the application
+                from utils.migration_output_storage import MigrationOutputStorage
+
+                safe_bin_name = bin_name.replace(' ', '_').replace('/', '-')
+                bin_output_dir = output_dir / safe_bin_name
+
+                self.log_message.emit(f"  Saving output to Zarr/Parquet format...", "info")
+
+                # Create migration output storage using config adapter params
+                p = config_adapter.params
+                migration_storage = MigrationOutputStorage(str(bin_output_dir))
+                migration_storage.initialize_output(
+                    n_time=p.n_samples,
+                    n_inline=p.n_il,
+                    n_xline=p.n_xl,
+                    dt_ms=p.dt_ms,
+                    t0_ms=p.t_min_ms,
+                    d_inline=p.il_spacing,
+                    d_xline=p.xl_spacing,
+                    inline_start=self.config.get('inline_min', 1),
+                    xline_start=self.config.get('xline_min', 1),
+                    x_origin=p.origin_x,
+                    y_origin=p.origin_y,
+                    grid_azimuth_deg=p.azimuth_deg,
+                    source_file=str(input_path),  # Original input for app compatibility
+                )
+
+                # Write the full cube
+                migration_storage.write_full_cube(accumulated_image, accumulated_fold)
+
+                # Finalize with normalization and save headers/metadata
+                extra_metadata = {
+                    'bin_name': bin_name,
+                    'input_traces': len(migrated_traces),
+                    'velocity_type': self.config.get('velocity_type', 'constant'),
+                    'velocity_v0': p.velocity_mps,
+                    'max_aperture_m': p.max_aperture_m,
+                    'max_angle_deg': p.max_angle_deg,
+                    'elapsed_seconds': bin_elapsed,
+                    'traces_per_second': traces_per_sec,
+                }
+                migration_storage.finalize(normalize=True, extra_metadata=extra_metadata)
+
+                self.log_message.emit(
+                    f"  Saved to {bin_output_dir}",
+                    "info"
+                )
+                self.log_message.emit(
+                    f"  Output format: Zarr traces + Parquet headers (loadable in app)",
                     "info"
                 )
 
@@ -371,29 +459,6 @@ class MigrationWorker(QThread):
             logger.error(f"Migration failed: {e}", exc_info=True)
             self.log_message.emit(f"Error: {str(e)}", "error")
             self.finished.emit(False, str(e))
-
-    def _create_velocity_model(self):
-        """Create velocity model from configuration."""
-        from models.velocity_model import create_constant_velocity, create_linear_gradient_velocity
-
-        vel_type = self.config.get('velocity_type', 'constant')
-        v0 = self.config.get('velocity_v0', 2500.0)
-
-        if vel_type == 'constant':
-            return create_constant_velocity(v0, is_time=True)
-        elif vel_type == 'gradient':
-            gradient = self.config.get('velocity_gradient', 0.0)
-            # Create gradient model
-            return create_linear_gradient_velocity(
-                v0=v0,
-                gradient=gradient,
-                z_max=10.0,  # 10 seconds
-                dz=0.004,
-                is_time=True
-            )
-        else:
-            # File-based - would load from file
-            return create_constant_velocity(v0, is_time=True)
 
     def cancel(self):
         """Request job cancellation."""

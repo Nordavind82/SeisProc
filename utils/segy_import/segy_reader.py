@@ -223,28 +223,53 @@ class SEGYFileHandle:
 
     def _read_headers_batch(self, f, start: int, end: int) -> List[Dict]:
         """
-        Read headers in batch using segyio attributes for better performance.
+        Read headers in batch using raw byte extraction.
 
-        Uses segyio.attributes() for vectorized header access instead of
-        per-trace header access, which is significantly faster.
+        Note: We read raw bytes instead of using segyio.attributes() because
+        segyio interprets byte positions as TraceField enum values, which
+        doesn't work for non-standard header positions (e.g., byte 201 is
+        interpreted as ShotPointScalar enum, not raw byte 201).
         """
+        import struct
+
         mappings = self.header_mapping.get_all_mappings()
         n_traces = end - start
 
         # Pre-create header dictionaries
         headers = [{} for _ in range(n_traces)]
 
-        # Batch read each field using attributes (much faster than per-trace)
-        for name, byte_loc in mappings.items():
-            try:
-                # Use segyio attributes for vectorized access
-                values = f.attributes(byte_loc)[start:end]
-                for i, val in enumerate(values):
-                    headers[i][name] = int(val)
-            except (KeyError, IndexError):
-                # Field not available, set to 0
-                for i in range(n_traces):
-                    headers[i][name] = 0
+        # Format code sizes and struct format strings (big-endian as per SEG-Y)
+        FORMAT_INFO = {
+            'i': (4, '>i'),  # 4-byte signed int, big-endian
+            'h': (2, '>h'),  # 2-byte signed int, big-endian
+            'I': (4, '>I'),  # 4-byte unsigned int, big-endian
+            'H': (2, '>H'),  # 2-byte unsigned int, big-endian
+        }
+
+        # Read each trace header and extract fields from raw bytes
+        for trace_offset, local_idx in enumerate(range(start, end)):
+            header_obj = f.header[local_idx]
+            raw_header = bytes(header_obj.buf)
+
+            for name, (byte_loc, fmt_code) in mappings.items():
+                try:
+                    # Byte location is 1-based in SEG-Y, convert to 0-based
+                    offset = byte_loc - 1
+
+                    # Get format info
+                    size, struct_fmt = FORMAT_INFO.get(fmt_code, (4, '>i'))
+
+                    # Extract bytes and unpack
+                    raw_bytes = raw_header[offset:offset + size]
+
+                    if len(raw_bytes) == size:
+                        value = struct.unpack(struct_fmt, raw_bytes)[0]
+                        headers[trace_offset][name] = int(value)
+                    else:
+                        headers[trace_offset][name] = 0
+
+                except (KeyError, IndexError, struct.error):
+                    headers[trace_offset][name] = 0
 
         return headers
 
@@ -416,27 +441,52 @@ class SEGYReader:
 
     def _read_headers_batch_with_mapping(self, f, start: int, end: int) -> List[Dict]:
         """
-        Read headers using batch access with header mapping applied.
+        Read headers using raw byte extraction with header mapping applied.
 
-        This method handles both standard segyio byte locations and
-        the custom header mapping system.
+        Note: We read raw bytes instead of using segyio.attributes() because
+        segyio interprets byte positions as TraceField enum values, which
+        doesn't work for non-standard header positions.
         """
+        import struct
+
         mappings = self.header_mapping.get_all_mappings()
         n_traces = end - start
 
         # Pre-create header dictionaries
         headers = [{} for _ in range(n_traces)]
 
-        # Batch read each field using segyio attributes
-        for name, byte_loc in mappings.items():
-            try:
-                values = f.attributes(byte_loc)[start:end]
-                for i, val in enumerate(values):
-                    headers[i][name] = int(val)
-            except (KeyError, IndexError, TypeError):
-                # Fallback for non-standard fields
-                for i in range(n_traces):
-                    headers[i][name] = 0
+        # Format code sizes and struct format strings (big-endian as per SEG-Y)
+        FORMAT_INFO = {
+            'i': (4, '>i'),  # 4-byte signed int, big-endian
+            'h': (2, '>h'),  # 2-byte signed int, big-endian
+            'I': (4, '>I'),  # 4-byte unsigned int, big-endian
+            'H': (2, '>H'),  # 2-byte unsigned int, big-endian
+        }
+
+        # Read each trace header and extract fields from raw bytes
+        for trace_offset, local_idx in enumerate(range(start, end)):
+            header_obj = f.header[local_idx]
+            raw_header = bytes(header_obj.buf)
+
+            for name, (byte_loc, fmt_code) in mappings.items():
+                try:
+                    # Byte location is 1-based in SEG-Y, convert to 0-based
+                    offset = byte_loc - 1
+
+                    # Get format info
+                    size, struct_fmt = FORMAT_INFO.get(fmt_code, (4, '>i'))
+
+                    # Extract bytes and unpack
+                    raw_bytes = raw_header[offset:offset + size]
+
+                    if len(raw_bytes) == size:
+                        value = struct.unpack(struct_fmt, raw_bytes)[0]
+                        headers[trace_offset][name] = int(value)
+                    else:
+                        headers[trace_offset][name] = 0
+
+                except (KeyError, IndexError, struct.error):
+                    headers[trace_offset][name] = 0
 
         # Apply computed headers if configured
         if self.header_mapping.has_computed_headers():

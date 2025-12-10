@@ -55,6 +55,27 @@ from processors.migration.checkpoint import (
     find_resumable_jobs,
 )
 
+# New high-performance engine (PSTM Redesign)
+from processors.migration.geometry_preprocessor import (
+    GeometryPreprocessor,
+    PrecomputedGeometry,
+    compute_output_indices,
+    compute_traveltimes,
+    compute_weights,
+)
+from processors.migration.kirchhoff_kernel import (
+    KirchhoffKernel,
+    interpolate_traces,
+    scatter_add_migration,
+    normalize_by_fold,
+)
+from processors.migration.migration_engine import MigrationEngine
+from processors.migration.config_adapter import (
+    ConfigAdapter,
+    MigrationParams,
+    create_adapter_from_wizard,
+)
+
 __all__ = [
     # Base classes
     'BaseMigrator',
@@ -100,4 +121,19 @@ __all__ = [
     'create_checkpoint_manager',
     'resume_from_checkpoint',
     'find_resumable_jobs',
+    # New high-performance engine
+    'MigrationEngine',
+    'GeometryPreprocessor',
+    'PrecomputedGeometry',
+    'KirchhoffKernel',
+    'compute_output_indices',
+    'compute_traveltimes',
+    'compute_weights',
+    'interpolate_traces',
+    'scatter_add_migration',
+    'normalize_by_fold',
+    # Config adapter
+    'ConfigAdapter',
+    'MigrationParams',
+    'create_adapter_from_wizard',
 ]

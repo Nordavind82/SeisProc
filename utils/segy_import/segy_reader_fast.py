@@ -215,8 +215,8 @@ class FastSEGYReader:
             mapping = self.header_mapping.get_all_mappings()
 
             # segfast expects header specs as first arg, indices as second
-            # Use byte locations directly
-            header_specs = list(mapping.values())
+            # Use byte locations directly (mapping now returns (byte_loc, format) tuples)
+            header_specs = [byte_loc for byte_loc, fmt in mapping.values()]
 
             # Load headers for specified indices
             headers_df = self._loader.load_headers(
@@ -226,7 +226,7 @@ class FastSEGYReader:
             )
 
             # Build reverse mapping: byte_loc -> our name
-            byte_to_name = {v: k for k, v in mapping.items()}
+            byte_to_name = {byte_loc: name for name, (byte_loc, fmt) in mapping.items()}
 
             # Convert DataFrame to list of dicts
             headers = []
@@ -307,10 +307,15 @@ class FastSEGYReader:
 
     def _load_headers_segyio_fallback(self, indices: np.ndarray) -> List[Dict]:
         """
-        Fallback header loading using segyio batch reading.
+        Fallback header loading using raw byte reading.
         Used when segfast header loading fails.
+
+        Note: We read raw bytes instead of using segyio.attributes() because
+        segyio interprets byte positions as TraceField enum values, which
+        doesn't work for non-standard header positions.
         """
         import segyio as sio
+        import struct
 
         mappings = self.header_mapping.get_all_mappings()
         n_traces = len(indices)
@@ -319,16 +324,40 @@ class FastSEGYReader:
 
         headers = [{} for _ in range(n_traces)]
 
+        # Format code sizes and struct format strings (big-endian as per SEG-Y)
+        FORMAT_INFO = {
+            'i': (4, '>i'),  # 4-byte signed int, big-endian
+            'h': (2, '>h'),  # 2-byte signed int, big-endian
+            'I': (4, '>I'),  # 4-byte unsigned int, big-endian
+            'H': (2, '>H'),  # 2-byte unsigned int, big-endian
+        }
+
         with sio.open(str(self.filename), 'r', ignore_geometry=True) as f:
             f.mmap()
-            for name, byte_loc in mappings.items():
-                try:
-                    values = f.attributes(byte_loc)[start:end]
-                    for i, val in enumerate(values):
-                        headers[i][name] = int(val)
-                except (KeyError, IndexError, TypeError):
-                    for i in range(n_traces):
-                        headers[i][name] = 0
+            for trace_offset, local_idx in enumerate(range(start, end)):
+                # Get raw trace header via buf property
+                header_obj = f.header[local_idx]
+                raw_header = bytes(header_obj.buf)
+
+                for name, (byte_loc, fmt_code) in mappings.items():
+                    try:
+                        # Byte location is 1-based in SEG-Y, convert to 0-based
+                        offset = byte_loc - 1
+
+                        # Get format info
+                        size, struct_fmt = FORMAT_INFO.get(fmt_code, (4, '>i'))
+
+                        # Extract bytes and unpack
+                        raw_bytes = raw_header[offset:offset + size]
+
+                        if len(raw_bytes) == size:
+                            value = struct.unpack(struct_fmt, raw_bytes)[0]
+                            headers[trace_offset][name] = int(value)
+                        else:
+                            headers[trace_offset][name] = 0
+
+                    except (KeyError, IndexError, TypeError, struct.error):
+                        headers[trace_offset][name] = 0
 
         return headers
 

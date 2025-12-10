@@ -372,6 +372,22 @@ class FKKFilterGPU:
         """
         Apply FKK filter to seismic volume.
 
+        Pipeline sequence (symmetric):
+        ==============================
+        FORWARD:
+          1. Temporal pad (pad_copy) - extends data at top/bottom
+          2. Spatial pad (pad_copy) - extends data at edges
+          3. AGC apply - equalizes amplitudes on PADDED data
+          4. FFT pad → FFT → Filter → IFFT → FFT unpad
+
+        REVERSE (exact mirror):
+          5. AGC remove - using scale factors from padded data
+          6. Spatial unpad - crop to original spatial extent
+          7. Temporal unpad - crop to original time extent
+
+        Note: Temporal taper is NOT used when pad_copy is enabled, as pad_copy
+        provides smooth edge handling without destroying original data.
+
         Args:
             volume: Input SeismicVolume
             config: Filter configuration
@@ -382,104 +398,100 @@ class FKKFilterGPU:
         logger.info(f"Applying FKK filter: {config.get_summary()}")
         logger.info(f"  Edge method: {config.edge_method}, pad_traces_x: {config.pad_traces_x}, pad_traces_y: {config.pad_traces_y}")
         logger.info(f"  Padding factor: {config.padding_factor}")
-        print(f"[FKK] edge_method={config.edge_method}, pad_x={config.pad_traces_x}, pad_y={config.pad_traces_y}, fft_pad={config.padding_factor}")
 
         nt, nx, ny = volume.shape
         data = volume.data.astype(np.float32).copy()
-        agc_scale_factors = None
 
-        # Step 1: Optional AGC (uses adaptive epsilon, no max_gain clipping)
-        if config.apply_agc:
-            window_samples = max(3, int(config.agc_window_ms / 1000.0 / volume.dt))
-            data, agc_scale_factors = apply_agc_3d(data, window_samples)
-            logger.debug(f"Applied AGC with window={window_samples} samples")
+        # =====================================================================
+        # FORWARD PASS - Build up padded volume
+        # =====================================================================
 
-        # Step 2: Optional temporal taper
-        taper_top = int(config.taper_ms_top / 1000.0 / volume.dt) if config.taper_ms_top > 0 else 0
-        taper_bottom = int(config.taper_ms_bottom / 1000.0 / volume.dt) if config.taper_ms_bottom > 0 else 0
-        if taper_top > 0 or taper_bottom > 0:
-            data = apply_temporal_taper(data, taper_top, taper_bottom)
-
-        # Step 2b: Optional temporal pad_copy (for high-amplitude top/bottom edges)
+        # Step 1: Temporal pad_copy (FIRST - before any amplitude changes)
+        # This extends the data at top/bottom with tapered copies
         temporal_pad_top = int(config.pad_time_top_ms / 1000.0 / volume.dt) if config.pad_time_top_ms > 0 else 0
         temporal_pad_bottom = int(config.pad_time_bottom_ms / 1000.0 / volume.dt) if config.pad_time_bottom_ms > 0 else 0
         if temporal_pad_top > 0 or temporal_pad_bottom > 0:
             data = pad_copy_temporal(data, temporal_pad_top, temporal_pad_bottom)
-            logger.info(f"  Applied temporal pad_copy: +{temporal_pad_top} samples at top, +{temporal_pad_bottom} at bottom")
-            print(f"[FKK] temporal_pad: top={temporal_pad_top} samples, bottom={temporal_pad_bottom} samples")
+            logger.info(f"  Step 1: Temporal pad_copy: +{temporal_pad_top} top, +{temporal_pad_bottom} bottom")
 
-        # Step 3: Spatial edge handling with pad_copy
+        # Step 2: Spatial pad_copy (extends edges with tapered copies)
         edge_pad_x = 0
         edge_pad_y = 0
-
         if config.edge_method == 'pad_copy':
-            # Determine padding size (auto or user-specified)
             edge_pad_x = config.pad_traces_x if config.pad_traces_x > 0 else get_auto_pad_size(nx)
             edge_pad_y = config.pad_traces_y if config.pad_traces_y > 0 else get_auto_pad_size(ny)
-
-            # Apply pad_copy: pad with copies of edge traces, taper only padded zone
             data = pad_copy_3d(data, edge_pad_x, edge_pad_y)
-            logger.info(f"  Applied pad_copy: +{edge_pad_x} traces per side in X, +{edge_pad_y} traces per side in Y")
+            logger.info(f"  Step 2: Spatial pad_copy: +{edge_pad_x} X, +{edge_pad_y} Y per side")
 
-        # Step 4: Compute padded dimensions for FFT
-        nt_current, nx_current, ny_current = data.shape
+        # Step 3: AGC apply (on PADDED data - scale factors match padded geometry)
+        agc_scale_factors = None
+        if config.apply_agc:
+            window_samples = max(3, int(config.agc_window_ms / 1000.0 / volume.dt))
+            data, agc_scale_factors = apply_agc_3d(data, window_samples)
+            logger.info(f"  Step 3: AGC applied (window={window_samples} samples)")
 
-        # Apply padding factor for extra padding
-        nt_pad = next_power_of_2(int(nt_current * config.padding_factor))
-        nx_pad = next_power_of_2(int(nx_current * config.padding_factor))
-        ny_pad = next_power_of_2(int(ny_current * config.padding_factor))
+        # Step 4a: FFT padding (zero-pad to power-of-2)
+        nt_padded, nx_padded, ny_padded = data.shape  # Size after pad_copy operations
 
-        # Ensure at least power-of-2 of current size
-        nt_pad = max(nt_pad, next_power_of_2(nt_current))
-        nx_pad = max(nx_pad, next_power_of_2(nx_current))
-        ny_pad = max(ny_pad, next_power_of_2(ny_current))
+        nt_fft = next_power_of_2(int(nt_padded * config.padding_factor))
+        nx_fft = next_power_of_2(int(nx_padded * config.padding_factor))
+        ny_fft = next_power_of_2(int(ny_padded * config.padding_factor))
 
-        pad_t = nt_pad - nt_current
-        pad_x = nx_pad - nx_current
-        pad_y = ny_pad - ny_current
+        nt_fft = max(nt_fft, next_power_of_2(nt_padded))
+        nx_fft = max(nx_fft, next_power_of_2(nx_padded))
+        ny_fft = max(ny_fft, next_power_of_2(ny_padded))
 
-        if pad_t > 0 or pad_x > 0 or pad_y > 0:
-            data = np.pad(data, ((0, pad_t), (0, pad_x), (0, pad_y)), mode='constant')
-            logger.info(f"  FFT padded: ({nt_current},{nx_current},{ny_current}) -> ({nt_pad},{nx_pad},{ny_pad})")
+        fft_pad_t = nt_fft - nt_padded
+        fft_pad_x = nx_fft - nx_padded
+        fft_pad_y = ny_fft - ny_padded
 
-        # Step 5: Transfer to GPU and compute 3D FFT
-        # Use float32 for MPS compatibility (MPS doesn't support float64)
+        if fft_pad_t > 0 or fft_pad_x > 0 or fft_pad_y > 0:
+            data = np.pad(data, ((0, fft_pad_t), (0, fft_pad_x), (0, fft_pad_y)), mode='constant')
+            logger.info(f"  Step 4a: FFT pad: ({nt_padded},{nx_padded},{ny_padded}) -> ({nt_fft},{nx_fft},{ny_fft})")
+
+        # Step 4b: FFT
         data_gpu = torch.from_numpy(data).float().to(self.device)
-
         spectrum = torch.fft.rfft(data_gpu, dim=0)
         spectrum = torch.fft.fft(spectrum, dim=1)
         spectrum = torch.fft.fft(spectrum, dim=2)
         spectrum = torch.fft.fftshift(spectrum, dim=(1, 2))
 
-        # Step 6: Build and apply mask
+        # Step 4c: Apply velocity cone mask
         mask = self.build_velocity_cone_mask(
-            (nt_pad, nx_pad, ny_pad),
+            (nt_fft, nx_fft, ny_fft),
             (volume.dt, volume.dx, volume.dy),
             config
         )
         spectrum = spectrum * mask
 
-        # Step 7: Inverse 3D FFT
+        # Step 4d: Inverse FFT
         spectrum = torch.fft.ifftshift(spectrum, dim=(1, 2))
         spectrum = torch.fft.ifft(spectrum, dim=2)
         spectrum = torch.fft.ifft(spectrum, dim=1)
-        result = torch.fft.irfft(spectrum, n=nt_pad, dim=0)
+        result = torch.fft.irfft(spectrum, n=nt_fft, dim=0)
 
-        # Step 8: Transfer back to CPU and remove FFT padding
+        # Step 4e: Remove FFT padding
         output = result.real.cpu().numpy().astype(np.float32)
-        output = output[:nt_current, :nx_current, :ny_current]
+        output = output[:nt_padded, :nx_padded, :ny_padded]
 
-        # Step 9: Remove temporal pad_copy (extract original time range)
-        if temporal_pad_top > 0 or temporal_pad_bottom > 0:
-            output = output[temporal_pad_top:temporal_pad_top + nt, :, :]
+        # =====================================================================
+        # REVERSE PASS - Unwind in exact reverse order
+        # =====================================================================
 
-        # Step 9b: Remove spatial edge padding (extract original data region)
-        if config.edge_method == 'pad_copy' and (edge_pad_x > 0 or edge_pad_y > 0):
-            output = output[:, edge_pad_x:edge_pad_x + nx, edge_pad_y:edge_pad_y + ny]
-
-        # Step 10: Remove AGC if applied
+        # Step 5: AGC remove (using scale factors computed on padded data)
         if config.apply_agc and agc_scale_factors is not None:
             output = remove_agc_3d(output, agc_scale_factors)
+            logger.info(f"  Step 5: AGC removed")
+
+        # Step 6: Spatial unpad (crop to original spatial extent)
+        if config.edge_method == 'pad_copy' and (edge_pad_x > 0 or edge_pad_y > 0):
+            output = output[:, edge_pad_x:edge_pad_x + nx, edge_pad_y:edge_pad_y + ny]
+            logger.info(f"  Step 6: Spatial unpad: cropped to ({output.shape[1]}, {output.shape[2]})")
+
+        # Step 7: Temporal unpad (crop to original time extent)
+        if temporal_pad_top > 0 or temporal_pad_bottom > 0:
+            output = output[temporal_pad_top:temporal_pad_top + nt, :, :]
+            logger.info(f"  Step 7: Temporal unpad: cropped to {output.shape[0]} samples")
 
         logger.info("FKK filter applied successfully")
 
@@ -592,98 +604,103 @@ class FKKFilterCPU:
         return mask
 
     def apply_filter(self, volume: SeismicVolume, config: FKKConfig) -> SeismicVolume:
-        """Apply FKK filter on CPU."""
+        """
+        Apply FKK filter on CPU.
+
+        Pipeline sequence (symmetric) - same as GPU version:
+        FORWARD: temporal_pad → spatial_pad → AGC → FFT → filter → IFFT
+        REVERSE: AGC_remove → spatial_unpad → temporal_unpad
+        """
         logger.info(f"Applying FKK filter (CPU): {config.get_summary()}")
 
         nt, nx, ny = volume.shape
         data = volume.data.astype(np.float32).copy()
-        agc_scale_factors = None
 
-        # Step 1: Optional AGC (uses adaptive epsilon, no max_gain clipping)
-        if config.apply_agc:
-            window_samples = max(3, int(config.agc_window_ms / 1000.0 / volume.dt))
-            data, agc_scale_factors = apply_agc_3d(data, window_samples)
-            logger.debug(f"Applied AGC with window={window_samples} samples")
+        # =====================================================================
+        # FORWARD PASS
+        # =====================================================================
 
-        # Step 2: Optional temporal taper
-        taper_top = int(config.taper_ms_top / 1000.0 / volume.dt) if config.taper_ms_top > 0 else 0
-        taper_bottom = int(config.taper_ms_bottom / 1000.0 / volume.dt) if config.taper_ms_bottom > 0 else 0
-        if taper_top > 0 or taper_bottom > 0:
-            data = apply_temporal_taper(data, taper_top, taper_bottom)
-
-        # Step 2b: Optional temporal pad_copy (for high-amplitude top/bottom edges)
+        # Step 1: Temporal pad_copy (FIRST)
         temporal_pad_top = int(config.pad_time_top_ms / 1000.0 / volume.dt) if config.pad_time_top_ms > 0 else 0
         temporal_pad_bottom = int(config.pad_time_bottom_ms / 1000.0 / volume.dt) if config.pad_time_bottom_ms > 0 else 0
         if temporal_pad_top > 0 or temporal_pad_bottom > 0:
             data = pad_copy_temporal(data, temporal_pad_top, temporal_pad_bottom)
-            logger.info(f"  Applied temporal pad_copy: +{temporal_pad_top} samples at top, +{temporal_pad_bottom} at bottom")
+            logger.info(f"  Step 1: Temporal pad_copy: +{temporal_pad_top} top, +{temporal_pad_bottom} bottom")
 
-        # Step 3: Spatial edge handling with pad_copy
+        # Step 2: Spatial pad_copy
         edge_pad_x = 0
         edge_pad_y = 0
-
         if config.edge_method == 'pad_copy':
-            # Determine padding size (auto or user-specified)
             edge_pad_x = config.pad_traces_x if config.pad_traces_x > 0 else get_auto_pad_size(nx)
             edge_pad_y = config.pad_traces_y if config.pad_traces_y > 0 else get_auto_pad_size(ny)
-
-            # Apply pad_copy: pad with copies of edge traces, taper only padded zone
             data = pad_copy_3d(data, edge_pad_x, edge_pad_y)
-            logger.info(f"  Applied pad_copy: +{edge_pad_x} traces per side in X, +{edge_pad_y} traces per side in Y")
+            logger.info(f"  Step 2: Spatial pad_copy: +{edge_pad_x} X, +{edge_pad_y} Y per side")
 
-        # Step 4: Compute padded dimensions for FFT
-        nt_current, nx_current, ny_current = data.shape
+        # Step 3: AGC apply (on PADDED data)
+        agc_scale_factors = None
+        if config.apply_agc:
+            window_samples = max(3, int(config.agc_window_ms / 1000.0 / volume.dt))
+            data, agc_scale_factors = apply_agc_3d(data, window_samples)
+            logger.info(f"  Step 3: AGC applied (window={window_samples} samples)")
 
-        # Apply padding factor for extra padding
-        nt_pad = next_power_of_2(int(nt_current * config.padding_factor))
-        nx_pad = next_power_of_2(int(nx_current * config.padding_factor))
-        ny_pad = next_power_of_2(int(ny_current * config.padding_factor))
+        # Step 4a: FFT padding
+        nt_padded, nx_padded, ny_padded = data.shape
 
-        # Ensure at least power-of-2 of current size
-        nt_pad = max(nt_pad, next_power_of_2(nt_current))
-        nx_pad = max(nx_pad, next_power_of_2(nx_current))
-        ny_pad = max(ny_pad, next_power_of_2(ny_current))
+        nt_fft = next_power_of_2(int(nt_padded * config.padding_factor))
+        nx_fft = next_power_of_2(int(nx_padded * config.padding_factor))
+        ny_fft = next_power_of_2(int(ny_padded * config.padding_factor))
 
-        pad_t = nt_pad - nt_current
-        pad_x = nx_pad - nx_current
-        pad_y = ny_pad - ny_current
+        nt_fft = max(nt_fft, next_power_of_2(nt_padded))
+        nx_fft = max(nx_fft, next_power_of_2(nx_padded))
+        ny_fft = max(ny_fft, next_power_of_2(ny_padded))
 
-        if pad_t > 0 or pad_x > 0 or pad_y > 0:
-            data = np.pad(data, ((0, pad_t), (0, pad_x), (0, pad_y)), mode='constant')
-            logger.info(f"  FFT padded: ({nt_current},{nx_current},{ny_current}) -> ({nt_pad},{nx_pad},{ny_pad})")
+        fft_pad_t = nt_fft - nt_padded
+        fft_pad_x = nx_fft - nx_padded
+        fft_pad_y = ny_fft - ny_padded
 
-        # Step 5: Compute 3D FFT
+        if fft_pad_t > 0 or fft_pad_x > 0 or fft_pad_y > 0:
+            data = np.pad(data, ((0, fft_pad_t), (0, fft_pad_x), (0, fft_pad_y)), mode='constant')
+            logger.info(f"  Step 4a: FFT pad: ({nt_padded},{nx_padded},{ny_padded}) -> ({nt_fft},{nx_fft},{ny_fft})")
+
+        # Step 4b: FFT
         spectrum = self._fft.rfft(data, axis=0)
         spectrum = self._fft.fft(spectrum, axis=1)
         spectrum = self._fft.fft(spectrum, axis=2)
         spectrum = self._fft.fftshift(spectrum, axes=(1, 2))
 
-        # Step 6: Build and apply mask
+        # Step 4c: Apply mask
         mask = self.build_velocity_cone_mask(
-            (nt_pad, nx_pad, ny_pad), (volume.dt, volume.dx, volume.dy), config
+            (nt_fft, nx_fft, ny_fft), (volume.dt, volume.dx, volume.dy), config
         )
         spectrum = spectrum * mask
 
-        # Step 7: Inverse 3D FFT
+        # Step 4d: Inverse FFT
         spectrum = self._fft.ifftshift(spectrum, axes=(1, 2))
         spectrum = self._fft.ifft(spectrum, axis=2)
         spectrum = self._fft.ifft(spectrum, axis=1)
-        result = self._fft.irfft(spectrum, n=nt_pad, axis=0)
+        result = self._fft.irfft(spectrum, n=nt_fft, axis=0)
 
-        # Step 8: Remove FFT padding
-        output = result.real.astype(np.float32)[:nt_current, :nx_current, :ny_current]
+        # Step 4e: Remove FFT padding
+        output = result.real.astype(np.float32)[:nt_padded, :nx_padded, :ny_padded]
 
-        # Step 9: Remove temporal pad_copy (extract original time range)
-        if temporal_pad_top > 0 or temporal_pad_bottom > 0:
-            output = output[temporal_pad_top:temporal_pad_top + nt, :, :]
+        # =====================================================================
+        # REVERSE PASS - exact mirror order
+        # =====================================================================
 
-        # Step 9b: Remove spatial edge padding (extract original data region)
-        if config.edge_method == 'pad_copy' and (edge_pad_x > 0 or edge_pad_y > 0):
-            output = output[:, edge_pad_x:edge_pad_x + nx, edge_pad_y:edge_pad_y + ny]
-
-        # Step 10: Remove AGC if applied
+        # Step 5: AGC remove
         if config.apply_agc and agc_scale_factors is not None:
             output = remove_agc_3d(output, agc_scale_factors)
+            logger.info(f"  Step 5: AGC removed")
+
+        # Step 6: Spatial unpad
+        if config.edge_method == 'pad_copy' and (edge_pad_x > 0 or edge_pad_y > 0):
+            output = output[:, edge_pad_x:edge_pad_x + nx, edge_pad_y:edge_pad_y + ny]
+            logger.info(f"  Step 6: Spatial unpad")
+
+        # Step 7: Temporal unpad
+        if temporal_pad_top > 0 or temporal_pad_bottom > 0:
+            output = output[temporal_pad_top:temporal_pad_top + nt, :, :]
+            logger.info(f"  Step 7: Temporal unpad")
 
         logger.info("FKK filter applied successfully (CPU)")
 

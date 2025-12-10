@@ -8,7 +8,14 @@ from typing import Dict, Type, Any
 from .base_processor import BaseProcessor, ProgressCallback
 from .bandpass_filter import BandpassFilter, ProcessingPipeline
 from .tf_denoise import TFDenoise
+from .stft_denoise import STFTDenoise
+from .stockwell_denoise import StockwellDenoise
 from .dwt_denoise import DWTDenoise, PYWT_AVAILABLE
+from .gabor_denoise import GaborDenoise
+from .emd_denoise import EMDDenoise, PYEMD_AVAILABLE
+from .sst_denoise import SSTDenoise, SSQUEEZEPY_AVAILABLE
+from .omp_denoise import OMPDenoise
+from .denoise_3d import Denoise3D, compute_3d_mad, get_available_headers
 from .agc import apply_agc_vectorized, remove_agc, apply_agc_to_gather
 from .fk_filter import FKFilter
 from .fkk_filter_gpu import FKKFilterGPU, FKKFilterCPU, get_fkk_filter
@@ -27,7 +34,14 @@ from .migration.kirchhoff_migrator import KirchhoffMigrator
 PROCESSOR_REGISTRY: Dict[str, Type[BaseProcessor]] = {
     'BandpassFilter': BandpassFilter,
     'TFDenoise': TFDenoise,
+    'STFTDenoise': STFTDenoise,
+    'StockwellDenoise': StockwellDenoise,
     'DWTDenoise': DWTDenoise,
+    'GaborDenoise': GaborDenoise,
+    'EMDDenoise': EMDDenoise,
+    'SSTDenoise': SSTDenoise,
+    'OMPDenoise': OMPDenoise,
+    'Denoise3D': Denoise3D,
     'FKFilter': FKFilter,
     'GainProcessor': GainProcessor,
     'ChunkedProcessor': ChunkedProcessor,
@@ -98,8 +112,19 @@ __all__ = [
     'BandpassFilter',
     'ProcessingPipeline',
     'TFDenoise',
+    'STFTDenoise',
+    'StockwellDenoise',
     'DWTDenoise',
     'PYWT_AVAILABLE',
+    'GaborDenoise',
+    'EMDDenoise',
+    'PYEMD_AVAILABLE',
+    'SSTDenoise',
+    'SSQUEEZEPY_AVAILABLE',
+    'OMPDenoise',
+    'Denoise3D',
+    'compute_3d_mad',
+    'get_available_headers',
     'FKFilter',
     'FKKFilterGPU',
     'FKKFilterCPU',

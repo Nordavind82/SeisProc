@@ -578,6 +578,7 @@ class MainWindow(QMainWindow):
         """
         headers_path = storage_dir / 'headers.parquet'
         sort_keys = []
+        headers_with_counts = []
 
         if headers_path.exists():
             try:
@@ -591,6 +592,9 @@ class MainWindow(QMainWindow):
                 sort_keys = [k for k in priority_keys if k in numeric_cols]
                 sort_keys += [k for k in numeric_cols if k not in priority_keys]
                 logger.debug(f"Found {len(sort_keys)} sortable columns")
+
+                # Build 3D headers with unique counts
+                headers_with_counts = self._get_headers_with_counts(headers_df)
             except Exception as e:
                 logger.warning(f"Could not read headers for sort keys: {e}")
 
@@ -602,6 +606,8 @@ class MainWindow(QMainWindow):
         # Update control panel
         if hasattr(self, 'control_panel') and self.control_panel is not None:
             self.control_panel.set_available_sort_headers(sort_keys)
+            if headers_with_counts:
+                self.control_panel.set_available_3d_headers(headers_with_counts)
 
     def _populate_sort_keys_from_dataframe(self, headers_df):
         """
@@ -611,6 +617,7 @@ class MainWindow(QMainWindow):
             headers_df: pandas DataFrame with header columns
         """
         sort_keys = []
+        headers_with_counts = []
 
         try:
             # Get numeric columns suitable for sorting
@@ -621,6 +628,9 @@ class MainWindow(QMainWindow):
             sort_keys = [k for k in priority_keys if k in numeric_cols]
             sort_keys += [k for k in numeric_cols if k not in priority_keys]
             logger.debug(f"Found {len(sort_keys)} sortable columns from DataFrame")
+
+            # Build 3D headers with unique counts
+            headers_with_counts = self._get_headers_with_counts(headers_df)
         except Exception as e:
             logger.warning(f"Could not extract sort keys from DataFrame: {e}")
 
@@ -632,6 +642,65 @@ class MainWindow(QMainWindow):
         # Update control panel
         if hasattr(self, 'control_panel') and self.control_panel is not None:
             self.control_panel.set_available_sort_headers(sort_keys)
+            if headers_with_counts:
+                self.control_panel.set_available_3d_headers(headers_with_counts)
+
+    def _get_headers_with_counts(self, headers_df):
+        """
+        Get list of headers with unique value counts for 3D volume building.
+
+        Prioritizes source/receiver related headers for volume organization.
+
+        Args:
+            headers_df: pandas DataFrame with header columns
+
+        Returns:
+            List of (header_name, unique_count) tuples sorted by relevance
+        """
+        if headers_df is None or headers_df.empty:
+            return []
+
+        # Priority headers for 3D organization (source/receiver coords first)
+        priority_headers = [
+            # Source-related (for inline)
+            'sin', 's_line', 'field_record', 'FFID', 'source_x', 'SOURCE_X',
+            'SourceLine', 'SourceStation', 'sou_sloc',
+            # Receiver-related (for crossline)
+            'rec_sloc', 'trace_number', 'Channel', 'receiver_x', 'RECEIVER_X',
+            'ReceiverLine', 'ReceiverStation', 'rin',
+            # CDP/CMP
+            'CDP', 'inline', 'crossline', 'CMP', 'CDPLine',
+            # Coordinates
+            'cdp_x', 'cdp_y', 'CDP_X', 'CDP_Y',
+            # Other useful
+            'offset', 'TRACE_SEQUENCE_LINE', 'TraceNumber', 'FieldRecord'
+        ]
+
+        headers_with_counts = []
+
+        # Get numeric columns only
+        numeric_cols = headers_df.select_dtypes(include=['number']).columns.tolist()
+
+        # Add priority headers first (if they exist and have multiple unique values)
+        for header in priority_headers:
+            if header in numeric_cols:
+                n_unique = headers_df[header].nunique()
+                if 2 <= n_unique <= 50000:  # Reasonable range for axis
+                    headers_with_counts.append((header, n_unique))
+                    numeric_cols.remove(header)  # Don't add again
+
+        # Add remaining headers sorted by unique count (descending)
+        remaining = []
+        for header in numeric_cols:
+            n_unique = headers_df[header].nunique()
+            if 2 <= n_unique <= 50000:
+                remaining.append((header, n_unique))
+
+        # Sort remaining by unique count descending
+        remaining.sort(key=lambda x: -x[1])
+        headers_with_counts.extend(remaining)
+
+        return headers_with_counts
 
     def _clear_recent_files(self):
         """Clear the recent files list."""
@@ -2966,9 +3035,10 @@ class MainWindow(QMainWindow):
             QApplication.processEvents()
 
             # Import PSTM components
-            from processors.migration import KirchhoffMigrator
+            from processors.migration.optimized_kirchhoff_migrator import create_optimized_kirchhoff_migrator
             from models.velocity_model import create_constant_velocity
             from models.migration_geometry import MigrationGeometry
+            from models.migration_config import MigrationConfig, OutputGrid
 
             # Create constant velocity model
             velocity_model = create_constant_velocity(velocity, is_time=True)
@@ -2978,13 +3048,30 @@ class MainWindow(QMainWindow):
             if geometry is None:
                 return  # Error already shown
 
-            # Create migrator
-            migrator = KirchhoffMigrator(
+            # Build migration config
+            n_samples = self.input_data.n_samples
+            dt_sec = self.input_data.sample_rate / 1000.0  # ms to seconds
+            output_grid = OutputGrid(
+                n_time=n_samples,
+                n_inline=1,
+                n_xline=1,
+                dt=dt_sec,
+                d_inline=25.0,
+                d_xline=25.0,
+            )
+            migration_config = MigrationConfig(
+                output_grid=output_grid,
+                max_aperture_m=aperture,
+                max_angle_deg=max_angle,
+            )
+
+            # Create optimized migrator
+            prefer_gpu = self.control_panel.use_gpu() if hasattr(self.control_panel, 'use_gpu') else True
+            migrator = create_optimized_kirchhoff_migrator(
                 velocity=velocity_model,
-                aperture=aperture,
-                max_angle=max_angle,
-                dt=self.input_data.sample_rate,
-                prefer_gpu=self.control_panel.use_gpu() if hasattr(self.control_panel, 'use_gpu') else True,
+                config=migration_config,
+                prefer_gpu=prefer_gpu,
+                optimization_level='high',
             )
 
             self.statusBar().showMessage(f"Running PSTM (v={velocity:.0f} m/s, aperture={aperture:.0f}m)...")

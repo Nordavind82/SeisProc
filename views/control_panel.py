@@ -5,12 +5,17 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
                               QPushButton, QLabel, QDoubleSpinBox, QSlider,
                               QSpinBox, QComboBox, QListWidget, QAbstractItemView,
                               QCheckBox, QScrollArea, QRadioButton, QButtonGroup,
-                              QListWidgetItem)
+                              QListWidgetItem, QFormLayout)
 from PyQt6.QtCore import Qt, pyqtSignal
 import numpy as np
 import sys
 from processors.bandpass_filter import BandpassFilter
 from processors.dwt_denoise import DWTDenoise, PYWT_AVAILABLE
+from processors.gabor_denoise import GaborDenoise
+from processors.emd_denoise import EMDDenoise, PYEMD_AVAILABLE
+from processors.stft_denoise import STFTDenoise
+from processors.stockwell_denoise import StockwellDenoise
+from processors.omp_denoise import OMPDenoise
 from models.fk_config import FKConfigManager, FKFilterConfig
 from models.fkk_config import FKKConfig, FKK_PRESETS
 
@@ -97,19 +102,34 @@ class ControlPanel(QWidget):
 
         # Processing controls (dynamic based on algorithm)
         self.bandpass_group = self._create_bandpass_group()
-        self.tfdenoise_group = self._create_tfdenoise_group()
+        self.stockwell_group = self._create_stockwell_group()
+        self.stft_group = self._create_stft_group()
         self.dwtdenoise_group = self._create_dwtdenoise_group()
+        self.gabor_group = self._create_gabor_group()
+        self.emd_group = self._create_emd_group()
+        self.omp_group = self._create_omp_group()
+        self.denoise3d_group = self._create_denoise3d_group()
         self.fk_filter_group = self._create_fk_filter_group()
         self.fkk_filter_group = self._create_fkk_filter_group()
         self.pstm_group = self._create_pstm_group()
         controls_layout.addWidget(self.bandpass_group)
-        controls_layout.addWidget(self.tfdenoise_group)
+        controls_layout.addWidget(self.stockwell_group)
+        controls_layout.addWidget(self.stft_group)
         controls_layout.addWidget(self.dwtdenoise_group)
+        controls_layout.addWidget(self.gabor_group)
+        controls_layout.addWidget(self.emd_group)
+        controls_layout.addWidget(self.omp_group)
+        controls_layout.addWidget(self.denoise3d_group)
         controls_layout.addWidget(self.fk_filter_group)
         controls_layout.addWidget(self.fkk_filter_group)
         controls_layout.addWidget(self.pstm_group)
-        self.tfdenoise_group.hide()  # Initially hidden
+        self.stockwell_group.hide()  # Initially hidden
+        self.stft_group.hide()  # Initially hidden
         self.dwtdenoise_group.hide()  # Initially hidden
+        self.gabor_group.hide()  # Initially hidden
+        self.emd_group.hide()  # Initially hidden
+        self.omp_group.hide()  # Initially hidden
+        self.denoise3d_group.hide()  # Initially hidden
         self.fk_filter_group.hide()  # Initially hidden
         self.fkk_filter_group.hide()  # Initially hidden
         self.pstm_group.hide()  # Initially hidden
@@ -146,8 +166,13 @@ class ControlPanel(QWidget):
         self.algorithm_combo = QComboBox()
         self.algorithm_combo.addItems([
             "Bandpass Filter",
-            "TF-Denoise (S-Transform)",
+            "Stockwell Transform (ST)",
+            "STFT Denoise",
             "DWT-Denoise (Wavelet)",
+            "Gabor Transform",
+            "EMD Decomposition",
+            "OMP Sparse Denoise",
+            "3D Spatial Denoise",
             "FK Filter",
             "3D FKK Filter",
             "Kirchhoff PSTM"
@@ -250,121 +275,99 @@ class ControlPanel(QWidget):
         group.setLayout(layout)
         return group
 
-    def _create_tfdenoise_group(self) -> QGroupBox:
-        """Create TF-Denoise parameters group."""
-        group = QGroupBox("TF-Denoise Parameters")
+    def _create_stockwell_group(self) -> QGroupBox:
+        """Create Stockwell Transform (S-Transform) parameters group."""
+        group = QGroupBox("Stockwell Transform (ST) Parameters")
         layout = QVBoxLayout()
 
         # Preset selection
         preset_layout = QHBoxLayout()
         preset_layout.addWidget(QLabel("Preset:"))
-        self.tfdenoise_preset_combo = QComboBox()
-        self.tfdenoise_preset_combo.addItems([
+        self.stockwell_preset_combo = QComboBox()
+        self.stockwell_preset_combo.addItems([
             "Low-Freq Noise",
             "White Noise",
             "High-Freq Noise",
             "Conservative",
             "Custom"
         ])
-        self.tfdenoise_preset_combo.currentIndexChanged.connect(self._on_tfdenoise_preset_changed)
-        preset_layout.addWidget(self.tfdenoise_preset_combo)
+        self.stockwell_preset_combo.currentIndexChanged.connect(self._on_stockwell_preset_changed)
+        preset_layout.addWidget(self.stockwell_preset_combo)
         layout.addLayout(preset_layout)
 
         # Spatial aperture
         aperture_layout = QHBoxLayout()
         aperture_layout.addWidget(QLabel("Spatial Aperture:"))
-        self.aperture_spin = QSpinBox()
-        self.aperture_spin.setRange(3, 21)
-        self.aperture_spin.setValue(7)
-        self.aperture_spin.setSingleStep(2)  # Odd numbers only
-        self.aperture_spin.setToolTip("Number of traces to use for spatial denoising (odd numbers)")
-        aperture_layout.addWidget(self.aperture_spin)
+        self.stockwell_aperture_spin = QSpinBox()
+        self.stockwell_aperture_spin.setRange(3, 21)
+        self.stockwell_aperture_spin.setValue(7)
+        self.stockwell_aperture_spin.setSingleStep(2)
+        self.stockwell_aperture_spin.setToolTip("Number of traces to use for spatial denoising (odd numbers)")
+        aperture_layout.addWidget(self.stockwell_aperture_spin)
         layout.addLayout(aperture_layout)
 
         # Frequency range
         fmin_layout = QHBoxLayout()
         fmin_layout.addWidget(QLabel("Min Freq (Hz):"))
-        self.tfdenoise_fmin_spin = QDoubleSpinBox()
-        self.tfdenoise_fmin_spin.setRange(1.0, self.nyquist_freq - 1)
-        self.tfdenoise_fmin_spin.setValue(5.0)
-        self.tfdenoise_fmin_spin.setDecimals(1)
-        fmin_layout.addWidget(self.tfdenoise_fmin_spin)
+        self.stockwell_fmin_spin = QDoubleSpinBox()
+        self.stockwell_fmin_spin.setRange(1.0, self.nyquist_freq - 1)
+        self.stockwell_fmin_spin.setValue(5.0)
+        self.stockwell_fmin_spin.setDecimals(1)
+        fmin_layout.addWidget(self.stockwell_fmin_spin)
         layout.addLayout(fmin_layout)
 
         fmax_layout = QHBoxLayout()
         fmax_layout.addWidget(QLabel("Max Freq (Hz):"))
-        self.tfdenoise_fmax_spin = QDoubleSpinBox()
-        self.tfdenoise_fmax_spin.setRange(2.0, self.nyquist_freq - 0.1)
-        self.tfdenoise_fmax_spin.setValue(100.0)
-        self.tfdenoise_fmax_spin.setDecimals(1)
-        fmax_layout.addWidget(self.tfdenoise_fmax_spin)
+        self.stockwell_fmax_spin = QDoubleSpinBox()
+        self.stockwell_fmax_spin.setRange(2.0, self.nyquist_freq - 0.1)
+        self.stockwell_fmax_spin.setValue(100.0)
+        self.stockwell_fmax_spin.setDecimals(1)
+        fmax_layout.addWidget(self.stockwell_fmax_spin)
         layout.addLayout(fmax_layout)
 
         # MAD threshold multiplier
         k_layout = QHBoxLayout()
         k_layout.addWidget(QLabel("Threshold (k):"))
-        self.threshold_k_spin = QDoubleSpinBox()
-        self.threshold_k_spin.setRange(0.5, 10.0)
-        self.threshold_k_spin.setValue(3.0)
-        self.threshold_k_spin.setSingleStep(0.5)
-        self.threshold_k_spin.setDecimals(1)
-        self.threshold_k_spin.setToolTip("MAD threshold multiplier (higher = more aggressive)")
-        k_layout.addWidget(self.threshold_k_spin)
+        self.stockwell_threshold_k_spin = QDoubleSpinBox()
+        self.stockwell_threshold_k_spin.setRange(0.5, 10.0)
+        self.stockwell_threshold_k_spin.setValue(3.0)
+        self.stockwell_threshold_k_spin.setSingleStep(0.5)
+        self.stockwell_threshold_k_spin.setDecimals(1)
+        self.stockwell_threshold_k_spin.setToolTip("MAD threshold multiplier (higher = more aggressive)")
+        k_layout.addWidget(self.stockwell_threshold_k_spin)
         layout.addLayout(k_layout)
 
-        # Threshold type
-        threshold_type_layout = QHBoxLayout()
-        threshold_type_layout.addWidget(QLabel("Threshold Type:"))
-        self.threshold_type_combo = QComboBox()
-        self.threshold_type_combo.addItems([
-            "Soft",
-            "Garrote"
-        ])
-        threshold_type_layout.addWidget(self.threshold_type_combo)
-        layout.addLayout(threshold_type_layout)
-
-        # Transform type
-        transform_layout = QHBoxLayout()
-        transform_layout.addWidget(QLabel("Transform:"))
-        self.transform_type_combo = QComboBox()
-        self.transform_type_combo.addItems([
-            "S-Transform",
-            "STFT"
-        ])
-        transform_layout.addWidget(self.transform_type_combo)
-        layout.addLayout(transform_layout)
-
-        # Threshold mode (NEW)
+        # Threshold mode
         threshold_mode_layout = QHBoxLayout()
         threshold_mode_layout.addWidget(QLabel("Noise Removal:"))
-        self.threshold_mode_combo = QComboBox()
-        self.threshold_mode_combo.addItems([
+        self.stockwell_threshold_mode_combo = QComboBox()
+        self.stockwell_threshold_mode_combo.addItems([
             "Adaptive (Recommended)",
             "Hard (Full Removal)",
             "Scaled (Progressive)",
             "Soft (Legacy)"
         ])
-        self.threshold_mode_combo.setToolTip(
+        self.stockwell_threshold_mode_combo.setToolTip(
             "Adaptive: Hard for severe outliers, scaled for moderate (recommended)\n"
             "Hard: Full removal for all outliers\n"
             "Scaled: Progressive removal based on severity\n"
             "Soft: Legacy partial removal"
         )
-        threshold_mode_layout.addWidget(self.threshold_mode_combo)
+        threshold_mode_layout.addWidget(self.stockwell_threshold_mode_combo)
         layout.addLayout(threshold_mode_layout)
 
-        # Low-amplitude protection (NEW)
-        self.low_amp_protection_checkbox = QCheckBox("Low-amplitude protection")
-        self.low_amp_protection_checkbox.setChecked(True)
-        self.low_amp_protection_checkbox.setToolTip(
+        # Low-amplitude protection
+        self.stockwell_low_amp_checkbox = QCheckBox("Low-amplitude protection")
+        self.stockwell_low_amp_checkbox.setChecked(True)
+        self.stockwell_low_amp_checkbox.setToolTip(
             "Prevent inflation of low-amplitude samples\n"
             "(isolated signals won't be boosted toward median)"
         )
-        layout.addWidget(self.low_amp_protection_checkbox)
+        layout.addWidget(self.stockwell_low_amp_checkbox)
 
         # Apply button
-        self.tfdenoise_apply_btn = QPushButton("Apply TF-Denoise")
-        self.tfdenoise_apply_btn.setStyleSheet("""
+        self.stockwell_apply_btn = QPushButton("Apply Stockwell Denoise")
+        self.stockwell_apply_btn.setStyleSheet("""
             QPushButton {
                 background-color: #4CAF50;
                 color: white;
@@ -379,8 +382,132 @@ class ControlPanel(QWidget):
                 background-color: #3d8b40;
             }
         """)
-        self.tfdenoise_apply_btn.clicked.connect(self._on_apply_clicked)
-        layout.addWidget(self.tfdenoise_apply_btn)
+        self.stockwell_apply_btn.clicked.connect(self._on_apply_clicked)
+        layout.addWidget(self.stockwell_apply_btn)
+
+        group.setLayout(layout)
+        return group
+
+    def _create_stft_group(self) -> QGroupBox:
+        """Create STFT Denoise parameters group."""
+        group = QGroupBox("STFT Denoise Parameters")
+        layout = QVBoxLayout()
+
+        # Preset selection
+        preset_layout = QHBoxLayout()
+        preset_layout.addWidget(QLabel("Preset:"))
+        self.stft_preset_combo = QComboBox()
+        self.stft_preset_combo.addItems([
+            "Low-Freq Noise",
+            "White Noise",
+            "High-Freq Noise",
+            "Conservative",
+            "Custom"
+        ])
+        self.stft_preset_combo.currentIndexChanged.connect(self._on_stft_preset_changed)
+        preset_layout.addWidget(self.stft_preset_combo)
+        layout.addLayout(preset_layout)
+
+        # Spatial aperture
+        aperture_layout = QHBoxLayout()
+        aperture_layout.addWidget(QLabel("Spatial Aperture:"))
+        self.stft_aperture_spin = QSpinBox()
+        self.stft_aperture_spin.setRange(3, 21)
+        self.stft_aperture_spin.setValue(7)
+        self.stft_aperture_spin.setSingleStep(2)
+        self.stft_aperture_spin.setToolTip("Number of traces to use for spatial denoising (odd numbers)")
+        aperture_layout.addWidget(self.stft_aperture_spin)
+        layout.addLayout(aperture_layout)
+
+        # Window size (nperseg) - STFT specific
+        nperseg_layout = QHBoxLayout()
+        nperseg_layout.addWidget(QLabel("Window Size:"))
+        self.stft_nperseg_spin = QSpinBox()
+        self.stft_nperseg_spin.setRange(16, 256)
+        self.stft_nperseg_spin.setValue(64)
+        self.stft_nperseg_spin.setSingleStep(16)
+        self.stft_nperseg_spin.setToolTip("STFT window size (samples). Larger = better freq resolution, worse time resolution")
+        nperseg_layout.addWidget(self.stft_nperseg_spin)
+        layout.addLayout(nperseg_layout)
+
+        # Frequency range
+        fmin_layout = QHBoxLayout()
+        fmin_layout.addWidget(QLabel("Min Freq (Hz):"))
+        self.stft_fmin_spin = QDoubleSpinBox()
+        self.stft_fmin_spin.setRange(1.0, self.nyquist_freq - 1)
+        self.stft_fmin_spin.setValue(5.0)
+        self.stft_fmin_spin.setDecimals(1)
+        fmin_layout.addWidget(self.stft_fmin_spin)
+        layout.addLayout(fmin_layout)
+
+        fmax_layout = QHBoxLayout()
+        fmax_layout.addWidget(QLabel("Max Freq (Hz):"))
+        self.stft_fmax_spin = QDoubleSpinBox()
+        self.stft_fmax_spin.setRange(2.0, self.nyquist_freq - 0.1)
+        self.stft_fmax_spin.setValue(100.0)
+        self.stft_fmax_spin.setDecimals(1)
+        fmax_layout.addWidget(self.stft_fmax_spin)
+        layout.addLayout(fmax_layout)
+
+        # MAD threshold multiplier
+        k_layout = QHBoxLayout()
+        k_layout.addWidget(QLabel("Threshold (k):"))
+        self.stft_threshold_k_spin = QDoubleSpinBox()
+        self.stft_threshold_k_spin.setRange(0.5, 10.0)
+        self.stft_threshold_k_spin.setValue(3.0)
+        self.stft_threshold_k_spin.setSingleStep(0.5)
+        self.stft_threshold_k_spin.setDecimals(1)
+        self.stft_threshold_k_spin.setToolTip("MAD threshold multiplier (higher = more aggressive)")
+        k_layout.addWidget(self.stft_threshold_k_spin)
+        layout.addLayout(k_layout)
+
+        # Threshold mode
+        threshold_mode_layout = QHBoxLayout()
+        threshold_mode_layout.addWidget(QLabel("Noise Removal:"))
+        self.stft_threshold_mode_combo = QComboBox()
+        self.stft_threshold_mode_combo.addItems([
+            "Adaptive (Recommended)",
+            "Hard (Full Removal)",
+            "Scaled (Progressive)",
+            "Soft (Legacy)"
+        ])
+        self.stft_threshold_mode_combo.setToolTip(
+            "Adaptive: Hard for severe outliers, scaled for moderate (recommended)\n"
+            "Hard: Full removal for all outliers\n"
+            "Scaled: Progressive removal based on severity\n"
+            "Soft: Legacy partial removal"
+        )
+        threshold_mode_layout.addWidget(self.stft_threshold_mode_combo)
+        layout.addLayout(threshold_mode_layout)
+
+        # Low-amplitude protection
+        self.stft_low_amp_checkbox = QCheckBox("Low-amplitude protection")
+        self.stft_low_amp_checkbox.setChecked(True)
+        self.stft_low_amp_checkbox.setToolTip(
+            "Prevent inflation of low-amplitude samples\n"
+            "(isolated signals won't be boosted toward median)"
+        )
+        layout.addWidget(self.stft_low_amp_checkbox)
+
+        # Apply button
+        self.stft_apply_btn = QPushButton("Apply STFT Denoise")
+        self.stft_apply_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                font-weight: bold;
+                padding: 8px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+            QPushButton:pressed {
+                background-color: #3d8b40;
+            }
+        """)
+        self.stft_apply_btn.clicked.connect(self._on_apply_clicked)
+        layout.addWidget(self.stft_apply_btn)
 
         group.setLayout(layout)
         return group
@@ -426,12 +553,16 @@ class ControlPanel(QWidget):
         self.dwt_transform_combo.addItems([
             "DWT (Fast)",
             "SWT (Translation-Invariant)",
-            "DWT-Spatial (with Aperture)"
+            "DWT-Spatial (with Aperture)",
+            "WPT (Wavelet Packets)",
+            "WPT-Spatial (with Aperture)"
         ])
         self.dwt_transform_combo.setToolTip(
             "DWT: Fast standard wavelet transform (5-10x faster)\n"
             "SWT: Stationary WT, avoids shift artifacts (slower)\n"
-            "DWT-Spatial: Uses spatial aperture for robust thresholding"
+            "DWT-Spatial: Uses spatial aperture for robust thresholding\n"
+            "WPT: Wavelet Packets - full tree, better frequency resolution\n"
+            "WPT-Spatial: WPT with spatial aperture processing"
         )
         self.dwt_transform_combo.currentIndexChanged.connect(self._on_dwt_transform_changed)
         transform_layout.addWidget(self.dwt_transform_combo)
@@ -474,7 +605,7 @@ class ControlPanel(QWidget):
         mode_layout.addWidget(self.dwt_threshold_mode_combo)
         layout.addLayout(mode_layout)
 
-        # Spatial aperture (only for DWT-Spatial mode)
+        # Spatial aperture (only for spatial modes)
         aperture_layout = QHBoxLayout()
         aperture_layout.addWidget(QLabel("Spatial Aperture:"))
         self.dwt_aperture_spin = QSpinBox()
@@ -486,6 +617,16 @@ class ControlPanel(QWidget):
         aperture_layout.addWidget(self.dwt_aperture_spin)
         layout.addLayout(aperture_layout)
         self.dwt_aperture_layout = aperture_layout
+
+        # Best-basis selection (only for WPT modes)
+        self.dwt_best_basis_checkbox = QCheckBox("Best-basis selection (Shannon entropy)")
+        self.dwt_best_basis_checkbox.setChecked(False)
+        self.dwt_best_basis_checkbox.setEnabled(False)  # Disabled by default
+        self.dwt_best_basis_checkbox.setToolTip(
+            "Use Shannon entropy to find optimal decomposition tree.\n"
+            "Can improve denoising for non-stationary signals."
+        )
+        layout.addWidget(self.dwt_best_basis_checkbox)
 
         # Performance info
         perf_label = QLabel("5-10x faster than STFT with comparable quality")
@@ -517,8 +658,573 @@ class ControlPanel(QWidget):
 
     def _on_dwt_transform_changed(self, index: int):
         """Handle DWT transform type change."""
-        # Enable aperture only for DWT-Spatial mode (index 2)
-        self.dwt_aperture_spin.setEnabled(index == 2)
+        # Enable aperture for spatial modes (index 2=DWT-Spatial, 4=WPT-Spatial)
+        self.dwt_aperture_spin.setEnabled(index in [2, 4])
+        # Enable best-basis for WPT modes (index 3=WPT, 4=WPT-Spatial)
+        self.dwt_best_basis_checkbox.setEnabled(index in [3, 4])
+
+    def _create_gabor_group(self) -> QGroupBox:
+        """Create Gabor Transform Denoise parameters group."""
+        group = QGroupBox("Gabor Transform Parameters")
+        layout = QVBoxLayout()
+
+        # Info label
+        info_label = QLabel("STFT with Gaussian windows for optimal TF localization")
+        info_label.setStyleSheet("color: #666; font-size: 9pt; font-style: italic;")
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        # Window size
+        window_layout = QHBoxLayout()
+        window_layout.addWidget(QLabel("Window Size:"))
+        self.gabor_window_spin = QSpinBox()
+        self.gabor_window_spin.setRange(16, 512)
+        self.gabor_window_spin.setValue(64)
+        self.gabor_window_spin.setSingleStep(16)
+        self.gabor_window_spin.setToolTip("Gabor window size in samples (power of 2 recommended)")
+        window_layout.addWidget(self.gabor_window_spin)
+        layout.addLayout(window_layout)
+
+        # Sigma (Gaussian width)
+        sigma_layout = QHBoxLayout()
+        sigma_layout.addWidget(QLabel("Sigma:"))
+        self.gabor_sigma_spin = QDoubleSpinBox()
+        self.gabor_sigma_spin.setRange(0.0, 100.0)
+        self.gabor_sigma_spin.setValue(0.0)
+        self.gabor_sigma_spin.setSingleStep(1.0)
+        self.gabor_sigma_spin.setDecimals(1)
+        self.gabor_sigma_spin.setSpecialValueText("Auto")
+        self.gabor_sigma_spin.setToolTip(
+            "Gaussian window standard deviation.\n"
+            "0 = Auto (window_size/6 for optimal TF trade-off)\n"
+            "Lower = better frequency resolution\n"
+            "Higher = better time resolution"
+        )
+        sigma_layout.addWidget(self.gabor_sigma_spin)
+        layout.addLayout(sigma_layout)
+
+        # Overlap percentage
+        overlap_layout = QHBoxLayout()
+        overlap_layout.addWidget(QLabel("Overlap %:"))
+        self.gabor_overlap_spin = QSpinBox()
+        self.gabor_overlap_spin.setRange(25, 90)
+        self.gabor_overlap_spin.setValue(75)
+        self.gabor_overlap_spin.setSingleStep(5)
+        self.gabor_overlap_spin.setToolTip("Window overlap percentage (75% typical)")
+        overlap_layout.addWidget(self.gabor_overlap_spin)
+        layout.addLayout(overlap_layout)
+
+        # Spatial aperture
+        aperture_layout = QHBoxLayout()
+        aperture_layout.addWidget(QLabel("Spatial Aperture:"))
+        self.gabor_aperture_spin = QSpinBox()
+        self.gabor_aperture_spin.setRange(3, 21)
+        self.gabor_aperture_spin.setValue(7)
+        self.gabor_aperture_spin.setSingleStep(2)
+        self.gabor_aperture_spin.setToolTip("Number of traces for spatial MAD estimation (odd)")
+        aperture_layout.addWidget(self.gabor_aperture_spin)
+        layout.addLayout(aperture_layout)
+
+        # Frequency range
+        fmin_layout = QHBoxLayout()
+        fmin_layout.addWidget(QLabel("Min Freq (Hz):"))
+        self.gabor_fmin_spin = QDoubleSpinBox()
+        self.gabor_fmin_spin.setRange(1.0, self.nyquist_freq - 1)
+        self.gabor_fmin_spin.setValue(5.0)
+        self.gabor_fmin_spin.setDecimals(1)
+        fmin_layout.addWidget(self.gabor_fmin_spin)
+        layout.addLayout(fmin_layout)
+
+        fmax_layout = QHBoxLayout()
+        fmax_layout.addWidget(QLabel("Max Freq (Hz):"))
+        self.gabor_fmax_spin = QDoubleSpinBox()
+        self.gabor_fmax_spin.setRange(2.0, self.nyquist_freq - 0.1)
+        self.gabor_fmax_spin.setValue(100.0)
+        self.gabor_fmax_spin.setDecimals(1)
+        fmax_layout.addWidget(self.gabor_fmax_spin)
+        layout.addLayout(fmax_layout)
+
+        # MAD threshold multiplier
+        k_layout = QHBoxLayout()
+        k_layout.addWidget(QLabel("Threshold (k):"))
+        self.gabor_threshold_k_spin = QDoubleSpinBox()
+        self.gabor_threshold_k_spin.setRange(0.5, 10.0)
+        self.gabor_threshold_k_spin.setValue(3.0)
+        self.gabor_threshold_k_spin.setSingleStep(0.5)
+        self.gabor_threshold_k_spin.setDecimals(1)
+        self.gabor_threshold_k_spin.setToolTip("MAD threshold multiplier (higher = more aggressive)")
+        k_layout.addWidget(self.gabor_threshold_k_spin)
+        layout.addLayout(k_layout)
+
+        # Threshold mode
+        mode_layout = QHBoxLayout()
+        mode_layout.addWidget(QLabel("Threshold Mode:"))
+        self.gabor_threshold_mode_combo = QComboBox()
+        self.gabor_threshold_mode_combo.addItems([
+            "Soft (Shrinkage)",
+            "Hard (Keep/Zero)"
+        ])
+        self.gabor_threshold_mode_combo.setToolTip(
+            "Soft: Shrinks coefficients toward median (smoother)\n"
+            "Hard: Keeps or zeros coefficients (preserves edges)"
+        )
+        mode_layout.addWidget(self.gabor_threshold_mode_combo)
+        layout.addLayout(mode_layout)
+
+        # Low-amplitude protection
+        self.gabor_low_amp_checkbox = QCheckBox("Low-amplitude protection")
+        self.gabor_low_amp_checkbox.setChecked(True)
+        self.gabor_low_amp_checkbox.setToolTip("Prevent inflation of low-amplitude samples")
+        layout.addWidget(self.gabor_low_amp_checkbox)
+
+        # Apply button
+        self.gabor_apply_btn = QPushButton("Apply Gabor Denoise")
+        self.gabor_apply_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #9C27B0;
+                color: white;
+                font-weight: bold;
+                padding: 8px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #7B1FA2;
+            }
+            QPushButton:pressed {
+                background-color: #6A1B9A;
+            }
+        """)
+        self.gabor_apply_btn.clicked.connect(self._on_apply_clicked)
+        layout.addWidget(self.gabor_apply_btn)
+
+        group.setLayout(layout)
+        return group
+
+    def _create_emd_group(self) -> QGroupBox:
+        """Create EMD Decomposition parameters group."""
+        group = QGroupBox("EMD Decomposition Parameters")
+        layout = QVBoxLayout()
+
+        # Info label
+        info_label = QLabel("Adaptive decomposition into Intrinsic Mode Functions")
+        info_label.setStyleSheet("color: #666; font-size: 9pt; font-style: italic;")
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        # Method selection
+        method_layout = QHBoxLayout()
+        method_layout.addWidget(QLabel("Method:"))
+        self.emd_method_combo = QComboBox()
+        self.emd_method_combo.addItems([
+            "EMD (Fast)",
+            "EEMD (Robust)",
+            "CEEMDAN (Best Quality)"
+        ])
+        self.emd_method_combo.setCurrentIndex(1)  # Default to EEMD
+        self.emd_method_combo.setToolTip(
+            "EMD: Fast but may have mode mixing\n"
+            "EEMD: Ensemble EMD, noise-assisted (robust)\n"
+            "CEEMDAN: Complete EEMD (best quality, slowest)"
+        )
+        self.emd_method_combo.currentIndexChanged.connect(self._on_emd_method_changed)
+        method_layout.addWidget(self.emd_method_combo)
+        layout.addLayout(method_layout)
+
+        # IMF removal strategy
+        remove_layout = QHBoxLayout()
+        remove_layout.addWidget(QLabel("Remove IMFs:"))
+        self.emd_remove_combo = QComboBox()
+        self.emd_remove_combo.addItems([
+            "First (High-freq noise)",
+            "First 2",
+            "First 3",
+            "Last (Low-freq trend)",
+            "Last 2",
+            "Custom"
+        ])
+        self.emd_remove_combo.setToolTip(
+            "IMF 0 = highest frequency (often noise)\n"
+            "Last IMF = lowest frequency (trend/DC)"
+        )
+        remove_layout.addWidget(self.emd_remove_combo)
+        layout.addLayout(remove_layout)
+
+        # Custom IMF indices (hidden by default)
+        self.emd_custom_layout = QHBoxLayout()
+        self.emd_custom_layout.addWidget(QLabel("IMF indices:"))
+        self.emd_custom_edit = QSpinBox()
+        self.emd_custom_edit.setRange(0, 10)
+        self.emd_custom_edit.setValue(0)
+        self.emd_custom_edit.setToolTip("Enter IMF indices to remove (0-indexed)")
+        self.emd_custom_layout.addWidget(self.emd_custom_edit)
+        self.emd_custom_widget = QWidget()
+        self.emd_custom_widget.setLayout(self.emd_custom_layout)
+        self.emd_custom_widget.hide()
+        layout.addWidget(self.emd_custom_widget)
+        self.emd_remove_combo.currentIndexChanged.connect(self._on_emd_remove_changed)
+
+        # Ensemble size (for EEMD/CEEMDAN)
+        ensemble_layout = QHBoxLayout()
+        ensemble_layout.addWidget(QLabel("Ensemble size:"))
+        self.emd_ensemble_spin = QSpinBox()
+        self.emd_ensemble_spin.setRange(10, 500)
+        self.emd_ensemble_spin.setValue(100)
+        self.emd_ensemble_spin.setSingleStep(10)
+        self.emd_ensemble_spin.setToolTip("Number of noise realizations (EEMD/CEEMDAN only)")
+        ensemble_layout.addWidget(self.emd_ensemble_spin)
+        layout.addLayout(ensemble_layout)
+
+        # Noise amplitude
+        noise_layout = QHBoxLayout()
+        noise_layout.addWidget(QLabel("Noise amplitude:"))
+        self.emd_noise_spin = QDoubleSpinBox()
+        self.emd_noise_spin.setRange(0.01, 1.0)
+        self.emd_noise_spin.setValue(0.2)
+        self.emd_noise_spin.setSingleStep(0.05)
+        self.emd_noise_spin.setDecimals(2)
+        self.emd_noise_spin.setToolTip("Added noise amplitude as fraction of signal std")
+        noise_layout.addWidget(self.emd_noise_spin)
+        layout.addLayout(noise_layout)
+
+        # Warning for slow methods
+        self.emd_warning_label = QLabel("Note: EEMD/CEEMDAN can be slow for large data")
+        self.emd_warning_label.setStyleSheet("color: #FF9800; font-size: 9pt;")
+        layout.addWidget(self.emd_warning_label)
+
+        # Apply button
+        self.emd_apply_btn = QPushButton("Apply EMD Denoise")
+        self.emd_apply_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #FF5722;
+                color: white;
+                font-weight: bold;
+                padding: 8px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #E64A19;
+            }
+            QPushButton:pressed {
+                background-color: #D84315;
+            }
+        """)
+        self.emd_apply_btn.clicked.connect(self._on_apply_clicked)
+        layout.addWidget(self.emd_apply_btn)
+
+        group.setLayout(layout)
+        return group
+
+    def _on_emd_method_changed(self, index: int):
+        """Handle EMD method selection change."""
+        # Enable ensemble/noise controls only for EEMD/CEEMDAN
+        ensemble_enabled = index > 0
+        self.emd_ensemble_spin.setEnabled(ensemble_enabled)
+        self.emd_noise_spin.setEnabled(ensemble_enabled)
+        self.emd_warning_label.setVisible(ensemble_enabled)
+
+    def _on_emd_remove_changed(self, index: int):
+        """Handle IMF removal strategy change."""
+        # Show custom input only for "Custom" option
+        self.emd_custom_widget.setVisible(index == 5)
+
+    def _create_omp_group(self) -> QGroupBox:
+        """Create OMP Sparse Denoise parameters group."""
+        group = QGroupBox("OMP Sparse Denoise Parameters")
+        layout = QVBoxLayout()
+
+        # Info label
+        info_label = QLabel("Sparse representation denoising using Orthogonal Matching Pursuit")
+        info_label.setStyleSheet("color: #666; font-size: 9pt; font-style: italic;")
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        # Dictionary type selection
+        dict_layout = QHBoxLayout()
+        dict_layout.addWidget(QLabel("Dictionary:"))
+        self.omp_dict_combo = QComboBox()
+        self.omp_dict_combo.addItems([
+            "DCT (Fast, smooth signals)",
+            "DFT (Oscillatory)",
+            "Gabor (Time-frequency)",
+            "Wavelet (Seismic)",
+            "Hybrid (Multi-basis)"
+        ])
+        self.omp_dict_combo.setCurrentIndex(3)  # Default to Wavelet for seismic
+        self.omp_dict_combo.setToolTip(
+            "DCT: Discrete Cosine Transform - fast, good for smooth signals\n"
+            "DFT: Discrete Fourier Transform - periodic/oscillatory signals\n"
+            "Gabor: Localized in time and frequency - transient events\n"
+            "Wavelet: Ricker wavelets - best for seismic reflections\n"
+            "Hybrid: Combination of all bases - most flexible"
+        )
+        dict_layout.addWidget(self.omp_dict_combo)
+        layout.addLayout(dict_layout)
+
+        # Patch size
+        patch_layout = QHBoxLayout()
+        patch_layout.addWidget(QLabel("Patch size:"))
+        self.omp_patch_spin = QSpinBox()
+        self.omp_patch_spin.setRange(16, 256)
+        self.omp_patch_spin.setValue(64)
+        self.omp_patch_spin.setSingleStep(16)
+        self.omp_patch_spin.setToolTip("Size of signal patches for sparse coding (samples)")
+        patch_layout.addWidget(self.omp_patch_spin)
+        layout.addLayout(patch_layout)
+
+        # Sparsity level
+        sparsity_layout = QHBoxLayout()
+        sparsity_layout.addWidget(QLabel("Sparsity (atoms):"))
+        self.omp_sparsity_spin = QSpinBox()
+        self.omp_sparsity_spin.setRange(1, 50)
+        self.omp_sparsity_spin.setValue(8)
+        self.omp_sparsity_spin.setToolTip(
+            "Maximum atoms per patch (lower = more denoising, higher = preserve detail)"
+        )
+        sparsity_layout.addWidget(self.omp_sparsity_spin)
+        layout.addLayout(sparsity_layout)
+
+        # Residual tolerance
+        tol_layout = QHBoxLayout()
+        tol_layout.addWidget(QLabel("Residual tol:"))
+        self.omp_tol_spin = QDoubleSpinBox()
+        self.omp_tol_spin.setRange(0.01, 0.5)
+        self.omp_tol_spin.setValue(0.1)
+        self.omp_tol_spin.setSingleStep(0.01)
+        self.omp_tol_spin.setDecimals(2)
+        self.omp_tol_spin.setToolTip(
+            "Stop OMP when residual < tolerance × signal norm\n"
+            "Lower = more atoms used, Higher = earlier stopping"
+        )
+        tol_layout.addWidget(self.omp_tol_spin)
+        layout.addLayout(tol_layout)
+
+        # Overlap
+        overlap_layout = QHBoxLayout()
+        overlap_layout.addWidget(QLabel("Patch overlap:"))
+        self.omp_overlap_spin = QDoubleSpinBox()
+        self.omp_overlap_spin.setRange(0.0, 0.9)
+        self.omp_overlap_spin.setValue(0.5)
+        self.omp_overlap_spin.setSingleStep(0.1)
+        self.omp_overlap_spin.setDecimals(1)
+        self.omp_overlap_spin.setToolTip("Overlap between adjacent patches (0-0.9)")
+        overlap_layout.addWidget(self.omp_overlap_spin)
+        layout.addLayout(overlap_layout)
+
+        # Spatial aperture
+        aperture_layout = QHBoxLayout()
+        aperture_layout.addWidget(QLabel("Spatial aperture:"))
+        self.omp_aperture_spin = QSpinBox()
+        self.omp_aperture_spin.setRange(1, 15)
+        self.omp_aperture_spin.setValue(1)
+        self.omp_aperture_spin.setSingleStep(2)
+        self.omp_aperture_spin.setToolTip(
+            "Number of neighboring traces for joint processing\n"
+            "1 = single trace, 3+ = use neighbors (must be odd)"
+        )
+        aperture_layout.addWidget(self.omp_aperture_spin)
+        layout.addLayout(aperture_layout)
+
+        # Processing mode
+        mode_layout = QHBoxLayout()
+        mode_layout.addWidget(QLabel("Mode:"))
+        self.omp_mode_combo = QComboBox()
+        self.omp_mode_combo.addItems(["Patch", "Spatial", "Adaptive"])
+        self.omp_mode_combo.setCurrentIndex(2)  # Default to Adaptive
+        self.omp_mode_combo.setToolTip(
+            "Patch: Process traces independently (fastest)\n"
+            "Spatial: Joint sparse coding across aperture\n"
+            "Adaptive: Time-varying sparsity based on local SNR (recommended)"
+        )
+        mode_layout.addWidget(self.omp_mode_combo)
+        layout.addLayout(mode_layout)
+
+        # Noise estimation method
+        noise_layout = QHBoxLayout()
+        noise_layout.addWidget(QLabel("Noise estimation:"))
+        self.omp_noise_combo = QComboBox()
+        self.omp_noise_combo.addItems([
+            "None (fixed params)",
+            "MAD-Diff (robust)",
+            "MAD-Residual",
+            "Wavelet"
+        ])
+        self.omp_noise_combo.setCurrentIndex(1)  # Default to MAD-Diff
+        self.omp_noise_combo.setToolTip(
+            "None: Use fixed sparsity/tolerance\n"
+            "MAD-Diff: Median Absolute Deviation of trace differences (robust, recommended)\n"
+            "MAD-Residual: MAD after subtracting local mean\n"
+            "Wavelet: Wavelet-based noise estimation"
+        )
+        noise_layout.addWidget(self.omp_noise_combo)
+        layout.addLayout(noise_layout)
+
+        # Adaptive sparsity checkbox
+        self.omp_adaptive_checkbox = QCheckBox("Adaptive sparsity (vary with local SNR)")
+        self.omp_adaptive_checkbox.setChecked(True)
+        self.omp_adaptive_checkbox.setToolTip(
+            "When enabled, uses fewer atoms in noisy regions (more aggressive)\n"
+            "and more atoms in clean regions (preserve detail)"
+        )
+        layout.addWidget(self.omp_adaptive_checkbox)
+
+        # Performance note
+        perf_label = QLabel("Uses Numba + spatial statistics for robust denoising")
+        perf_label.setStyleSheet("color: #4CAF50; font-size: 9pt;")
+        layout.addWidget(perf_label)
+
+        # Apply button
+        self.omp_apply_btn = QPushButton("Apply OMP Denoise")
+        self.omp_apply_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #9C27B0;
+                color: white;
+                font-weight: bold;
+                padding: 8px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #7B1FA2;
+            }
+            QPushButton:pressed {
+                background-color: #6A1B9A;
+            }
+        """)
+        self.omp_apply_btn.clicked.connect(self._on_apply_clicked)
+        layout.addWidget(self.omp_apply_btn)
+
+        group.setLayout(layout)
+        return group
+
+    def _create_denoise3d_group(self) -> QGroupBox:
+        """Create 3D Spatial Denoise parameters group."""
+        group = QGroupBox("3D Spatial Denoise Parameters")
+        layout = QVBoxLayout()
+
+        # Info label
+        info_label = QLabel(
+            "Build 3D volume from 2D gather using\n"
+            "selected headers for inline/crossline axes,\n"
+            "then apply DWT denoising with 3D spatial MAD."
+        )
+        info_label.setStyleSheet("color: #666; font-size: 10px;")
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        # Header selection
+        header_group = QGroupBox("Volume Organization")
+        header_layout = QFormLayout()
+
+        # Inline key combo - populated from dataset headers
+        self.denoise3d_inline_combo = QComboBox()
+        self.denoise3d_inline_combo.setToolTip(
+            "Header for inline (X) axis.\n"
+            "For shot gather: field_record, sin, source_x\n"
+            "For CDP: CDP, inline"
+        )
+        # Default items shown when no dataset loaded
+        self.denoise3d_inline_combo.addItems([
+            "(load dataset first)"
+        ])
+        header_layout.addRow("Inline Key:", self.denoise3d_inline_combo)
+
+        # Crossline key combo - populated from dataset headers
+        self.denoise3d_xline_combo = QComboBox()
+        self.denoise3d_xline_combo.setToolTip(
+            "Header for crossline (Y) axis.\n"
+            "For shot gather: trace_number, rec_sloc, receiver_x\n"
+            "For CDP: crossline"
+        )
+        self.denoise3d_xline_combo.addItems([
+            "(load dataset first)"
+        ])
+        header_layout.addRow("Crossline Key:", self.denoise3d_xline_combo)
+
+        # Status label showing unique values
+        self.denoise3d_status_label = QLabel("")
+        self.denoise3d_status_label.setStyleSheet("color: #888; font-size: 10px;")
+        self.denoise3d_status_label.setWordWrap(True)
+        header_layout.addRow(self.denoise3d_status_label)
+
+        # Connect combo changes to update status
+        self.denoise3d_inline_combo.currentIndexChanged.connect(self._update_denoise3d_status)
+        self.denoise3d_xline_combo.currentIndexChanged.connect(self._update_denoise3d_status)
+
+        header_group.setLayout(header_layout)
+        layout.addWidget(header_group)
+
+        # Aperture controls
+        aperture_group = QGroupBox("3D Spatial Aperture")
+        aperture_layout = QFormLayout()
+
+        # Inline aperture
+        self.denoise3d_ap_inline_spin = QSpinBox()
+        self.denoise3d_ap_inline_spin.setRange(1, 15)
+        self.denoise3d_ap_inline_spin.setSingleStep(2)
+        self.denoise3d_ap_inline_spin.setValue(3)
+        self.denoise3d_ap_inline_spin.setToolTip("Aperture in inline direction (odd)")
+        aperture_layout.addRow("Inline Aperture:", self.denoise3d_ap_inline_spin)
+
+        # Crossline aperture
+        self.denoise3d_ap_xline_spin = QSpinBox()
+        self.denoise3d_ap_xline_spin.setRange(1, 15)
+        self.denoise3d_ap_xline_spin.setSingleStep(2)
+        self.denoise3d_ap_xline_spin.setValue(3)
+        self.denoise3d_ap_xline_spin.setToolTip("Aperture in crossline direction (odd)")
+        aperture_layout.addRow("Crossline Aperture:", self.denoise3d_ap_xline_spin)
+
+        aperture_group.setLayout(aperture_layout)
+        layout.addWidget(aperture_group)
+
+        # DWT parameters
+        dwt_group = QGroupBox("DWT Parameters")
+        dwt_layout = QFormLayout()
+
+        # Wavelet selection
+        self.denoise3d_wavelet_combo = QComboBox()
+        self.denoise3d_wavelet_combo.addItems([
+            "db4", "db6", "db8", "sym4", "sym6", "coif2", "bior2.2"
+        ])
+        self.denoise3d_wavelet_combo.setCurrentIndex(0)  # db4 default
+        self.denoise3d_wavelet_combo.setToolTip("Wavelet for DWT decomposition")
+        dwt_layout.addRow("Wavelet:", self.denoise3d_wavelet_combo)
+
+        # Threshold k
+        self.denoise3d_k_spin = QDoubleSpinBox()
+        self.denoise3d_k_spin.setRange(1.0, 10.0)
+        self.denoise3d_k_spin.setSingleStep(0.5)
+        self.denoise3d_k_spin.setValue(3.0)
+        self.denoise3d_k_spin.setToolTip("MAD threshold multiplier (k)")
+        dwt_layout.addRow("Threshold k:", self.denoise3d_k_spin)
+
+        # Threshold mode
+        self.denoise3d_mode_combo = QComboBox()
+        self.denoise3d_mode_combo.addItems(["soft", "hard"])
+        self.denoise3d_mode_combo.setCurrentIndex(0)  # soft default
+        self.denoise3d_mode_combo.setToolTip("Thresholding mode")
+        dwt_layout.addRow("Threshold Mode:", self.denoise3d_mode_combo)
+
+        dwt_group.setLayout(dwt_layout)
+        layout.addWidget(dwt_group)
+
+        # Apply button
+        self.denoise3d_apply_btn = QPushButton("Apply 3D Denoise")
+        self.denoise3d_apply_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                font-weight: bold;
+                padding: 8px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+        """)
+        self.denoise3d_apply_btn.clicked.connect(self._on_apply_clicked)
+        layout.addWidget(self.denoise3d_apply_btn)
+
+        group.setLayout(layout)
+        return group
 
     def _create_fk_filter_group(self) -> QGroupBox:
         """Create FK filter group with Design/Apply modes."""
@@ -1284,8 +1990,13 @@ class ControlPanel(QWidget):
         """Handle algorithm selection change."""
         # Hide all algorithm groups first
         self.bandpass_group.hide()
-        self.tfdenoise_group.hide()
+        self.stockwell_group.hide()
+        self.stft_group.hide()
         self.dwtdenoise_group.hide()
+        self.gabor_group.hide()
+        self.emd_group.hide()
+        self.omp_group.hide()
+        self.denoise3d_group.hide()
         self.fk_filter_group.hide()
         self.fkk_filter_group.hide()
         self.pstm_group.hide()
@@ -1295,27 +2006,52 @@ class ControlPanel(QWidget):
             # Disable GPU for bandpass filter
             if self.gpu_checkbox is not None:
                 self.gpu_checkbox.setEnabled(False)
-        elif index == 1:  # TF-Denoise
-            self.tfdenoise_group.show()
-            # Enable GPU for TF-Denoise if available
+        elif index == 1:  # Stockwell Transform (ST)
+            self.stockwell_group.show()
+            # Enable GPU for Stockwell if available
             if self.gpu_checkbox is not None and self.gpu_available:
                 self.gpu_checkbox.setEnabled(True)
-        elif index == 2:  # DWT-Denoise
+        elif index == 2:  # STFT Denoise
+            self.stft_group.show()
+            # Enable GPU for STFT if available
+            if self.gpu_checkbox is not None and self.gpu_available:
+                self.gpu_checkbox.setEnabled(True)
+        elif index == 3:  # DWT-Denoise
             self.dwtdenoise_group.show()
             # Disable GPU for DWT (CPU-only for now)
             if self.gpu_checkbox is not None:
                 self.gpu_checkbox.setEnabled(False)
-        elif index == 3:  # FK Filter
+        elif index == 4:  # Gabor Transform
+            self.gabor_group.show()
+            # Disable GPU for Gabor (CPU-only for now)
+            if self.gpu_checkbox is not None:
+                self.gpu_checkbox.setEnabled(False)
+        elif index == 5:  # EMD Decomposition
+            self.emd_group.show()
+            # Disable GPU for EMD (CPU-only)
+            if self.gpu_checkbox is not None:
+                self.gpu_checkbox.setEnabled(False)
+        elif index == 6:  # OMP Sparse Denoise
+            self.omp_group.show()
+            # Disable GPU for OMP (CPU-only with Numba)
+            if self.gpu_checkbox is not None:
+                self.gpu_checkbox.setEnabled(False)
+        elif index == 7:  # 3D Spatial Denoise
+            self.denoise3d_group.show()
+            # Disable GPU for 3D Denoise (CPU-only)
+            if self.gpu_checkbox is not None:
+                self.gpu_checkbox.setEnabled(False)
+        elif index == 8:  # FK Filter
             self.fk_filter_group.show()
             # Disable GPU for FK filter
             if self.gpu_checkbox is not None:
                 self.gpu_checkbox.setEnabled(False)
-        elif index == 4:  # 3D FKK Filter
+        elif index == 9:  # 3D FKK Filter
             self.fkk_filter_group.show()
             # Enable GPU for 3D FKK filter if available
             if self.gpu_checkbox is not None and self.gpu_available:
                 self.gpu_checkbox.setEnabled(True)
-        elif index == 5:  # Kirchhoff PSTM
+        elif index == 10:  # Kirchhoff PSTM
             self.pstm_group.show()
             # Enable GPU for PSTM if available
             if self.gpu_checkbox is not None and self.gpu_available:
@@ -1330,8 +2066,8 @@ class ControlPanel(QWidget):
             else:
                 self.gpu_status_label.setText(f"🟡 GPU Disabled (Using CPU)")
 
-    def _on_tfdenoise_preset_changed(self, index: int):
-        """Handle TF-Denoise preset change."""
+    def _on_stockwell_preset_changed(self, index: int):
+        """Handle Stockwell Transform preset change."""
         # Preset configurations
         presets = {
             0: {"aperture": 11, "fmin": 5.0, "fmax": 30.0, "k": 2.5},  # Low-Freq Noise
@@ -1342,20 +2078,50 @@ class ControlPanel(QWidget):
 
         if index < 4:  # Not Custom
             preset = presets[index]
-            self.aperture_spin.blockSignals(True)
-            self.tfdenoise_fmin_spin.blockSignals(True)
-            self.tfdenoise_fmax_spin.blockSignals(True)
-            self.threshold_k_spin.blockSignals(True)
+            self.stockwell_aperture_spin.blockSignals(True)
+            self.stockwell_fmin_spin.blockSignals(True)
+            self.stockwell_fmax_spin.blockSignals(True)
+            self.stockwell_threshold_k_spin.blockSignals(True)
 
-            self.aperture_spin.setValue(preset["aperture"])
-            self.tfdenoise_fmin_spin.setValue(preset["fmin"])
-            self.tfdenoise_fmax_spin.setValue(preset["fmax"])
-            self.threshold_k_spin.setValue(preset["k"])
+            self.stockwell_aperture_spin.setValue(preset["aperture"])
+            self.stockwell_fmin_spin.setValue(preset["fmin"])
+            self.stockwell_fmax_spin.setValue(preset["fmax"])
+            self.stockwell_threshold_k_spin.setValue(preset["k"])
 
-            self.aperture_spin.blockSignals(False)
-            self.tfdenoise_fmin_spin.blockSignals(False)
-            self.tfdenoise_fmax_spin.blockSignals(False)
-            self.threshold_k_spin.blockSignals(False)
+            self.stockwell_aperture_spin.blockSignals(False)
+            self.stockwell_fmin_spin.blockSignals(False)
+            self.stockwell_fmax_spin.blockSignals(False)
+            self.stockwell_threshold_k_spin.blockSignals(False)
+
+    def _on_stft_preset_changed(self, index: int):
+        """Handle STFT Denoise preset change."""
+        # Preset configurations
+        presets = {
+            0: {"aperture": 11, "fmin": 5.0, "fmax": 30.0, "k": 2.5, "nperseg": 64},  # Low-Freq Noise
+            1: {"aperture": 15, "fmin": 5.0, "fmax": 150.0, "k": 3.5, "nperseg": 64},  # White Noise
+            2: {"aperture": 7, "fmin": 50.0, "fmax": 150.0, "k": 3.0, "nperseg": 32},  # High-Freq Noise
+            3: {"aperture": 9, "fmin": 10.0, "fmax": 100.0, "k": 2.0, "nperseg": 64},  # Conservative
+        }
+
+        if index < 4:  # Not Custom
+            preset = presets[index]
+            self.stft_aperture_spin.blockSignals(True)
+            self.stft_fmin_spin.blockSignals(True)
+            self.stft_fmax_spin.blockSignals(True)
+            self.stft_threshold_k_spin.blockSignals(True)
+            self.stft_nperseg_spin.blockSignals(True)
+
+            self.stft_aperture_spin.setValue(preset["aperture"])
+            self.stft_fmin_spin.setValue(preset["fmin"])
+            self.stft_fmax_spin.setValue(preset["fmax"])
+            self.stft_threshold_k_spin.setValue(preset["k"])
+            self.stft_nperseg_spin.setValue(preset["nperseg"])
+
+            self.stft_aperture_spin.blockSignals(False)
+            self.stft_fmin_spin.blockSignals(False)
+            self.stft_fmax_spin.blockSignals(False)
+            self.stft_threshold_k_spin.blockSignals(False)
+            self.stft_nperseg_spin.blockSignals(False)
 
     def _on_apply_clicked(self):
         """Handle apply button click."""
@@ -1371,7 +2137,7 @@ class ControlPanel(QWidget):
                 )
                 print(f"✓ Using Bandpass Filter")
 
-            elif algo_index == 1:  # TF-Denoise
+            elif algo_index == 1:  # Stockwell Transform (ST)
                 # Check if GPU should be used
                 use_gpu = (
                     GPU_AVAILABLE and
@@ -1381,51 +2147,98 @@ class ControlPanel(QWidget):
 
                 # Get threshold mode from combo box
                 threshold_mode_map = {
-                    0: 'adaptive',  # Adaptive (Recommended)
-                    1: 'hard',      # Hard (Full Removal)
-                    2: 'scaled',    # Scaled (Progressive)
-                    3: 'soft'       # Soft (Legacy)
+                    0: 'adaptive',
+                    1: 'hard',
+                    2: 'scaled',
+                    3: 'soft'
                 }
                 threshold_mode = threshold_mode_map.get(
-                    self.threshold_mode_combo.currentIndex(), 'adaptive'
+                    self.stockwell_threshold_mode_combo.currentIndex(), 'adaptive'
                 )
 
                 # Get low-amplitude protection setting
-                low_amp_protection = self.low_amp_protection_checkbox.isChecked()
+                low_amp_protection = self.stockwell_low_amp_checkbox.isChecked()
 
                 if use_gpu:
-                    # Use GPU-accelerated version
+                    # Use GPU-accelerated version (S-Transform)
                     processor = TFDenoiseGPU(
-                        aperture=self.aperture_spin.value(),
-                        fmin=self.tfdenoise_fmin_spin.value(),
-                        fmax=self.tfdenoise_fmax_spin.value(),
-                        threshold_k=self.threshold_k_spin.value(),
-                        threshold_type=self.threshold_type_combo.currentText().lower(),
+                        aperture=self.stockwell_aperture_spin.value(),
+                        fmin=self.stockwell_fmin_spin.value(),
+                        fmax=self.stockwell_fmax_spin.value(),
+                        threshold_k=self.stockwell_threshold_k_spin.value(),
+                        threshold_type='soft',
                         threshold_mode=threshold_mode,
-                        transform_type=self.transform_type_combo.currentText().lower().replace("-", ""),
+                        transform_type='stransform',
                         use_gpu='auto',
                         low_amp_protection=low_amp_protection,
                         device_manager=self.device_manager
                     )
-                    print(f"✓ Using GPU-accelerated TF-Denoise: {self.device_manager.get_device_name()}")
-                    print(f"  Threshold mode: {threshold_mode}, Low-amp protection: {low_amp_protection}")
+                    print(f"✓ Using GPU Stockwell (S-Transform): {self.device_manager.get_device_name()}")
                 else:
-                    # Use CPU version
-                    from processors.tf_denoise import TFDenoise
-                    processor = TFDenoise(
-                        aperture=self.aperture_spin.value(),
-                        fmin=self.tfdenoise_fmin_spin.value(),
-                        fmax=self.tfdenoise_fmax_spin.value(),
-                        threshold_k=self.threshold_k_spin.value(),
-                        threshold_type=self.threshold_type_combo.currentText().lower(),
+                    # Use CPU Stockwell processor
+                    processor = StockwellDenoise(
+                        aperture=self.stockwell_aperture_spin.value(),
+                        fmin=self.stockwell_fmin_spin.value(),
+                        fmax=self.stockwell_fmax_spin.value(),
+                        threshold_k=self.stockwell_threshold_k_spin.value(),
                         threshold_mode=threshold_mode,
-                        transform_type=self.transform_type_combo.currentText().lower().replace("-", ""),
                         low_amp_protection=low_amp_protection
                     )
-                    print(f"✓ Using CPU TF-Denoise")
-                    print(f"  Threshold mode: {threshold_mode}, Low-amp protection: {low_amp_protection}")
+                    print(f"✓ Using CPU Stockwell (S-Transform) Denoise")
+                print(f"  Threshold mode: {threshold_mode}, Low-amp protection: {low_amp_protection}")
 
-            elif algo_index == 2:  # DWT-Denoise
+            elif algo_index == 2:  # STFT Denoise
+                # Check if GPU should be used
+                use_gpu = (
+                    GPU_AVAILABLE and
+                    self.gpu_checkbox is not None and
+                    self.gpu_checkbox.isChecked()
+                )
+
+                # Get threshold mode from combo box
+                threshold_mode_map = {
+                    0: 'adaptive',
+                    1: 'hard',
+                    2: 'scaled',
+                    3: 'soft'
+                }
+                threshold_mode = threshold_mode_map.get(
+                    self.stft_threshold_mode_combo.currentIndex(), 'adaptive'
+                )
+
+                # Get low-amplitude protection setting
+                low_amp_protection = self.stft_low_amp_checkbox.isChecked()
+
+                if use_gpu:
+                    # Use GPU-accelerated version (STFT)
+                    processor = TFDenoiseGPU(
+                        aperture=self.stft_aperture_spin.value(),
+                        fmin=self.stft_fmin_spin.value(),
+                        fmax=self.stft_fmax_spin.value(),
+                        threshold_k=self.stft_threshold_k_spin.value(),
+                        threshold_type='soft',
+                        threshold_mode=threshold_mode,
+                        transform_type='stft',
+                        use_gpu='auto',
+                        low_amp_protection=low_amp_protection,
+                        device_manager=self.device_manager
+                    )
+                    print(f"✓ Using GPU STFT Denoise: {self.device_manager.get_device_name()}")
+                else:
+                    # Use CPU STFT processor
+                    processor = STFTDenoise(
+                        aperture=self.stft_aperture_spin.value(),
+                        fmin=self.stft_fmin_spin.value(),
+                        fmax=self.stft_fmax_spin.value(),
+                        nperseg=self.stft_nperseg_spin.value(),
+                        threshold_k=self.stft_threshold_k_spin.value(),
+                        threshold_mode=threshold_mode,
+                        low_amp_protection=low_amp_protection
+                    )
+                    print(f"✓ Using CPU STFT Denoise (window={self.stft_nperseg_spin.value()})")
+                print(f"  Threshold mode: {threshold_mode}, Low-amp protection: {low_amp_protection}")
+
+            elif algo_index == 3:  # DWT-Denoise
                 # Get wavelet name from combo box text
                 wavelet_map = {
                     0: 'db4',
@@ -1441,12 +2254,18 @@ class ControlPanel(QWidget):
                 transform_map = {
                     0: 'dwt',
                     1: 'swt',
-                    2: 'dwt_spatial'
+                    2: 'dwt_spatial',
+                    3: 'wpt',
+                    4: 'wpt_spatial'
                 }
                 transform_type = transform_map.get(self.dwt_transform_combo.currentIndex(), 'dwt')
 
                 # Get threshold mode
                 threshold_mode = 'soft' if self.dwt_threshold_mode_combo.currentIndex() == 0 else 'hard'
+
+                # Get best-basis setting (only for WPT modes)
+                best_basis = (transform_type in ['wpt', 'wpt_spatial'] and
+                             self.dwt_best_basis_checkbox.isChecked())
 
                 processor = DWTDenoise(
                     wavelet=wavelet,
@@ -1454,10 +2273,147 @@ class ControlPanel(QWidget):
                     threshold_k=self.dwt_threshold_k_spin.value(),
                     threshold_mode=threshold_mode,
                     transform_type=transform_type,
-                    aperture=self.dwt_aperture_spin.value()
+                    aperture=self.dwt_aperture_spin.value(),
+                    best_basis=best_basis
                 )
                 print(f"✓ Using DWT-Denoise ({transform_type.upper()})")
-                print(f"  Wavelet: {wavelet}, Level: {self.dwt_level_spin.value()}, k={self.dwt_threshold_k_spin.value()}")
+                extra_info = ", best-basis" if best_basis else ""
+                print(f"  Wavelet: {wavelet}, Level: {self.dwt_level_spin.value()}, k={self.dwt_threshold_k_spin.value()}{extra_info}")
+
+            elif algo_index == 4:  # Gabor Transform
+                # Get sigma (0 = auto/None)
+                sigma_value = self.gabor_sigma_spin.value()
+                sigma = sigma_value if sigma_value > 0 else None
+
+                # Get threshold mode
+                threshold_mode = 'soft' if self.gabor_threshold_mode_combo.currentIndex() == 0 else 'hard'
+
+                processor = GaborDenoise(
+                    aperture=self.gabor_aperture_spin.value(),
+                    fmin=self.gabor_fmin_spin.value(),
+                    fmax=self.gabor_fmax_spin.value(),
+                    threshold_k=self.gabor_threshold_k_spin.value(),
+                    threshold_mode=threshold_mode,
+                    window_size=self.gabor_window_spin.value(),
+                    sigma=sigma,
+                    overlap_percent=float(self.gabor_overlap_spin.value()),
+                    low_amp_protection=self.gabor_low_amp_checkbox.isChecked()
+                )
+                sigma_str = f"sigma={sigma:.1f}" if sigma else "sigma=auto"
+                print(f"✓ Using Gabor Transform Denoise")
+                print(f"  Window: {self.gabor_window_spin.value()}, {sigma_str}, Overlap: {self.gabor_overlap_spin.value()}%")
+                print(f"  Freq: {self.gabor_fmin_spin.value()}-{self.gabor_fmax_spin.value()}Hz, k={self.gabor_threshold_k_spin.value()}")
+
+            elif algo_index == 5:  # EMD Decomposition
+                # Get method
+                method_map = {0: 'emd', 1: 'eemd', 2: 'ceemdan'}
+                method = method_map.get(self.emd_method_combo.currentIndex(), 'eemd')
+
+                # Get removal strategy
+                remove_map = {
+                    0: 'first',
+                    1: 'first_2',
+                    2: 'first_3',
+                    3: 'last',
+                    4: 'last_2',
+                    5: [self.emd_custom_edit.value()]  # Custom
+                }
+                remove_imfs = remove_map.get(self.emd_remove_combo.currentIndex(), 'first')
+
+                processor = EMDDenoise(
+                    method=method,
+                    remove_imfs=remove_imfs,
+                    ensemble_size=self.emd_ensemble_spin.value(),
+                    noise_amplitude=self.emd_noise_spin.value()
+                )
+                print(f"✓ Using EMD Decomposition ({method.upper()})")
+                print(f"  Remove: {remove_imfs}, Ensemble: {self.emd_ensemble_spin.value()}")
+
+            elif algo_index == 6:  # OMP Sparse Denoise
+                # Get dictionary type
+                dict_map = {
+                    0: 'dct',
+                    1: 'dft',
+                    2: 'gabor',
+                    3: 'wavelet',
+                    4: 'hybrid'
+                }
+                dictionary_type = dict_map.get(self.omp_dict_combo.currentIndex(), 'wavelet')
+
+                # Get processing mode
+                mode_map = {0: 'patch', 1: 'spatial', 2: 'adaptive'}
+                denoise_mode = mode_map.get(self.omp_mode_combo.currentIndex(), 'adaptive')
+
+                # Get noise estimation method
+                noise_map = {0: 'none', 1: 'mad_diff', 2: 'mad_residual', 3: 'wavelet'}
+                noise_estimation = noise_map.get(self.omp_noise_combo.currentIndex(), 'mad_diff')
+
+                # Get adaptive sparsity setting
+                adaptive_sparsity = self.omp_adaptive_checkbox.isChecked()
+
+                # Get aperture (ensure odd)
+                aperture = self.omp_aperture_spin.value()
+                if aperture % 2 == 0:
+                    aperture += 1  # Make it odd
+
+                processor = OMPDenoise(
+                    patch_size=self.omp_patch_spin.value(),
+                    overlap=self.omp_overlap_spin.value(),
+                    sparsity=self.omp_sparsity_spin.value(),
+                    residual_tol=self.omp_tol_spin.value(),
+                    dictionary_type=dictionary_type,
+                    aperture=aperture,
+                    denoise_mode=denoise_mode,
+                    noise_estimation=noise_estimation,
+                    adaptive_sparsity=adaptive_sparsity
+                )
+                print(f"✓ Using OMP Sparse Denoise ({dictionary_type.upper()} dictionary)")
+                print(f"  Patch: {self.omp_patch_spin.value()}, Sparsity: {self.omp_sparsity_spin.value()} atoms")
+                print(f"  Mode: {denoise_mode}, Noise: {noise_estimation}, Adaptive: {adaptive_sparsity}")
+                print(f"  Aperture: {aperture}")
+
+            elif algo_index == 7:  # 3D Spatial Denoise
+                from processors.denoise_3d import Denoise3D
+
+                # Get header keys from combo data (actual header name, not display text)
+                inline_key = self.denoise3d_inline_combo.currentData()
+                xline_key = self.denoise3d_xline_combo.currentData()
+
+                if not inline_key or not xline_key:
+                    print("Error: Please select valid header keys for 3D volume")
+                    return
+
+                if inline_key == xline_key:
+                    print("Error: Inline and Crossline keys must be different")
+                    return
+
+                # Get apertures (ensure odd)
+                ap_inline = self.denoise3d_ap_inline_spin.value()
+                if ap_inline > 1 and ap_inline % 2 == 0:
+                    ap_inline += 1
+
+                ap_xline = self.denoise3d_ap_xline_spin.value()
+                if ap_xline > 1 and ap_xline % 2 == 0:
+                    ap_xline += 1
+
+                # Get DWT parameters
+                wavelet = self.denoise3d_wavelet_combo.currentText()
+                threshold_k = self.denoise3d_k_spin.value()
+                threshold_mode = self.denoise3d_mode_combo.currentText()
+
+                processor = Denoise3D(
+                    inline_key=inline_key,
+                    xline_key=xline_key,
+                    aperture_inline=ap_inline,
+                    aperture_xline=ap_xline,
+                    wavelet=wavelet,
+                    threshold_k=threshold_k,
+                    threshold_mode=threshold_mode
+                )
+                print(f"✓ Using 3D Spatial Denoise")
+                print(f"  Volume: {inline_key} × {xline_key}")
+                print(f"  Aperture: {ap_inline}×{ap_xline}, Wavelet: {wavelet}")
+                print(f"  k={threshold_k}, mode={threshold_mode}")
 
             else:
                 # Other algorithms not handled here (FK, FKK, PSTM have their own handlers)
@@ -1588,6 +2544,97 @@ class ControlPanel(QWidget):
             sort_text = "Sort: None"
 
         self.current_sort_label.setText(sort_text)
+
+    def set_available_3d_headers(self, headers_with_counts: list):
+        """
+        Populate the 3D denoise header dropdowns with available headers.
+
+        Args:
+            headers_with_counts: List of tuples (header_name, unique_count)
+                                 sorted by relevance/unique count
+        """
+        # Store for status updates
+        self._denoise3d_header_counts = {h: c for h, c in headers_with_counts}
+
+        # Block signals during update
+        self.denoise3d_inline_combo.blockSignals(True)
+        self.denoise3d_xline_combo.blockSignals(True)
+
+        self.denoise3d_inline_combo.clear()
+        self.denoise3d_xline_combo.clear()
+
+        if not headers_with_counts:
+            self.denoise3d_inline_combo.addItem("(no headers available)")
+            self.denoise3d_xline_combo.addItem("(no headers available)")
+            self.denoise3d_status_label.setText("Load a dataset with headers")
+            self.denoise3d_inline_combo.blockSignals(False)
+            self.denoise3d_xline_combo.blockSignals(False)
+            return
+
+        # Add headers with unique count info
+        for header, count in headers_with_counts:
+            display = f"{header} ({count} unique)"
+            self.denoise3d_inline_combo.addItem(display, header)
+            self.denoise3d_xline_combo.addItem(display, header)
+
+        # Set smart defaults for inline (source-related headers)
+        inline_defaults = ['sin', 's_line', 'field_record', 'FFID', 'source_x',
+                          'SourceLine', 'CDP', 'inline']
+        for default in inline_defaults:
+            idx = self.denoise3d_inline_combo.findData(default)
+            if idx >= 0:
+                self.denoise3d_inline_combo.setCurrentIndex(idx)
+                break
+
+        # Set smart defaults for crossline (receiver-related headers)
+        xline_defaults = ['rec_sloc', 'trace_number', 'Channel', 'receiver_x',
+                         'ReceiverStation', 'crossline', 'trace_number_cdp']
+        for default in xline_defaults:
+            idx = self.denoise3d_xline_combo.findData(default)
+            if idx >= 0:
+                self.denoise3d_xline_combo.setCurrentIndex(idx)
+                break
+
+        # If same selection, pick different for crossline
+        if self.denoise3d_xline_combo.currentIndex() == self.denoise3d_inline_combo.currentIndex():
+            for i in range(self.denoise3d_xline_combo.count()):
+                if i != self.denoise3d_inline_combo.currentIndex():
+                    self.denoise3d_xline_combo.setCurrentIndex(i)
+                    break
+
+        self.denoise3d_inline_combo.blockSignals(False)
+        self.denoise3d_xline_combo.blockSignals(False)
+
+        # Update status
+        self._update_denoise3d_status()
+
+    def _update_denoise3d_status(self):
+        """Update the 3D denoise status label with volume size estimate."""
+        inline_key = self.denoise3d_inline_combo.currentData()
+        xline_key = self.denoise3d_xline_combo.currentData()
+
+        if not hasattr(self, '_denoise3d_header_counts'):
+            return
+
+        counts = self._denoise3d_header_counts
+
+        if inline_key and xline_key and inline_key in counts and xline_key in counts:
+            n_inline = counts[inline_key]
+            n_xline = counts[xline_key]
+            grid_size = n_inline * n_xline
+
+            if inline_key == xline_key:
+                self.denoise3d_status_label.setText(
+                    "⚠ Inline and Crossline must be different!"
+                )
+                self.denoise3d_status_label.setStyleSheet("color: red; font-size: 10px;")
+            else:
+                self.denoise3d_status_label.setText(
+                    f"Volume grid: {n_inline} × {n_xline} = {grid_size:,} positions"
+                )
+                self.denoise3d_status_label.setStyleSheet("color: #888; font-size: 10px;")
+        else:
+            self.denoise3d_status_label.setText("")
 
     # FK Filter event handlers
 

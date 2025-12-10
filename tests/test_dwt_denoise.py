@@ -267,5 +267,163 @@ class TestDWTDenoiseEdgeCases:
         assert np.sqrt(np.mean(result.traces**2)) < np.sqrt(np.mean(noise_only**2))
 
 
+class TestWPTDenoise:
+    """Tests for Wavelet Packet Transform denoising."""
+
+    def test_wpt_mode_runs(self):
+        """Test that WPT mode processes without error."""
+        clean, noisy, _ = create_test_data(n_samples=512, n_traces=10)
+
+        processor = DWTDenoise(
+            wavelet='db4',
+            threshold_k=3.0,
+            transform_type='wpt',
+            level=4
+        )
+
+        data = SeismicData(traces=noisy, sample_rate=2.0)
+        result = processor.process(data)
+
+        assert result.traces.shape == noisy.shape
+        assert not np.allclose(result.traces, noisy)
+
+    def test_wpt_spatial_mode_runs(self):
+        """Test that WPT spatial mode processes without error."""
+        clean, noisy, _ = create_test_data(n_samples=512, n_traces=15)
+
+        processor = DWTDenoise(
+            wavelet='db4',
+            threshold_k=3.0,
+            transform_type='wpt_spatial',
+            aperture=5,
+            level=4
+        )
+
+        data = SeismicData(traces=noisy, sample_rate=2.0)
+        result = processor.process(data)
+
+        assert result.traces.shape == noisy.shape
+
+    def test_wpt_best_basis(self):
+        """Test WPT with best-basis selection."""
+        clean, noisy, _ = create_test_data(n_samples=512, n_traces=10)
+
+        processor = DWTDenoise(
+            wavelet='db4',
+            threshold_k=3.0,
+            transform_type='wpt',
+            level=4,
+            best_basis=True
+        )
+
+        data = SeismicData(traces=noisy, sample_rate=2.0)
+        result = processor.process(data)
+
+        assert result.traces.shape == noisy.shape
+
+    def test_wpt_snr_improvement(self):
+        """Test that WPT improves SNR."""
+        clean, noisy, noise = create_test_data(n_samples=512, noise_level=0.08)
+
+        processor = DWTDenoise(
+            wavelet='db4',
+            threshold_k=2.5,
+            transform_type='wpt',
+            level=4
+        )
+        data = SeismicData(traces=noisy, sample_rate=2.0)
+        result = processor.process(data)
+
+        input_snr = 10 * np.log10(np.mean(clean**2) / np.mean(noise**2))
+        error = clean - result.traces
+        output_snr = 10 * np.log10(np.mean(clean**2) / np.mean(error**2))
+
+        assert output_snr > input_snr, f"WPT should improve SNR: {input_snr:.1f} -> {output_snr:.1f} dB"
+
+    def test_wpt_vs_dwt_comparison(self):
+        """Compare WPT and DWT results."""
+        clean, noisy, _ = create_test_data(n_samples=512, n_traces=10, noise_level=0.1)
+
+        # DWT
+        dwt_proc = DWTDenoise(wavelet='db4', threshold_k=3.0, transform_type='dwt')
+        dwt_result = dwt_proc.process(SeismicData(traces=noisy.copy(), sample_rate=2.0))
+
+        # WPT
+        wpt_proc = DWTDenoise(wavelet='db4', threshold_k=3.0, transform_type='wpt', level=4)
+        wpt_result = wpt_proc.process(SeismicData(traces=noisy.copy(), sample_rate=2.0))
+
+        # Both should produce valid output
+        assert dwt_result.traces.shape == noisy.shape
+        assert wpt_result.traces.shape == noisy.shape
+
+        # Results should differ (WPT uses full tree)
+        assert not np.allclose(dwt_result.traces, wpt_result.traces)
+
+    def test_wpt_frequency_selectivity(self):
+        """Test WPT with narrowband signal produces valid output."""
+        np.random.seed(42)
+        n_samples = 512
+        n_traces = 5
+        sample_rate = 2.0  # ms
+        fs = 1000.0 / sample_rate  # Hz
+
+        t = np.arange(n_samples) / fs
+
+        # Create narrowband signal (40 Hz)
+        clean = np.zeros((n_samples, n_traces))
+        for i in range(n_traces):
+            clean[:, i] = np.sin(2 * np.pi * 40 * t)
+
+        # Add broadband noise
+        noise = np.random.randn(n_samples, n_traces) * 0.5  # Higher noise
+        noisy = clean + noise
+
+        processor = DWTDenoise(
+            wavelet='db4',
+            threshold_k=3.0,  # More aggressive threshold
+            transform_type='wpt',
+            level=5
+        )
+        data = SeismicData(traces=noisy, sample_rate=sample_rate)
+        result = processor.process(data)
+
+        # WPT should produce valid output with high correlation to clean
+        output_corr = np.corrcoef(clean.flatten(), result.traces.flatten())[0, 1]
+        assert output_corr > 0.7, f"Output should correlate well with clean signal: {output_corr:.3f}"
+
+        # Energy should be reduced (noise attenuated)
+        input_energy = np.mean(noisy ** 2)
+        output_energy = np.mean(result.traces ** 2)
+        assert output_energy < input_energy, "WPT should reduce energy (attenuate noise)"
+
+
+class TestWPTDescription:
+    """Tests for WPT processor descriptions."""
+
+    def test_wpt_description(self):
+        """Test WPT description format."""
+        processor = DWTDenoise(
+            wavelet='db4',
+            threshold_k=3.0,
+            transform_type='wpt'
+        )
+        desc = processor.get_description()
+
+        assert 'WPT' in desc
+        assert 'db4' in desc
+
+    def test_wpt_best_basis_description(self):
+        """Test best-basis appears in description."""
+        processor = DWTDenoise(
+            wavelet='db4',
+            threshold_k=3.0,
+            transform_type='wpt',
+            best_basis=True
+        )
+        desc = processor.get_description()
+
+        assert 'best-basis' in desc
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
