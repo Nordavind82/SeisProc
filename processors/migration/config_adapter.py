@@ -51,6 +51,7 @@ class MigrationParams:
     use_time_domain: bool = False
     use_kdtree: bool = False
     sample_batch_size: int = 200
+    max_traces_per_tile: int = 5000
 
 
 class ConfigAdapter:
@@ -141,12 +142,13 @@ class ConfigAdapter:
         use_time_domain = cfg.get('use_time_domain', False)
         use_kdtree = cfg.get('use_kdtree', False)
         sample_batch_size = cfg.get('sample_batch_size', 200)
+        max_traces_per_tile = cfg.get('max_traces_per_tile', 5000)
 
         logger.info(f"ConfigAdapter extracted params: "
                    f"grid={n_il}x{n_xl}, dt={dt_ms}ms, v={velocity_mps}m/s, "
                    f"aperture={max_aperture_m}m, angle={max_angle_deg}°")
         logger.info(f"  Advanced: tile_size={tile_size}, time_domain={use_time_domain}, "
-                   f"kdtree={use_kdtree}, sample_batch={sample_batch_size}")
+                   f"kdtree={use_kdtree}, sample_batch={sample_batch_size}, max_traces={max_traces_per_tile}")
 
         return MigrationParams(
             origin_x=origin_x,
@@ -166,6 +168,7 @@ class ConfigAdapter:
             use_time_domain=use_time_domain,
             use_kdtree=use_kdtree,
             sample_batch_size=sample_batch_size,
+            max_traces_per_tile=max_traces_per_tile,
         )
 
     def get_engine_params(

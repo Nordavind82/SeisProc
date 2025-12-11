@@ -349,6 +349,8 @@ class MigrationWorker(QThread):
                                 max_aperture_m=engine_params['max_aperture_m'],
                                 max_angle_deg=engine_params['max_angle_deg'],
                                 tile_size=p.tile_size,
+                                sample_batch_size=p.sample_batch_size,
+                                max_traces_per_tile=p.max_traces_per_tile,
                                 normalize=False,
                                 progress_callback=engine_progress,
                                 enable_profiling=True,

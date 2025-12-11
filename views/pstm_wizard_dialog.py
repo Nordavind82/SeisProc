@@ -126,6 +126,7 @@ class PSTMWizard(QWizard):
             'use_kdtree': False,
             'use_time_dependent_aperture': True,
             'sample_batch_size': 200,
+            'max_traces_per_tile': 5000,
             # Header mapping
             'header_mapping': {},
         }
@@ -244,6 +245,7 @@ class PSTMWizard(QWizard):
         self._config['use_kdtree'] = self.advanced_page.kdtree_check.isChecked()
         self._config['use_time_dependent_aperture'] = self.advanced_page.time_dep_aperture_check.isChecked()
         self._config['sample_batch_size'] = self.advanced_page.sample_batch_spin.value()
+        self._config['max_traces_per_tile'] = self.advanced_page.max_traces_spin.value()
 
         # Header mapping
         self._config['header_mapping'] = self.header_page.get_mapping()
@@ -1958,9 +1960,23 @@ class AdvancedOptionsPage(QWizardPage):
         self.sample_batch_spin.setSingleStep(50)
         self.sample_batch_spin.setToolTip(
             "For time-domain mode: samples processed per batch.\n"
-            "Larger = faster but more memory."
+            "Larger = faster but more memory.\n"
+            "Recommended: 100-200 for 16GB, 200-400 for 48GB+"
         )
         perf_layout.addWidget(self.sample_batch_spin, 4, 1)
+
+        # Max traces per tile
+        perf_layout.addWidget(QLabel("Max Traces/Tile:"), 5, 0)
+        self.max_traces_spin = QSpinBox()
+        self.max_traces_spin.setRange(1000, 20000)
+        self.max_traces_spin.setValue(5000)
+        self.max_traces_spin.setSingleStep(1000)
+        self.max_traces_spin.setToolTip(
+            "Maximum traces processed per output tile.\n"
+            "More traces = better accuracy but more memory.\n"
+            "Recommended: 3000 for 16GB, 5000-10000 for 48GB+"
+        )
+        perf_layout.addWidget(self.max_traces_spin, 5, 1)
 
         layout.addWidget(perf_group)
 

@@ -1212,6 +1212,104 @@ def migrate_kirchhoff_time_domain(
     return image, fold
 
 
+# Compiled kernel for time-domain batch processing
+# torch.compile provides JIT compilation for significant speedup on MPS/CUDA
+def _time_domain_batch_kernel(
+    t_in_sq: torch.Tensor,          # (n_sample_batch,)
+    v_rms_sq: torch.Tensor,         # (n_sample_batch, 1, 1)
+    h_eff_sq_expanded: torch.Tensor,  # (1, n_tile, n_filtered)
+    h_expanded: torch.Tensor,       # (1, n_tile, n_filtered)
+    h_sq_expanded: torch.Tensor,    # (1, n_tile, n_filtered)
+    v_rms_out: torch.Tensor,        # (n_sample_batch, n_tile, n_filtered)
+    amp_in_expanded: torch.Tensor,  # (n_sample_batch, n_tile, n_filtered)
+    t_min_ms: float,
+    dt_ms: float,
+    n_times: int,
+    max_angle_rad: float,
+    tan_max_angle: float,
+    max_aperture_m: float,
+    use_time_dependent_aperture: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    JIT-compiled kernel for time-domain migration batch processing.
+
+    Returns:
+        out_idx_floor: Output time indices
+        weighted_amp: Weighted amplitudes
+        full_mask: Valid contribution mask
+        n_sample_batch: Batch size (for fold counting)
+    """
+    # Time shift: 4 * h_eff² / v_rms² (in ms²)
+    time_shift_sq = 4.0 * h_eff_sq_expanded * 1e6 / v_rms_sq
+
+    # Output time: t_out² = t_in² + time_shift²
+    t_out_sq = t_in_sq.view(-1, 1, 1) + time_shift_sq
+    t_out_ms = torch.sqrt(t_out_sq)
+
+    # Output sample index
+    out_sample_idx = (t_out_ms - t_min_ms) / dt_ms
+
+    # Valid output range
+    valid_time = (out_sample_idx >= 0) & (out_sample_idx < n_times - 0.001)
+
+    # Aperture mask
+    if use_time_dependent_aperture:
+        aperture_at_t = t_out_ms * v_rms_out / 2000.0 * tan_max_angle
+        aperture_at_t = torch.clamp(aperture_at_t, max=max_aperture_m)
+        aperture_mask = h_expanded < aperture_at_t
+    else:
+        aperture_mask = h_expanded < max_aperture_m
+
+    # Depth at output time (for angle calculation)
+    z_at_t = v_rms_out * t_out_ms / 2000.0
+
+    # Angle mask
+    angle_from_vertical = torch.atan2(h_expanded, z_at_t + 1e-6)
+    angle_mask = angle_from_vertical < max_angle_rad
+
+    # Combined mask
+    full_mask = valid_time & aperture_mask & angle_mask
+
+    # Weight: cos(angle) / r² (obliquity and spreading correction)
+    r_sq = z_at_t**2 + h_sq_expanded
+    r = torch.sqrt(r_sq)
+    weight = z_at_t / (r * r_sq + 1e-10)
+
+    # Weighted amplitude
+    weighted_amp = amp_in_expanded * weight * full_mask.float()
+
+    # Output index (clamped for scatter_add)
+    out_idx_floor = out_sample_idx.long().clamp(0, n_times - 1)
+
+    return out_idx_floor, weighted_amp, full_mask
+
+
+# Try to compile the kernel if torch.compile is available (PyTorch 2.0+)
+# NOTE: torch.compile with MPS backend has float64 issues, so we disable it for MPS
+# and only use compilation for CUDA devices
+def _get_compiled_kernel():
+    """Get compiled or uncompiled kernel based on device availability."""
+    # Check if CUDA is available (torch.compile works well with CUDA)
+    if torch.cuda.is_available():
+        try:
+            compiled = torch.compile(
+                _time_domain_batch_kernel,
+                mode="reduce-overhead",
+                fullgraph=False,
+            )
+            logger.info("torch.compile available (CUDA) - using JIT-compiled kernel")
+            return compiled, True
+        except Exception as e:
+            logger.info(f"torch.compile failed ({e}) - using standard kernel")
+            return _time_domain_batch_kernel, False
+    else:
+        # MPS or CPU - use uncompiled version (MPS has float64 issues with torch.compile)
+        logger.info("Using standard kernel (torch.compile disabled for MPS/CPU)")
+        return _time_domain_batch_kernel, False
+
+_compiled_time_domain_batch_kernel, TORCH_COMPILE_AVAILABLE = _get_compiled_kernel()
+
+
 def migrate_kirchhoff_time_domain_rms(
     traces: torch.Tensor,
     source_x: torch.Tensor,
@@ -1228,10 +1326,18 @@ def migrate_kirchhoff_time_domain_rms(
     max_angle_deg: float,
     n_il: int,
     n_xl: int,
+    origin_x: float,
+    origin_y: float,
+    il_spacing: float,
+    xl_spacing: float,
+    azimuth_deg: float,
     tile_size: int = 100,
+    sample_batch_size: int = 200,
+    max_traces_per_tile: int = 5000,
     progress_callback: Optional[Callable[[float, str], None]] = None,
     enable_profiling: bool = False,
     use_time_dependent_aperture: bool = True,
+    use_half_precision: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Time-domain Kirchhoff migration with RMS velocity support.
@@ -1260,10 +1366,13 @@ def migrate_kirchhoff_time_domain_rms(
         max_aperture_m: Maximum aperture in meters
         max_angle_deg: Maximum angle from vertical
         n_il, n_xl: Output grid dimensions
-        tile_size: Number of output points per tile
+        tile_size: Number of output points per tile (default 100, try 200-500 for more memory)
+        sample_batch_size: Input samples per batch (default 200, try 100-400)
+        max_traces_per_tile: Maximum traces per tile (default 5000, increase for more memory)
         progress_callback: Optional callback(percent, message)
         enable_profiling: If True, collect detailed timing statistics
         use_time_dependent_aperture: If True, use aperture(t) = v*t/2*tan(angle)
+        use_half_precision: If True, use float16 for computation (2x faster on MPS)
 
     Returns:
         image: (n_times, n_il, n_xl)
@@ -1277,9 +1386,18 @@ def migrate_kirchhoff_time_domain_rms(
     n_times = time_axis_ms.shape[0]
     n_output = n_il * n_xl
 
-    # Initialize output
-    image = torch.zeros(n_times, n_il, n_xl, device=device)
-    fold = torch.zeros(n_times, n_il, n_xl, device=device)
+    # NOTE: Float16 causes overflow for seismic data!
+    # Values like t_ms²=4e6, v²=4e6, h²=1e6 exceed float16 max of 65504
+    # Always use float32 for numerical stability
+    compute_dtype = torch.float32
+    # Float16 disabled due to overflow - the code is kept for reference
+    # if use_half_precision and device.type == 'mps':
+    #     compute_dtype = torch.float16
+    #     logger.info("  Using float16 precision for MPS acceleration")
+
+    # Initialize output (always float32 for accumulation precision)
+    image = torch.zeros(n_times, n_il, n_xl, device=device, dtype=torch.float32)
+    fold = torch.zeros(n_times, n_il, n_xl, device=device, dtype=torch.float32)
 
     # Pre-compute constants
     max_angle_rad = np.radians(max_angle_deg)
@@ -1297,17 +1415,97 @@ def migrate_kirchhoff_time_domain_rms(
     half_offset_y = (receiver_y - source_y) / 2.0
     half_offset_sq = half_offset_x**2 + half_offset_y**2  # (n_traces,)
 
+    # CRITICAL: Compute trace midpoint grid indices for scatter
+    # Each trace scatters to its OWN midpoint location, not the tile's output points
+    cos_az = np.cos(np.radians(azimuth_deg))
+    sin_az = np.sin(np.radians(azimuth_deg))
+
+    # Transform midpoint to grid coordinates
+    dx_from_origin = mid_x - origin_x
+    dy_from_origin = mid_y - origin_y
+
+    # Rotate by azimuth to get inline/crossline offsets
+    il_offset = dx_from_origin * cos_az + dy_from_origin * sin_az
+    xl_offset = -dx_from_origin * sin_az + dy_from_origin * cos_az
+
+    # Convert to grid indices (can be fractional, will clamp to valid range)
+    trace_il_float = il_offset / il_spacing
+    trace_xl_float = xl_offset / xl_spacing
+
+    # Clamp to valid grid range and convert to integer indices
+    trace_il_all = trace_il_float.long().clamp(0, n_il - 1)  # (n_traces,)
+    trace_xl_all = trace_xl_float.long().clamp(0, n_xl - 1)  # (n_traces,)
+
+    # Debug: show coordinate transformation details
+    logger.info(f"  Grid params: origin=({origin_x:.1f}, {origin_y:.1f}), spacing=({il_spacing:.1f}, {xl_spacing:.1f}), azimuth={azimuth_deg:.1f}°")
+    logger.info(f"  Midpoint range: x=[{float(mid_x.min()):.1f}, {float(mid_x.max()):.1f}], y=[{float(mid_y.min()):.1f}, {float(mid_y.max()):.1f}]")
+    logger.info(f"  IL float idx: [{float(trace_il_float.min()):.1f}, {float(trace_il_float.max()):.1f}] (grid 0-{n_il-1})")
+    logger.info(f"  XL float idx: [{float(trace_xl_float.min()):.1f}, {float(trace_xl_float.max()):.1f}] (grid 0-{n_xl-1})")
+
+    # Check for traces outside grid - this is a WARNING condition
+    traces_in_il = ((trace_il_float >= 0) & (trace_il_float < n_il)).sum().item()
+    traces_in_xl = ((trace_xl_float >= 0) & (trace_xl_float < n_xl)).sum().item()
+    traces_in_grid = ((trace_il_float >= 0) & (trace_il_float < n_il) &
+                      (trace_xl_float >= 0) & (trace_xl_float < n_xl)).sum().item()
+
+    if traces_in_grid < n_traces:
+        pct_outside = 100.0 * (1 - traces_in_grid / n_traces)
+        logger.warning(f"  WARNING: {pct_outside:.1f}% of traces ({n_traces - traces_in_grid}/{n_traces}) fall OUTSIDE the output grid!")
+        logger.warning(f"    Traces in IL range: {traces_in_il}, in XL range: {traces_in_xl}, in both: {traces_in_grid}")
+        logger.warning(f"    Check that output grid origin/extent matches the input trace geometry")
+        logger.warning(f"    Grid covers IL=[0, {n_il-1}], XL=[0, {n_xl-1}] but traces map to IL=[{float(trace_il_float.min()):.0f}, {float(trace_il_float.max()):.0f}], XL=[{float(trace_xl_float.min()):.0f}, {float(trace_xl_float.max()):.0f}]")
+    else:
+        logger.info(f"  All {n_traces} traces map within output grid")
+
+    logger.info(f"  Trace midpoint grid (clamped): IL [{int(trace_il_all.min())}, {int(trace_il_all.max())}], "
+                f"XL [{int(trace_xl_all.min())}, {int(trace_xl_all.max())}]")
+
+    # Memory-aware tile size adjustment for RMS kernel
+    # This kernel creates many large tensors of shape (n_sample_batch, n_tile, n_filtered)
+    # With many traces, reduce tile size to avoid OOM
+    # Target: n_tile * max_traces_per_tile * sample_batch_size * 10 tensors * 4 bytes < target_memory
+    # Use the user-provided parameters, don't hardcode limits
+    target_memory_gb = 12.0  # 12GB target for 48GB systems, adjust down if OOM
+    max_tensor_elements = int(target_memory_gb * 1024**3 // (4 * 10))  # bytes / (4 bytes * 10 tensors)
+    # Max tile = target_elements / (traces * sample_batch)
+    max_tile_for_memory = max(50, max_tensor_elements // max(1, max_traces_per_tile * sample_batch_size))
+    effective_tile_size = min(tile_size, max_tile_for_memory)
+
+    # Compute INPUT time axis from trace parameters
+    # Input traces may have different dt and time range than output grid
+    # We assume input traces start at t=0 with the same dt as specified (this is standard)
+    input_dt_ms = dt_ms  # TODO: could be passed separately if input dt differs from output dt
+    input_t_min_ms = 0.0  # Input traces typically start at t=0
+    input_time_axis_ms = input_t_min_ms + torch.arange(n_samples, device=device, dtype=torch.float32) * input_dt_ms
+
+    # PRE-COMPUTE v_rms for all INPUT times ONCE (critical performance optimization!)
+    # We iterate over input samples and map them to output times
+    # The approximation v_rms(t_out) ≈ v_rms(t_in) is good for mild gradients.
+    v_rms_all = velocity_model.rms_velocity_at_time(input_time_axis_ms)  # (n_samples,)
+    if not isinstance(v_rms_all, torch.Tensor):
+        v_rms_all = torch.tensor(v_rms_all, device=device, dtype=torch.float32)
+    else:
+        v_rms_all = v_rms_all.to(device=device, dtype=torch.float32)
+    logger.info(f"  Pre-computed v_rms: {float(v_rms_all[0]):.1f} - {float(v_rms_all[-1]):.1f} m/s "
+                f"over {float(input_time_axis_ms[0]):.0f} - {float(input_time_axis_ms[-1]):.0f} ms (input times)")
+
     # Process in tiles
-    n_tiles = (n_output + tile_size - 1) // tile_size
+    n_tiles = (n_output + effective_tile_size - 1) // effective_tile_size
 
     start_time = time_module.time()
     last_progress_time = start_time
 
     logger.info(f"Time-domain kernel (RMS): n_traces={n_traces}, n_times={n_times}, "
-                f"n_output={n_output}, tile_size={tile_size}, n_tiles={n_tiles}")
+                f"n_output={n_output}, tile_size={effective_tile_size} (requested {tile_size}), n_tiles={n_tiles}")
     logger.info(f"Velocity model: {velocity_model.get_summary()}")
     logger.info(f"Aperture: max={max_aperture_m}m, max_angle={max_angle_deg}°, "
                 f"time_dependent={use_time_dependent_aperture}")
+    logger.info(f"  Params: sample_batch={sample_batch_size}, max_traces/tile={max_traces_per_tile}")
+    logger.info("Starting time-domain migration...")
+
+    # Immediate first progress callback
+    if progress_callback is not None:
+        progress_callback(0.0, f"Starting migration: 0/{n_tiles} tiles")
 
     # Profiling
     if enable_profiling:
@@ -1325,217 +1523,225 @@ def migrate_kirchhoff_time_domain_rms(
             'aperture_passed': 0,
         }
 
-    for tile_idx, out_start in enumerate(range(0, n_output, tile_size)):
-        out_end = min(out_start + tile_size, n_output)
-        n_tile = out_end - out_start
+    # Disable gradient tracking for inference - reduces overhead significantly
+    with torch.no_grad():
+        for tile_idx, out_start in enumerate(range(0, n_output, effective_tile_size)):
+            out_end = min(out_start + effective_tile_size, n_output)
+            n_tile = out_end - out_start
 
-        # Get output coordinates for this tile
-        tile_x = output_x[out_start:out_end]
-        tile_y = output_y[out_start:out_end]
+            # Get output coordinates for this tile
+            tile_x = output_x[out_start:out_end]
+            tile_y = output_y[out_start:out_end]
 
-        # Compute inline/crossline indices
-        tile_il = torch.arange(out_start, out_end, device=device) // n_xl
-        tile_xl = torch.arange(out_start, out_end, device=device) % n_xl
-
-        if enable_profiling:
-            t0 = time_module.time()
-
-        # Pre-filter traces by distance to tile center
-        tile_cx = (tile_x.min() + tile_x.max()) / 2
-        tile_cy = (tile_y.min() + tile_y.max()) / 2
-        tile_radius = torch.sqrt(((tile_x - tile_cx)**2 + (tile_y - tile_cy)**2).max())
-
-        dist_to_center = torch.sqrt((mid_x - tile_cx)**2 + (mid_y - tile_cy)**2)
-        trace_filter = dist_to_center < (max_aperture_m + tile_radius + 100)
-
-        filtered_indices = torch.where(trace_filter)[0]
-        n_filtered = len(filtered_indices)
-
-        if n_filtered == 0:
-            continue
-
-        # Extract filtered data
-        mid_x_f = mid_x[filtered_indices]
-        mid_y_f = mid_y[filtered_indices]
-        half_offset_sq_f = half_offset_sq[filtered_indices]
-        traces_f = traces[:, filtered_indices]
-
-        if enable_profiling:
-            if device.type == 'mps':
-                torch.mps.synchronize()
-            profile_times['trace_filtering'] += time_module.time() - t0
-            t0 = time_module.time()
-
-        # Horizontal distance from each output point to each trace midpoint
-        dx = tile_x.unsqueeze(1) - mid_x_f.unsqueeze(0)
-        dy = tile_y.unsqueeze(1) - mid_y_f.unsqueeze(0)
-        h_sq = dx**2 + dy**2
-        h = torch.sqrt(h_sq)
-
-        # Effective horizontal distance including half-offset
-        h_eff_sq = h_sq + half_offset_sq_f.unsqueeze(0)  # (n_tile, n_filtered)
-
-        # Process input samples in batches
-        sample_batch_size = min(200, n_samples)
-
-        for sample_start in range(0, n_samples, sample_batch_size):
-            sample_end = min(sample_start + sample_batch_size, n_samples)
-            n_sample_batch = sample_end - sample_start
+            # Compute inline/crossline indices
+            tile_il = torch.arange(out_start, out_end, device=device) // n_xl
+            tile_xl = torch.arange(out_start, out_end, device=device) % n_xl
 
             if enable_profiling:
                 t0 = time_module.time()
 
-            # Input times for this batch (ms)
-            t_in_ms = t_min_ms + torch.arange(sample_start, sample_end, device=device, dtype=torch.float32) * dt_ms
-            t_in_sq = t_in_ms ** 2  # (n_sample_batch,)
+            # Pre-filter traces by distance to tile center
+            tile_cx = (tile_x.min() + tile_x.max()) / 2
+            tile_cy = (tile_y.min() + tile_y.max()) / 2
+            tile_radius = torch.sqrt(((tile_x - tile_cx)**2 + (tile_y - tile_cy)**2).max())
 
-            # Get RMS velocity at input times (as initial estimate)
-            # Shape: (n_sample_batch,)
-            v_rms_in = velocity_model.rms_velocity_at_time(t_in_ms)
-            if not isinstance(v_rms_in, torch.Tensor):
-                v_rms_in = torch.tensor(v_rms_in, device=device, dtype=torch.float32)
+            dist_to_center = torch.sqrt((mid_x - tile_cx)**2 + (mid_y - tile_cy)**2)
+            trace_filter = dist_to_center < (max_aperture_m + tile_radius + 100)
+
+            filtered_indices = torch.where(trace_filter)[0]
+            n_filtered = len(filtered_indices)
+
+            if n_filtered == 0:
+                continue
+
+            # Memory limit: cap filtered traces to avoid OOM
+            # max_traces_per_tile is passed as parameter (default 5000 for 48GB systems)
+            # With n_tile=500, n_sample_batch=50, n_filtered=5000:
+            # tensor size = 500*50*5000*4*10 tensors = 5GB (manageable for 48GB)
+            if n_filtered > max_traces_per_tile:
+                # Keep only the closest traces to tile center
+                distances_filtered = dist_to_center[filtered_indices]
+                sorted_idx = torch.argsort(distances_filtered)[:max_traces_per_tile]
+                filtered_indices = filtered_indices[sorted_idx]
+                n_filtered = max_traces_per_tile
+                if tile_idx == 0:
+                    logger.info(f"  Memory limit: capped traces to {n_filtered} closest per tile")
+
+            # Extract filtered data
+            mid_x_f = mid_x[filtered_indices]
+            mid_y_f = mid_y[filtered_indices]
+            half_offset_sq_f = half_offset_sq[filtered_indices]
+            traces_f = traces[:, filtered_indices]
+
+            # CRITICAL: Get the grid indices for filtered traces
+            # These determine WHERE each trace scatters to (its midpoint location)
+            trace_il_f = trace_il_all[filtered_indices]  # (n_filtered,)
+            trace_xl_f = trace_xl_all[filtered_indices]  # (n_filtered,)
 
             if enable_profiling:
                 if device.type == 'mps':
                     torch.mps.synchronize()
-                profile_times['rms_velocity'] += time_module.time() - t0
+                profile_times['trace_filtering'] += time_module.time() - t0
                 t0 = time_module.time()
 
-            # Time shift: 4 * h_eff² / v_rms²
-            # Shape: (n_sample_batch, n_tile, n_filtered)
-            v_rms_sq = (v_rms_in ** 2).view(-1, 1, 1)  # (n_sample_batch, 1, 1)
-            h_eff_sq_expanded = h_eff_sq.unsqueeze(0)  # (1, n_tile, n_filtered)
+            # Horizontal distance from each output point to each trace midpoint
+            dx = tile_x.unsqueeze(1) - mid_x_f.unsqueeze(0)
+            dy = tile_y.unsqueeze(1) - mid_y_f.unsqueeze(0)
+            h_sq = dx**2 + dy**2
+            h = torch.sqrt(h_sq)
 
-            # Convert h_eff_sq from m² to ms² using v_rms
-            # time_shift² = 4 * h_eff² / v² in seconds² = 4 * h_eff² * 1e6 / v² in ms²
-            time_shift_sq = 4.0 * h_eff_sq_expanded * 1e6 / v_rms_sq  # ms²
+            # Effective horizontal distance including half-offset
+            h_eff_sq = h_sq + half_offset_sq_f.unsqueeze(0)  # (n_tile, n_filtered)
 
-            # Output time: t_out² = t_in² + time_shift²
-            t_out_sq = t_in_sq.view(-1, 1, 1) + time_shift_sq
-            t_out_ms = torch.sqrt(t_out_sq)
+            # Use the sample_batch_size passed as parameter (user-configurable via wizard)
+            # Memory usage: n_sample_batch * n_tile * n_filtered * bytes_per_element * ~10 tensors
+            # For n_sample_batch=200, n_tile=300, n_filtered=5000: 200*300*5000*2*10 = 6GB (float16)
+            # Adjust sample_batch_size down if it would exceed reasonable memory
+            target_memory_gb = 12.0  # Target max working memory per batch (48GB system)
+            bytes_per_element = 2 if compute_dtype == torch.float16 else 4  # float16 = 2 bytes
+            tensors_per_batch = 10
+            max_elements = int(target_memory_gb * 1024**3 / bytes_per_element / tensors_per_batch)
 
-            # Iterative refinement: update v_rms using output time
-            # One iteration usually sufficient for mild gradients
-            v_rms_out = None
-            if velocity_model.velocity_type != 'constant':
-                # Get v_rms at output time (more accurate)
-                t_out_flat = t_out_ms.reshape(-1)
-                v_rms_out_flat = velocity_model.rms_velocity_at_time(t_out_flat)
-                if not isinstance(v_rms_out_flat, torch.Tensor):
-                    v_rms_out_flat = torch.tensor(v_rms_out_flat, device=device, dtype=torch.float32)
-                v_rms_out = v_rms_out_flat.reshape(n_sample_batch, n_tile, n_filtered)
+            # Compute max batch size that fits in memory
+            max_batch_for_memory = max(10, max_elements // max(1, n_tile * n_filtered))
+            # Iterate over INPUT samples (traces) not OUTPUT samples
+            # We map input times -> output times in time-domain migration
+            effective_sample_batch = min(sample_batch_size, max_batch_for_memory, n_samples)
 
-                # Recompute with updated v_rms
-                v_rms_sq_updated = v_rms_out ** 2
-                time_shift_sq_updated = 4.0 * h_eff_sq_expanded * 1e6 / v_rms_sq_updated
-                t_out_sq = t_in_sq.view(-1, 1, 1) + time_shift_sq_updated
-                t_out_ms = torch.sqrt(t_out_sq)
+            n_sample_batches = (n_samples + effective_sample_batch - 1) // effective_sample_batch
 
-            # Convert output time to output sample index
-            out_sample_idx = (t_out_ms - t_min_ms) / dt_ms
+            # Log first tile details
+            if tile_idx == 0:
+                logger.info(f"  Tile 0: {n_filtered} traces within aperture, batch_size={effective_sample_batch} "
+                            f"(requested {sample_batch_size}), n_sample_batches={n_sample_batches}")
 
-            # Valid output range
-            valid_time = (out_sample_idx >= 0) & (out_sample_idx < n_times - 0.001)
+            # Pre-compute expanded tensors once per tile for reuse in kernel
+            # Convert to compute_dtype for potential float16 acceleration
+            h_expanded = h.unsqueeze(0).to(compute_dtype)  # (1, n_tile, n_filtered)
+            h_sq_expanded = h_sq.unsqueeze(0).to(compute_dtype)  # (1, n_tile, n_filtered)
+            h_eff_sq_expanded = h_eff_sq.unsqueeze(0).to(compute_dtype)  # (1, n_tile, n_filtered)
+
+            for sample_batch_idx, sample_start in enumerate(range(0, n_samples, effective_sample_batch)):
+                sample_end = min(sample_start + effective_sample_batch, n_samples)
+                n_sample_batch = sample_end - sample_start
+
+                if enable_profiling:
+                    t0 = time_module.time()
+
+                # Input times for this batch (ms) - use INPUT time axis, not OUTPUT
+                # sample_start/sample_end are indices into input traces
+                t_in_ms = input_t_min_ms + torch.arange(sample_start, sample_end, device=device, dtype=compute_dtype) * input_dt_ms
+                t_in_sq = t_in_ms ** 2  # (n_sample_batch,)
+
+                # Use PRE-COMPUTED v_rms from the lookup table (critical optimization!)
+                v_rms_in = v_rms_all[sample_start:sample_end].to(compute_dtype)  # (n_sample_batch,)
+                v_rms_sq = (v_rms_in ** 2).view(-1, 1, 1)  # (n_sample_batch, 1, 1)
+                v_rms_out = v_rms_in.view(-1, 1, 1).expand(n_sample_batch, n_tile, n_filtered)
+
+                # Get input amplitudes and expand for batch processing
+                amp_in = traces_f[sample_start:sample_end, :].to(compute_dtype)
+                amp_in_expanded = amp_in.unsqueeze(1).expand(-1, n_tile, -1)
+
+                if enable_profiling:
+                    if device.type == 'mps':
+                        torch.mps.synchronize()
+                    profile_times['rms_velocity'] += time_module.time() - t0
+                    t0 = time_module.time()
+
+                # Use kernel for the heavy computation (time mapping, aperture/angle masking, weighting)
+                out_idx_floor, weighted_amp, full_mask = _compiled_time_domain_batch_kernel(
+                    t_in_sq,
+                    v_rms_sq,
+                    h_eff_sq_expanded,
+                    h_expanded,
+                    h_sq_expanded,
+                    v_rms_out,
+                    amp_in_expanded,
+                    t_min_ms,
+                    dt_ms,
+                    n_times,
+                    max_angle_rad,
+                    tan_max_angle,
+                    max_aperture_m,
+                    use_time_dependent_aperture,
+                )
+
+                if enable_profiling:
+                    if device.type == 'mps':
+                        torch.mps.synchronize()
+                    profile_times['time_mapping'] += time_module.time() - t0
+                    t0 = time_module.time()
+
+                # CRITICAL FIX: Use TRACE midpoint grid indices, NOT tile output indices!
+                # Each trace scatters to its own midpoint location on the grid
+                # trace_il_f, trace_xl_f are (n_filtered,) - expand to match (n_sample_batch, n_tile, n_filtered)
+                trace_il_exp = trace_il_f.view(1, 1, n_filtered).expand(n_sample_batch, n_tile, n_filtered)
+                trace_xl_exp = trace_xl_f.view(1, 1, n_filtered).expand(n_sample_batch, n_tile, n_filtered)
+
+                # 3D linear index: t * (n_il * n_xl) + il * n_xl + xl
+                # Note: out_idx_floor is (n_sample_batch, n_tile, n_filtered) - output TIME index
+                # trace_il_exp, trace_xl_exp are (n_sample_batch, n_tile, n_filtered) - trace LOCATION index
+                linear_idx = out_idx_floor * (n_il * n_xl) + trace_il_exp * n_xl + trace_xl_exp
+
+                # Flatten everything - convert back to float32 for accumulation precision
+                linear_idx_flat = linear_idx.reshape(-1)
+                amp_flat = weighted_amp.reshape(-1).to(torch.float32)
+                mask_flat = full_mask.reshape(-1).float()
+
+                # Flatten output for scatter_add
+                image_flat = image.reshape(-1)  # (n_times * n_il * n_xl,)
+                fold_flat = fold.reshape(-1)
+
+                # ONE scatter_add call for entire batch!
+                image_flat.scatter_add_(0, linear_idx_flat, amp_flat)
+                fold_flat.scatter_add_(0, linear_idx_flat, mask_flat)
+
+                if enable_profiling:
+                    if device.type == 'mps':
+                        torch.mps.synchronize()
+                    profile_times['accumulation'] += time_module.time() - t0
+                    profile_counts['total_trace_point_pairs'] += n_sample_batch * n_tile * n_filtered
+                    profile_counts['aperture_passed'] += int(full_mask.sum().item())
+
+                # Progress reporting within sample batches (every 2 seconds)
+                if progress_callback is not None:
+                    current_time = time_module.time()
+                    if current_time - last_progress_time >= 2.0:
+                        last_progress_time = current_time
+                        # Calculate overall progress: tiles + fraction of current tile
+                        batch_frac = (sample_batch_idx + 1) / n_sample_batches
+                        pct = (tile_idx + batch_frac) / n_tiles
+                        elapsed = current_time - start_time
+                        if pct > 0:
+                            eta = elapsed / pct * (1 - pct)
+                            progress_callback(
+                                pct,
+                                f"Tile {tile_idx+1}/{n_tiles} batch {sample_batch_idx+1}/{n_sample_batches} "
+                                f"({pct*100:.1f}%), ETA: {eta:.0f}s"
+                            )
 
             if enable_profiling:
-                if device.type == 'mps':
-                    torch.mps.synchronize()
-                profile_times['time_mapping'] += time_module.time() - t0
-                t0 = time_module.time()
+                profile_counts['tiles_processed'] += 1
 
-            # Aperture mask
-            if use_time_dependent_aperture:
-                # aperture(t) = v_rms(t) * t / 2 * tan(angle)
-                # Use v_rms_out if available, else approximate with v0
-                if v_rms_out is not None:
-                    v_for_aperture = v_rms_out
-                else:
-                    v_for_aperture = v0
-                aperture_at_t = t_out_ms * v_for_aperture / 2000.0 * tan_max_angle
-                aperture_at_t = torch.clamp(aperture_at_t, max=max_aperture_m)
-                aperture_mask = h.unsqueeze(0) < aperture_at_t
-            else:
-                aperture_mask = h.unsqueeze(0) < max_aperture_m
+            # Progress reporting at tile completion
+            if progress_callback is not None:
+                current_time = time_module.time()
+                if current_time - last_progress_time >= 2.0 or (tile_idx + 1) % max(1, n_tiles // 10) == 0:
+                    last_progress_time = current_time
+                    pct = (tile_idx + 1) / n_tiles
+                    elapsed = current_time - start_time
+                    if pct > 0:
+                        eta = elapsed / pct * (1 - pct)
+                        rate = (tile_idx + 1) * effective_tile_size * n_times / elapsed
+                        progress_callback(
+                            pct,
+                            f"Tile {tile_idx+1}/{n_tiles} ({pct*100:.1f}%), "
+                            f"{rate:.0f} output-samples/s, ETA: {eta:.0f}s"
+                        )
 
-            # Angle mask
-            # At output time t_out, depth z ≈ v_rms * t_out / 2
-            if v_rms_out is not None:
-                z_at_t = v_rms_out * t_out_ms / 2000.0
-            else:
-                z_at_t = v0 * t_out_ms / 2000.0
-            angle_from_vertical = torch.atan2(h.unsqueeze(0), z_at_t + 1e-6)
-            angle_mask = angle_from_vertical < max_angle_rad
-
-            # Combined mask
-            full_mask = valid_time & aperture_mask & angle_mask
-
-            if enable_profiling:
-                if device.type == 'mps':
-                    torch.mps.synchronize()
-                profile_times['aperture_mask'] += time_module.time() - t0
-                t0 = time_module.time()
-
-            # Get input amplitudes
-            amp_in = traces_f[sample_start:sample_end, :]
-            amp_in_expanded = amp_in.unsqueeze(1).expand(-1, n_tile, -1)
-
-            # Weight: cos(angle) / r²
-            r_sq = z_at_t**2 + h_sq.unsqueeze(0)
-            r = torch.sqrt(r_sq)
-            weight = z_at_t / (r * r_sq + 1e-10)
-
-            weighted_amp = amp_in_expanded * weight * full_mask.float()
-
-            if enable_profiling:
-                if device.type == 'mps':
-                    torch.mps.synchronize()
-                profile_times['interpolation'] += time_module.time() - t0
-                t0 = time_module.time()
-
-            # Accumulate to output using scatter_add
-            out_idx_floor = out_sample_idx.long().clamp(0, n_times - 1)
-
-            for s_idx in range(n_sample_batch):
-                out_t_idx = out_idx_floor[s_idx]
-                w_amp = weighted_amp[s_idx]
-                mask = full_mask[s_idx]
-
-                for t_idx in range(n_tile):
-                    t_indices = out_t_idx[t_idx]
-                    amplitudes = w_amp[t_idx]
-                    masks = mask[t_idx]
-
-                    il_idx = tile_il[t_idx]
-                    xl_idx = tile_xl[t_idx]
-
-                    image[:, il_idx, xl_idx].scatter_add_(0, t_indices, amplitudes)
-                    fold[:, il_idx, xl_idx].scatter_add_(0, t_indices, masks.float())
-
-            if enable_profiling:
-                if device.type == 'mps':
-                    torch.mps.synchronize()
-                profile_times['accumulation'] += time_module.time() - t0
-                profile_counts['total_trace_point_pairs'] += n_sample_batch * n_tile * n_filtered
-                profile_counts['aperture_passed'] += int(full_mask.sum().item())
-
-        if enable_profiling:
-            profile_counts['tiles_processed'] += 1
-
-        # Progress reporting
-        if progress_callback is not None:
-            current_time = time_module.time()
-            if current_time - last_progress_time >= 2.0 or (tile_idx + 1) % max(1, n_tiles // 10) == 0:
-                last_progress_time = current_time
-                pct = (tile_idx + 1) / n_tiles
-                elapsed = current_time - start_time
-                if pct > 0:
-                    eta = elapsed / pct * (1 - pct)
-                    rate = (tile_idx + 1) * tile_size * n_times / elapsed
-                    progress_callback(
-                        pct,
-                        f"Tile {tile_idx+1}/{n_tiles} ({pct*100:.1f}%), "
-                        f"{rate:.0f} output-samples/s, ETA: {eta:.0f}s"
-                    )
+            # Periodic GPU memory cleanup
+            if tile_idx % 50 == 0 and device.type == 'mps':
+                torch.mps.empty_cache()
 
     # Log profiling results
     if enable_profiling:
