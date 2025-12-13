@@ -21,7 +21,7 @@ from .config import (
 )
 from .header_vectorizer import HeaderVectorizer, vectorize_headers, get_trace_headers
 from .worker import export_trace_range
-from .coordinator import ParallelExportCoordinator
+from .coordinator import ParallelExportCoordinator, ExportStageResult
 from .merger import SEGYSegmentMerger
 
 __all__ = [
@@ -40,6 +40,7 @@ __all__ = [
     'export_trace_range',
     # Coordinator
     'ParallelExportCoordinator',
+    'ExportStageResult',
     # Merger
     'SEGYSegmentMerger',
 ]

@@ -15,13 +15,37 @@ from .gabor_denoise import GaborDenoise
 from .emd_denoise import EMDDenoise, PYEMD_AVAILABLE
 from .sst_denoise import SSTDenoise, SSQUEEZEPY_AVAILABLE
 from .omp_denoise import OMPDenoise
-from .denoise_3d import Denoise3D, compute_3d_mad, get_available_headers
+from .denoise_3d import (
+    Denoise3D,
+    Denoise3DConfig,
+    compute_3d_mad,
+    get_available_headers,
+    apply_denoise3d_design_mode,
+    apply_denoise3d_application_mode,
+)
 from .agc import apply_agc_vectorized, remove_agc, apply_agc_to_gather
 from .fk_filter import FKFilter
 from .fkk_filter_gpu import FKKFilterGPU, FKKFilterCPU, get_fkk_filter
+from .fkk_coordinate_filter import (
+    FKKCoordinateFilter,
+    FKKCoordinateConfig,
+    apply_fkk_coordinate_filter,
+    apply_fkk_design_mode,
+    apply_fkk_application_mode,
+)
 from .gain_processor import GainProcessor
 from .chunked_processor import ChunkedProcessor
 from .spectral_analyzer import SpectralAnalyzer
+from .mute_processor import MuteConfig, MuteProcessor
+from .deconvolution import DeconvolutionProcessor, DeconConfig, apply_spiking_decon, apply_predictive_decon
+
+# NMO and Stacking
+from .nmo_processor import NMOProcessor, NMOConfig, apply_nmo_gather, compute_nmo_time
+from .cdp_stacker import CDPStacker, StackConfig, StackResult, stack_cdp_gather, nmo_and_stack
+
+# QC Engines
+from .qc_stacking_engine import QCStackingEngine, QCStackingWorker, StackingProgress
+from .qc_batch_engine import QCBatchEngine, QCBatchWorker, BatchProgress, BatchResult
 
 # Migration processors
 from .migration.kirchhoff_migrator import KirchhoffMigrator
@@ -48,6 +72,9 @@ PROCESSOR_REGISTRY: Dict[str, Type[BaseProcessor]] = {
     'SpectralAnalyzer': SpectralAnalyzer,
     'ProcessingPipeline': ProcessingPipeline,
     'KirchhoffMigrator': KirchhoffMigrator,
+    'NMOProcessor': NMOProcessor,
+    'CDPStacker': CDPStacker,
+    'DeconvolutionProcessor': DeconvolutionProcessor,
 }
 
 
@@ -123,15 +150,50 @@ __all__ = [
     'SSQUEEZEPY_AVAILABLE',
     'OMPDenoise',
     'Denoise3D',
+    'Denoise3DConfig',
     'compute_3d_mad',
     'get_available_headers',
+    'apply_denoise3d_design_mode',
+    'apply_denoise3d_application_mode',
     'FKFilter',
     'FKKFilterGPU',
     'FKKFilterCPU',
     'get_fkk_filter',
+    # FKK Coordinate Filter
+    'FKKCoordinateFilter',
+    'FKKCoordinateConfig',
+    'apply_fkk_coordinate_filter',
+    'apply_fkk_design_mode',
+    'apply_fkk_application_mode',
     'GainProcessor',
     'ChunkedProcessor',
     'SpectralAnalyzer',
+    # Mute
+    'MuteConfig',
+    'MuteProcessor',
+    # Deconvolution
+    'DeconvolutionProcessor',
+    'DeconConfig',
+    'apply_spiking_decon',
+    'apply_predictive_decon',
+    # NMO and Stacking
+    'NMOProcessor',
+    'NMOConfig',
+    'apply_nmo_gather',
+    'compute_nmo_time',
+    'CDPStacker',
+    'StackConfig',
+    'StackResult',
+    'stack_cdp_gather',
+    'nmo_and_stack',
+    # QC Engines
+    'QCStackingEngine',
+    'QCStackingWorker',
+    'StackingProgress',
+    'QCBatchEngine',
+    'QCBatchWorker',
+    'BatchProgress',
+    'BatchResult',
     # Migration
     'KirchhoffMigrator',
     # AGC functions

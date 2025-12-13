@@ -144,7 +144,9 @@ class DWTDenoise(BaseProcessor):
 
         start_time = time.time()
 
-        traces = data.traces.copy()
+        # Use direct reference - processing methods don't modify input
+        # This saves ~20MB per gather (one fewer copy in memory)
+        traces = data.traces
         n_samples, n_traces = traces.shape
 
         # Determine decomposition level

@@ -21,10 +21,67 @@ import zarr
 import pandas as pd
 import psutil
 import logging
+import traceback
 from pathlib import Path
 from typing import Optional, Callable, List, Dict, Any, Tuple
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing as mp
+from datetime import datetime
+
+
+# =============================================================================
+# DEBUG LOGGING - Writes immediately to file with flush for crash diagnosis
+# =============================================================================
+_DEBUG_LOG_FILE = None
+_DEBUG_ENABLED = True  # Set to False to disable debug logging
+
+
+def _init_debug_log(output_dir: Optional[Path] = None):
+    """Initialize debug log file."""
+    global _DEBUG_LOG_FILE
+    if not _DEBUG_ENABLED:
+        return
+    try:
+        if output_dir:
+            log_path = output_dir / 'parallel_processing_debug.log'
+        else:
+            log_path = Path('/tmp/parallel_processing_debug.log')
+        _DEBUG_LOG_FILE = open(log_path, 'w')
+        _debug_log(f"Debug log initialized at {datetime.now().isoformat()}")
+        _debug_log(f"Log file: {log_path}")
+    except Exception as e:
+        print(f"Warning: Could not initialize debug log: {e}")
+
+
+def _debug_log(msg: str, include_memory: bool = False):
+    """Write debug message immediately to file with flush."""
+    global _DEBUG_LOG_FILE
+    if not _DEBUG_ENABLED or _DEBUG_LOG_FILE is None:
+        return
+    try:
+        timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        mem_info = ""
+        if include_memory:
+            mem = psutil.virtual_memory()
+            mem_info = f" [MEM: {mem.used/(1024**3):.2f}GB used / {mem.available/(1024**3):.2f}GB avail]"
+        line = f"[{timestamp}] COORD: {msg}{mem_info}\n"
+        _DEBUG_LOG_FILE.write(line)
+        _DEBUG_LOG_FILE.flush()  # Immediate flush for crash diagnosis
+        os.fsync(_DEBUG_LOG_FILE.fileno())  # Force OS to write to disk
+    except Exception:
+        pass
+
+
+def _close_debug_log():
+    """Close debug log file."""
+    global _DEBUG_LOG_FILE
+    if _DEBUG_LOG_FILE is not None:
+        try:
+            _debug_log("Debug log closing")
+            _DEBUG_LOG_FILE.close()
+        except Exception:
+            pass
+        _DEBUG_LOG_FILE = None
 
 from .config import (
     ProcessingConfig,
@@ -38,6 +95,13 @@ from .config import (
 from .partitioner import GatherPartitioner
 from .worker import process_gather_range, read_streaming_sort_file
 
+# Import settings for memory configuration
+try:
+    from models.app_settings import get_settings
+    SETTINGS_AVAILABLE = True
+except ImportError:
+    SETTINGS_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -46,6 +110,156 @@ def get_optimal_workers() -> int:
     cpu_count = os.cpu_count() or 4
     # Leave 2 cores free for system/UI, minimum 2 workers
     return max(2, cpu_count - 2)
+
+
+def check_parallel_processing_memory_budget(
+    n_workers: int,
+    max_gather_traces: int,
+    n_samples: int,
+    memory_copies: int = 4,
+    safety_factor: float = 0.7,
+    output_noise: bool = False,
+    sorting_enabled: bool = False,
+    output_mode: str = 'processed'
+) -> Tuple[bool, float, float, float, str, str]:
+    """
+    Pre-flight memory check for parallel gather processing.
+
+    Calculates: n_workers × max_gather_size × memory_copies × 4 bytes (float32)
+    PLUS worker startup overhead (imports, ensemble index, etc.)
+
+    Memory usage by mode:
+    - 'processed': ~2 copies (input + processed)
+    - 'noise': ~2 copies (input reused for result, + processed during computation)
+    - 'both': ~3-4 copies (input + processed + noise)
+
+    Args:
+        n_workers: Number of parallel worker processes
+        max_gather_traces: Maximum traces in any single gather
+        n_samples: Number of samples per trace
+        memory_copies: Base estimated copies per gather (2-8)
+        safety_factor: Fraction of available memory considered safe (0.0-1.0)
+        output_noise: Whether noise output is enabled (legacy, adds 1 copy)
+        sorting_enabled: Whether sorting is enabled (adds 1 copy)
+        output_mode: 'processed', 'noise', or 'both'
+
+    Returns:
+        Tuple of (is_safe, available_mb, required_mb, ratio, risk_level, message)
+        risk_level: 'low', 'medium', 'high', 'critical'
+    """
+    available_bytes = psutil.virtual_memory().available
+    available_mb = available_bytes / (1024**2)
+
+    # Per-worker memory overhead (MB) - MEASURED VALUES from actual runs
+    # Components that add up per worker:
+    #   - Fork base overhead: ~200 MB (Python pages that get modified, triggering COW)
+    #   - Ensemble index: ~80 MB (loaded AFTER fork, so NOT shared via COW)
+    #   - Zarr metadata/cache: ~250 MB (input + output arrays, chunk cache)
+    #   - Working buffers: ~150 MB (numpy temp arrays during processing)
+    #   - DWT/SWT peak: ~100 MB additional during wavelet transform
+    # Total measured: ~780 MB per worker (without headers)
+    #
+    # Headers for mute/sorting: ~170 MB per worker IF NOT pre-shared
+    # With fork COW pre-sharing (Linux), headers add ~0 MB per worker
+    import sys
+    if sys.platform == 'linux':
+        WORKER_STARTUP_OVERHEAD_MB = 800  # Fork: measured ~780 MB per worker
+    else:
+        WORKER_STARTUP_OVERHEAD_MB = 2500  # Spawn: full import overhead
+
+    # Determine effective output mode
+    effective_mode = output_mode
+    if output_mode == 'processed' and output_noise:
+        effective_mode = 'both'
+
+    # Calculate copies based on output mode
+    # NOTE: Peak memory occurs DURING processor.process(), not after!
+    # DWT/SWT processors internally create during processing:
+    #   1. Input gather (from zarr)
+    #   2. Padded array (for SWT power-of-2 requirement)
+    #   3. Denoised/output array
+    #   4. Coefficient arrays during SWT (temporary but significant)
+    # Total peak: ~4 copies for DWT/SWT processors
+    #
+    # After processing returns, worker does in-place operations to minimize memory
+    # But we must budget for the processor's peak, not the post-processing state
+    if effective_mode == 'noise':
+        # Peak during processor: input + padded + denoised + coefficients
+        # Post-processing is optimized with in-place subtraction
+        effective_copies = 4  # Measured peak during DWT processing
+    elif effective_mode == 'both':
+        # Peak: input + processor_internals + separate noise array
+        effective_copies = 5
+    else:
+        # Processed only: input + processor_internals
+        effective_copies = 4
+
+    if sorting_enabled:
+        effective_copies += 1
+
+    # Calculate memory per gather: n_samples × max_traces × 4 bytes × copies
+    bytes_per_gather = n_samples * max_gather_traces * 4 * effective_copies
+
+    # Total peak memory: all workers loading max-size gathers simultaneously
+    peak_bytes = n_workers * bytes_per_gather
+    gather_mb = peak_bytes / (1024**2)
+
+    # Add worker startup overhead (imports, ensemble index, zarr handles)
+    worker_overhead_mb = n_workers * WORKER_STARTUP_OVERHEAD_MB
+    required_mb = gather_mb + worker_overhead_mb
+
+    # Calculate safe number of workers based on available memory
+    # available_mb = n_workers * (startup_overhead + gather_memory_per_worker)
+    gather_mb_per_worker = gather_mb / n_workers if n_workers > 0 else 0
+    per_worker_total_mb = WORKER_STARTUP_OVERHEAD_MB + gather_mb_per_worker
+    safe_workers = max(1, int(available_mb * safety_factor / per_worker_total_mb)) if per_worker_total_mb > 0 else 1
+
+    # Calculate ratio
+    ratio = required_mb / available_mb if available_mb > 0 else float('inf')
+    safe_threshold = safety_factor
+
+    # Determine risk level
+    if ratio < safe_threshold * 0.5:
+        risk_level = 'low'
+        is_safe = True
+    elif ratio < safe_threshold:
+        risk_level = 'medium'
+        is_safe = True
+    elif ratio < 0.9:
+        risk_level = 'high'
+        is_safe = False
+    else:
+        risk_level = 'critical'
+        is_safe = False
+
+    # Build message with mode info
+    mode_label = effective_mode.upper()
+    if effective_mode == 'noise':
+        mode_label += " (memory-optimized)"
+
+    if risk_level == 'low':
+        message = (
+            f"Memory OK [{mode_label}]: {n_workers} workers × ~{per_worker_total_mb:.0f} MB/worker = "
+            f"{required_mb:.0f} MB ({ratio*100:.0f}% of {available_mb:.0f} MB available)"
+        )
+    elif risk_level == 'medium':
+        message = (
+            f"Memory MODERATE [{mode_label}]: {required_mb:.0f} MB estimated vs {available_mb:.0f} MB available "
+            f"({ratio*100:.0f}%). Processing should work but monitor system memory."
+        )
+    elif risk_level == 'high':
+        message = (
+            f"Memory WARNING [{mode_label}]: {required_mb:.0f} MB estimated vs {available_mb:.0f} MB available "
+            f"({ratio*100:.0f}%). Reduce workers to {safe_workers} or less."
+        )
+    else:  # critical
+        message = (
+            f"Memory CRITICAL [{mode_label}]: {required_mb:.0f} MB estimated vs {available_mb:.0f} MB available "
+            f"({ratio*100:.0f}%). WILL CRASH! Reduce workers to {safe_workers} or less."
+        )
+
+    # Return tuple with safe_workers as additional info
+    return is_safe, available_mb, required_mb, ratio, risk_level, message, safe_workers
 
 
 def check_sorting_memory_budget(
@@ -143,17 +357,57 @@ class ParallelProcessingCoordinator:
         Returns:
             ProcessingResult with outcome
         """
+        # EARLY CRASH DIAGNOSTIC - write to /tmp before any other operations
+        def _early_crash_log(msg: str):
+            """Write to shared crash log for diagnosis."""
+            try:
+                import os
+                from datetime import datetime
+                with open('/tmp/seisproc_parallel_crash.log', 'a') as f:
+                    ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                    mem = psutil.virtual_memory()
+                    f.write(f"[{ts}] [MEM: {mem.used/(1024**3):.2f}GB/{mem.available/(1024**3):.2f}GB] COORD: {msg}\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+            except Exception:
+                pass
+
+        _early_crash_log(">>> run() method ENTERED")
+
         start_time = time.time()
+        _early_crash_log(">>> start_time set")
+
         input_dir = Path(self.config.input_storage_dir)
+        _early_crash_log(f">>> input_dir={input_dir}")
+
         output_dir = Path(self.config.output_storage_dir)
+        _early_crash_log(f">>> output_dir={output_dir}")
         sorting_enabled = (
             self.config.sort_options is not None and
             self.config.sort_options.enabled
         )
+        _early_crash_log(f">>> sorting_enabled={sorting_enabled}")
+
+        # Initialize debug logging FIRST
+        _early_crash_log(">>> Creating output directory...")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        _early_crash_log(">>> Output directory created, initializing debug log...")
+        _init_debug_log(output_dir)
+        _early_crash_log(">>> Debug log initialized")
+        _debug_log("=" * 60)
+        _debug_log("PARALLEL PROCESSING COORDINATOR STARTING", include_memory=True)
+        _debug_log(f"Input dir: {input_dir}")
+        _debug_log(f"Output dir: {output_dir}")
+        _debug_log(f"Output mode: {getattr(self.config, 'output_mode', 'processed')}")
+        _debug_log(f"N workers requested: {self.n_workers}")
+        _debug_log(f"Sorting enabled: {sorting_enabled}")
 
         try:
             # Phase 1: Validate and load metadata
+            _early_crash_log(">>> Phase 1: Validating and loading metadata...")
+            _debug_log("Phase 1: Validating and loading metadata...", include_memory=True)
             if progress_callback:
+                _early_crash_log(">>> Calling progress_callback for initializing...")
                 progress_callback(ProcessingProgress(
                     phase='initializing',
                     current_traces=0,
@@ -162,12 +416,67 @@ class ParallelProcessingCoordinator:
                     total_gathers=0,
                     active_workers=0
                 ))
+                _early_crash_log(">>> progress_callback returned")
 
+            _early_crash_log(">>> Calling _load_and_validate...")
             metadata, ensemble_df = self._load_and_validate(input_dir)
+            _early_crash_log(f">>> _load_and_validate returned, {len(ensemble_df)} gathers")
+            _debug_log(f"Metadata loaded: n_traces={metadata.get('n_traces')}, n_samples={metadata.get('n_samples')}", include_memory=True)
+            _debug_log(f"Ensemble index loaded: {len(ensemble_df)} gathers")
             n_traces = metadata['n_traces']
             n_samples = metadata['n_samples']
             n_gathers = len(ensemble_df)
             sample_rate = metadata['sample_rate']
+
+            # Get max gather size for memory estimation
+            max_gather_traces = int(ensemble_df['n_traces'].max())
+            avg_gather_traces = int(ensemble_df['n_traces'].mean())
+            _debug_log(f"Gather stats: max={max_gather_traces} traces, avg={avg_gather_traces} traces")
+
+            # Determine output mode early for memory check
+            output_mode_check = getattr(self.config, 'output_mode', 'processed')
+            if output_mode_check == 'processed' and self.config.output_noise:
+                output_mode_check = 'both'
+            _debug_log(f"Effective output mode: {output_mode_check}")
+
+            # MEMORY GUARD: Pre-flight check for parallel processing memory
+            _debug_log("Running memory budget check...", include_memory=True)
+            memory_check_result = self._check_memory_budget(
+                n_workers=self.n_workers,
+                max_gather_traces=max_gather_traces,
+                n_samples=n_samples,
+                sorting_enabled=sorting_enabled,
+                output_noise=self.config.output_noise,
+                output_mode=output_mode_check
+            )
+
+            if memory_check_result is not None:
+                _debug_log(f"Memory check result: {memory_check_result}")
+                is_safe, available_mb, required_mb, ratio, risk_level, mem_message, safe_workers = memory_check_result
+                logger.info(mem_message)
+                print(f"  {mem_message}")
+
+                # Check if we should block execution
+                if not is_safe and risk_level == 'critical':
+                    if SETTINGS_AVAILABLE:
+                        settings = get_settings()
+                        if settings.get_parallel_block_on_high_risk():
+                            raise MemoryError(
+                                f"Parallel processing blocked due to critical memory risk.\n"
+                                f"Estimated: {required_mb:.0f} MB, Available: {available_mb:.0f} MB\n"
+                                f"Max gather: {max_gather_traces:,} traces\n"
+                                f"Reduce workers from {self.n_workers} to "
+                                f"{max(1, int(self.n_workers * available_mb * 0.7 / required_mb))} or less.\n"
+                                f"Or disable 'Block on high risk' in Settings > Performance."
+                            )
+
+            # Determine output mode
+            output_mode = getattr(self.config, 'output_mode', 'processed')
+            if output_mode == 'processed' and self.config.output_noise:
+                output_mode = 'both'  # Legacy compatibility
+
+            output_processed = output_mode in ('processed', 'both')
+            output_noise_flag = output_mode in ('noise', 'both')
 
             sort_info = ""
             if sorting_enabled:
@@ -189,24 +498,65 @@ class ParallelProcessingCoordinator:
                     )
                     print(f"  WARNING: {mem_message}")
 
-            print(f"  Processing {n_gathers:,} gathers, {n_traces:,} traces{sort_info}")
+            mode_info = ""
+            if output_mode == 'noise':
+                mode_info = " [NOISE-ONLY mode - memory optimized]"
+            elif output_mode == 'both':
+                mode_info = " [processed + noise output]"
+
+            print(f"  Processing {n_gathers:,} gathers, {n_traces:,} traces{sort_info}{mode_info}")
+            _debug_log(f"Processing {n_gathers:,} gathers, {n_traces:,} traces{sort_info}{mode_info}")
 
             # Phase 2: Partition gathers across workers
+            _early_crash_log(">>> Phase 2: Partitioning gathers across workers...")
+            _debug_log("Phase 2: Partitioning gathers across workers...", include_memory=True)
             segments = self._partition_gathers(ensemble_df)
+            _early_crash_log(f">>> Partitioned into {len(segments)} segments")
             print(f"  Partitioned into {len(segments)} segments")
+            _debug_log(f"Partitioned into {len(segments)} segments")
+            for seg in segments:
+                _debug_log(f"  Segment {seg.segment_id}: gathers {seg.start_gather}-{seg.end_gather}, {seg.n_traces:,} traces")
 
             # Phase 3: Create output directory and shared Zarr
+            _early_crash_log(">>> Phase 3: Creating output Zarr arrays...")
+            _debug_log("Phase 3: Creating output Zarr arrays...", include_memory=True)
             output_dir.mkdir(parents=True, exist_ok=True)
-            output_zarr_path = self._create_output_zarr(output_dir, n_samples, n_traces)
-            print(f"  Created output Zarr: {n_samples} x {n_traces:,}")
+
+            # Create output zarr only if outputting processed data
+            output_zarr_path = None
+            if output_processed:
+                _early_crash_log(f">>> Creating OUTPUT zarr ({n_samples} x {n_traces:,})...")
+                _debug_log(f"Creating OUTPUT zarr ({n_samples} x {n_traces:,})...", include_memory=True)
+                output_zarr_path = self._create_output_zarr(output_dir, n_samples, n_traces)
+                _early_crash_log(f">>> Output zarr created at {output_zarr_path}")
+                print(f"  Created output Zarr: {n_samples} x {n_traces:,}")
+                _debug_log(f"Output zarr created: {output_zarr_path}", include_memory=True)
+            else:
+                _early_crash_log(">>> Skipping output zarr (noise-only mode)")
+                _debug_log("Skipping output zarr (noise-only mode)")
+
+            # Create noise zarr if noise output is enabled
+            noise_zarr_path = None
+            if output_noise_flag:
+                _early_crash_log(f">>> Creating NOISE zarr ({n_samples} x {n_traces:,})...")
+                _debug_log(f"Creating NOISE zarr ({n_samples} x {n_traces:,})...", include_memory=True)
+                noise_zarr_path = self._create_noise_zarr(output_dir, n_samples, n_traces)
+                _early_crash_log(f">>> Noise zarr created at {noise_zarr_path}")
+                print(f"  Created noise Zarr: {n_samples} x {n_traces:,}")
+                _debug_log(f"Noise zarr created: {noise_zarr_path}", include_memory=True)
 
             # Create temp directory for sort mappings if sorting enabled
             temp_dir = None
             if sorting_enabled:
                 temp_dir = output_dir / 'temp_sort'
                 temp_dir.mkdir(parents=True, exist_ok=True)
+                _debug_log(f"Sort temp directory: {temp_dir}")
 
             # Phase 4: Run parallel workers
+            _early_crash_log(">>> Phase 4: Launching parallel workers...")
+            _debug_log("Phase 4: Launching parallel workers...", include_memory=True)
+            _early_crash_log(f">>> About to start {len(segments)} workers with ProcessPoolExecutor")
+            _debug_log(f"About to start {len(segments)} workers with ProcessPoolExecutor")
             if progress_callback:
                 progress_callback(ProcessingProgress(
                     phase='processing',
@@ -221,6 +571,7 @@ class ParallelProcessingCoordinator:
                 segments=segments,
                 input_dir=input_dir,
                 output_zarr_path=output_zarr_path,
+                noise_zarr_path=noise_zarr_path,
                 n_samples=n_samples,
                 sample_rate=sample_rate,
                 metadata=metadata,
@@ -269,24 +620,66 @@ class ParallelProcessingCoordinator:
             elapsed = time.time() - start_time
             throughput = n_traces / elapsed if elapsed > 0 else 0
 
+            noise_info = ""
+            if output_mode == 'noise':
+                noise_info = " [noise-only output]"
+            elif noise_zarr_path:
+                noise_info = " + noise output"
             print(f"  Processing complete: {n_traces:,} traces in {elapsed:.1f}s "
-                  f"({throughput:,.0f} traces/sec)")
+                  f"({throughput:,.0f} traces/sec){noise_info}")
+
+            # For noise-only mode, create a symlink traces.zarr -> noise.zarr
+            # This allows standard loading code (LazySeismicData.from_storage_dir) to work
+            if output_mode == 'noise' and noise_zarr_path:
+                traces_symlink = output_dir / 'traces.zarr'
+                noise_zarr_actual = output_dir / 'noise.zarr'
+                if not traces_symlink.exists() and noise_zarr_actual.exists():
+                    try:
+                        traces_symlink.symlink_to('noise.zarr')
+                        _debug_log(f"Created symlink traces.zarr -> noise.zarr for loading compatibility")
+                    except Exception as e:
+                        _debug_log(f"Warning: Could not create traces.zarr symlink: {e}")
+
+            # For noise-only mode, the main output is the noise zarr
+            # For backwards compatibility, output_zarr_path is the processed output (or noise if no processed)
+            main_output_path = output_zarr_path if output_zarr_path else noise_zarr_path
+
+            # Log successful completion
+            _debug_log("=" * 60)
+            _debug_log("PARALLEL PROCESSING COMPLETED SUCCESSFULLY", include_memory=True)
+            _debug_log(f"Total gathers: {n_gathers:,}")
+            _debug_log(f"Total traces: {n_traces:,}")
+            _debug_log(f"Elapsed time: {elapsed:.1f}s")
+            _debug_log(f"Throughput: {throughput:,.0f} traces/sec")
+            _debug_log(f"Output path: {main_output_path}")
+            _debug_log("=" * 60)
+            _close_debug_log()
 
             return ProcessingResult(
                 success=True,
                 output_dir=str(output_dir),
-                output_zarr_path=output_zarr_path,
+                output_zarr_path=main_output_path,
                 n_gathers=n_gathers,
                 n_traces=n_traces,
                 n_samples=n_samples,
                 elapsed_time=elapsed,
                 throughput_traces_per_sec=throughput,
-                n_workers_used=len(segments)
+                n_workers_used=len(segments),
+                noise_zarr_path=noise_zarr_path
             )
 
         except Exception as e:
-            import traceback
             elapsed = time.time() - start_time
+            error_trace = traceback.format_exc()
+
+            # Log the error to debug file
+            _debug_log("=" * 60)
+            _debug_log("EXCEPTION CAUGHT IN COORDINATOR", include_memory=True)
+            _debug_log(f"Exception type: {type(e).__name__}")
+            _debug_log(f"Exception message: {str(e)}")
+            _debug_log(f"Full traceback:\n{error_trace}")
+            _debug_log("=" * 60)
+            _close_debug_log()
 
             # Cleanup on failure
             if output_dir.exists():
@@ -305,7 +698,7 @@ class ParallelProcessingCoordinator:
                 elapsed_time=elapsed,
                 throughput_traces_per_sec=0,
                 n_workers_used=0,
-                error=f"{str(e)}\n{traceback.format_exc()}"
+                error=f"{str(e)}\n{error_trace}"
             )
 
     def _load_and_validate(self, input_dir: Path) -> tuple:
@@ -367,6 +760,22 @@ class ParallelProcessingCoordinator:
 
         return str(output_path)
 
+    def _create_noise_zarr(self, output_dir: Path, n_samples: int, n_traces: int) -> str:
+        """Create pre-allocated noise output Zarr array."""
+        noise_path = output_dir / 'noise.zarr'
+
+        zarr.open(
+            str(noise_path),
+            mode='w',
+            shape=(n_samples, n_traces),
+            chunks=(n_samples, 1000),
+            dtype=np.float32,
+            compressor=None,  # No compression for speed
+            zarr_format=2
+        )
+
+        return str(noise_path)
+
     def _copy_metadata_files(self, input_dir: Path, output_dir: Path, metadata: dict):
         """Copy metadata and index files to output."""
         # Copy headers parquet
@@ -388,7 +797,8 @@ class ParallelProcessingCoordinator:
         self,
         segments: List[GatherSegment],
         input_dir: Path,
-        output_zarr_path: str,
+        output_zarr_path: Optional[str],
+        noise_zarr_path: Optional[str],
         n_samples: int,
         sample_rate: float,
         metadata: dict,
@@ -398,12 +808,37 @@ class ParallelProcessingCoordinator:
         progress_callback: Optional[Callable]
     ) -> List[ProcessingWorkerResult]:
         """Run worker processes in parallel."""
+        # Early crash logging function
+        def _early_log(msg: str):
+            try:
+                import os
+                from datetime import datetime
+                with open('/tmp/seisproc_parallel_crash.log', 'a') as f:
+                    ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                    mem = psutil.virtual_memory()
+                    f.write(f"[{ts}] [MEM: {mem.used/(1024**3):.2f}GB/{mem.available/(1024**3):.2f}GB] WORKERS: {msg}\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+            except Exception:
+                pass
+
+        _early_log(">>> _run_workers() ENTERED")
+        _debug_log("_run_workers() called", include_memory=True)
         sorting_enabled = (
             self.config.sort_options is not None and
             self.config.sort_options.enabled
         )
 
+        # Determine output mode
+        output_mode = getattr(self.config, 'output_mode', 'processed')
+        if output_mode == 'processed' and self.config.output_noise:
+            output_mode = 'both'
+        _debug_log(f"Output mode for workers: {output_mode}")
+        _debug_log(f"output_zarr_path: {output_zarr_path}")
+        _debug_log(f"noise_zarr_path: {noise_zarr_path}")
+
         # Create worker tasks
+        _debug_log("Creating worker tasks...", include_memory=True)
         tasks = []
         for segment in segments:
             # Set up sort mapping path if sorting enabled
@@ -424,13 +859,29 @@ class ParallelProcessingCoordinator:
                 sample_rate=sample_rate,
                 metadata=metadata,
                 sort_options=self.config.sort_options if sorting_enabled else None,
-                sort_mapping_path=sort_mapping_path
+                sort_mapping_path=sort_mapping_path,
+                # Output mode (new field)
+                output_mode=output_mode,
+                # Legacy noise output options (for backwards compatibility)
+                output_noise=self.config.output_noise,
+                noise_zarr_path=noise_zarr_path,
+                # Mute options
+                mute_velocity=self.config.mute_velocity,
+                mute_top=self.config.mute_top,
+                mute_bottom=self.config.mute_bottom,
+                mute_taper=self.config.mute_taper,
+                mute_target=self.config.mute_target
             )
             tasks.append(task)
 
         # Use multiprocessing Manager for progress queue
+        _early_log(">>> Creating multiprocessing Manager...")
+        _debug_log("Creating multiprocessing Manager and progress queue...", include_memory=True)
         manager = mp.Manager()
+        _early_log(">>> Manager created, creating queue...")
         progress_queue = manager.Queue()
+        _early_log(">>> Queue created successfully")
+        _debug_log("Manager created successfully", include_memory=True)
 
         # Track progress per worker
         worker_progress_traces = {s.segment_id: 0 for s in segments}
@@ -439,72 +890,225 @@ class ParallelProcessingCoordinator:
         processed_futures = set()
 
         print(f"  Launching {len(tasks)} worker processes...")
+        _early_log(f">>> About to create ProcessPoolExecutor with max_workers={self.n_workers}")
+        _debug_log(f"About to create ProcessPoolExecutor with max_workers={self.n_workers}", include_memory=True)
 
-        # Submit all tasks
-        with ProcessPoolExecutor(max_workers=self.n_workers) as executor:
-            futures = {
-                executor.submit(process_gather_range, task, progress_queue): task
-                for task in tasks
-            }
+        # Use FORK context on Linux for copy-on-write memory sharing
+        # Fork does NOT copy memory - it shares read-only pages (numpy, scipy, pandas)
+        # Only written pages get duplicated, so workers share ~1.5GB of imports
+        # This allows 14+ workers on 32GB systems vs only 6-8 with spawn
+        #
+        # Spawn creates fresh processes that must re-import everything (~2GB each)
+        # Use spawn only on macOS (fork unsafe with Objective-C) or Windows (no fork)
+        import sys
+        if sys.platform == 'linux':
+            mp_ctx = mp.get_context('fork')
+            _early_log(">>> Using 'fork' context for copy-on-write memory sharing (Linux)")
 
-            # Monitor progress
-            start_time = time.time()
+            # PRE-LOAD HEADERS FOR FORK COW SHARING
+            # If sorting or mute is enabled, workers need header columns.
+            # Loading headers here (in parent) before fork means all workers
+            # share the same memory pages via copy-on-write, saving ~178MB per worker
+            # for a 22M trace dataset. Without this, each worker loads independently.
+            mute_enabled = (
+                self.config.mute_velocity > 0 and
+                (self.config.mute_top or self.config.mute_bottom)
+            )
+            header_columns = []
+            if sorting_enabled:
+                header_columns.append(self.config.sort_options.sort_key)
+                if self.config.sort_options.secondary_key:
+                    header_columns.append(self.config.sort_options.secondary_key)
+            if mute_enabled:
+                for col in ['offset', 'OFFSET', 'Offset']:
+                    if col not in header_columns:
+                        header_columns.append(col)
 
-            while len(processed_futures) < len(futures):
-                # Check completed futures
-                for future in futures:
-                    if future.done() and future not in processed_futures:
-                        processed_futures.add(future)
+            if header_columns:
+                headers_path = input_dir / 'headers.parquet'
+                _early_log(f">>> Pre-loading headers for fork COW sharing: {header_columns}")
+                try:
+                    from .worker import set_shared_headers
+                    import pyarrow.parquet as pq
+
+                    # Get actual columns in the parquet file
+                    parquet_schema = pq.read_schema(headers_path)
+                    available_cols = set(parquet_schema.names)
+
+                    # Find which requested columns actually exist (case-sensitive match first)
+                    cols_to_load = []
+                    for col in header_columns:
+                        if col in available_cols:
+                            if col not in cols_to_load:
+                                cols_to_load.append(col)
+                        else:
+                            # Try case-insensitive match
+                            for avail_col in available_cols:
+                                if avail_col.lower() == col.lower() and avail_col not in cols_to_load:
+                                    cols_to_load.append(avail_col)
+                                    break
+
+                    if cols_to_load:
+                        _early_log(f">>> Found columns to load: {cols_to_load}")
+                        shared_headers = pd.read_parquet(headers_path, columns=cols_to_load)
+                        set_shared_headers(shared_headers, cols_to_load)
+                        _early_log(f">>> Headers pre-loaded: {len(shared_headers)} rows, "
+                                  f"{shared_headers.memory_usage(deep=True).sum()/(1024**2):.1f}MB "
+                                  f"(will be shared by all {self.n_workers} workers via COW)")
+                    else:
+                        _early_log(f">>> WARNING: None of requested columns {header_columns} found in parquet")
+                except Exception as e:
+                    _early_log(f">>> WARNING: Failed to pre-load headers: {e}, workers will load independently")
+        else:
+            mp_ctx = mp.get_context('spawn')
+            _early_log(">>> Using 'spawn' context (non-Linux platform)")
+        _early_log(">>> Entering ProcessPoolExecutor context...")
+        try:
+            with ProcessPoolExecutor(max_workers=self.n_workers, mp_context=mp_ctx) as executor:
+                _early_log(">>> ProcessPoolExecutor created, submitting tasks with staggered startup...")
+                _debug_log("ProcessPoolExecutor created, submitting tasks with staggered startup...", include_memory=True)
+
+                futures = {}
+                # With fork context, workers share parent's imported modules via copy-on-write
+                # No heavy import phase needed - workers start almost instantly
+                # With spawn context, each worker needs ~3-5 seconds to complete imports
+                if sys.platform == 'linux':
+                    STAGGER_DELAY = 0.1  # Fork: workers share memory, fast startup
+                else:
+                    STAGGER_DELAY = 1.0  # Spawn: workers need time for imports
+
+                # Check available memory before starting workers
+                mem_before = psutil.virtual_memory()
+                _early_log(f">>> Memory before workers: {mem_before.available/(1024**3):.2f}GB available")
+
+                for i, task in enumerate(tasks):
+                    mem = psutil.virtual_memory()
+                    _early_log(f">>> Submitting task {i+1}/{len(tasks)} (segment {task.segment_id}) "
+                              f"[{mem.available/(1024**3):.2f}GB avail]...")
+
+                    # Check if we have enough memory for another worker
+                    # Fork (Linux): Workers share imports via COW, need ~0.5GB for working data
+                    # Spawn (other): Workers re-import everything, need ~2.5GB each
+                    if sys.platform == 'linux':
+                        MIN_MEMORY_GB = 1.0  # Fork: only need working memory
+                    else:
+                        MIN_MEMORY_GB = 3.0  # Spawn: need full import overhead
+                    if mem.available / (1024**3) < MIN_MEMORY_GB:
+                        _early_log(f">>> WARNING: Low memory! Only {mem.available/(1024**3):.2f}GB available, need {MIN_MEMORY_GB}GB")
+                        # Wait for memory to free up (workers complete imports)
+                        for wait_i in range(30):  # Wait up to 15 seconds
+                            time.sleep(0.5)
+                            mem = psutil.virtual_memory()
+                            if mem.available / (1024**3) >= MIN_MEMORY_GB:
+                                _early_log(f">>> Memory freed: {mem.available/(1024**3):.2f}GB available, continuing")
+                                break
+                            if wait_i % 4 == 0:  # Log every 2 seconds
+                                _early_log(f">>> Waiting for memory... {mem.available/(1024**3):.2f}GB (need {MIN_MEMORY_GB}GB)")
+                        else:
+                            # Timeout - proceed anyway but log warning
+                            _early_log(f">>> TIMEOUT waiting for memory, proceeding with {mem.available/(1024**3):.2f}GB")
+
+                    future = executor.submit(process_gather_range, task, progress_queue)
+                    futures[future] = task
+                    _early_log(f">>> Task {i+1} submitted, waiting {STAGGER_DELAY}s before next...")
+
+                    # Stagger startup - give each worker time to complete heavy imports
+                    # This prevents all workers from loading heavy modules simultaneously
+                    if i < len(tasks) - 1:  # Don't sleep after last task
+                        time.sleep(STAGGER_DELAY)
+
+                _early_log(f">>> All {len(futures)} tasks submitted to executor (staggered)")
+                _early_log(">>> About to call _debug_log for 'all tasks submitted'...")
+                _debug_log(f"All {len(futures)} tasks submitted to executor (staggered)", include_memory=True)
+                _early_log(">>> _debug_log done, setting start_time...")
+
+                # Monitor progress
+                start_time = time.time()
+                _early_log(">>> start_time set, about to enter monitoring loop...")
+                _early_log(">>> Entering monitoring loop...")
+                _debug_log("Entering monitoring loop...", include_memory=True)
+
+                loop_count = 0
+                while len(processed_futures) < len(futures):
+                    loop_count += 1
+                    if loop_count % 10 == 1:  # Log every 10 iterations
+                        mem = psutil.virtual_memory()
+                        _early_log(f">>> Monitor loop #{loop_count}: {len(processed_futures)}/{len(futures)} done, "
+                                  f"{mem.available/(1024**3):.2f}GB avail")
+
+                    # Check completed futures
+                    for future in futures:
+                        if future.done() and future not in processed_futures:
+                            processed_futures.add(future)
+                            try:
+                                result = future.result(timeout=0.1)
+                                results.append(result)
+                                worker_progress_traces[result.segment_id] = result.n_traces_processed
+                                worker_progress_gathers[result.segment_id] = result.n_gathers_processed
+                                print(f"    Worker {result.segment_id} completed: "
+                                      f"{result.n_gathers_processed} gathers, "
+                                      f"{result.n_traces_processed:,} traces in {result.elapsed_time:.1f}s")
+                            except Exception as e:
+                                _early_log(f">>> Worker error: {type(e).__name__}: {e}")
+                                task = futures[future]
+                                results.append(ProcessingWorkerResult(
+                                    segment_id=task.segment_id,
+                                    n_gathers_processed=0,
+                                    n_traces_processed=0,
+                                    elapsed_time=0,
+                                    success=False,
+                                    error=str(e)
+                                ))
+
+                    # Drain progress queue
+                    while not progress_queue.empty():
                         try:
-                            result = future.result(timeout=0.1)
-                            results.append(result)
-                            worker_progress_traces[result.segment_id] = result.n_traces_processed
-                            worker_progress_gathers[result.segment_id] = result.n_gathers_processed
-                            print(f"    Worker {result.segment_id} completed: "
-                                  f"{result.n_gathers_processed} gathers, "
-                                  f"{result.n_traces_processed:,} traces in {result.elapsed_time:.1f}s")
-                        except Exception as e:
-                            task = futures[future]
-                            results.append(ProcessingWorkerResult(
-                                segment_id=task.segment_id,
-                                n_gathers_processed=0,
-                                n_traces_processed=0,
-                                elapsed_time=0,
-                                success=False,
-                                error=str(e)
+                            segment_id, traces_done, gathers_done = progress_queue.get_nowait()
+                            worker_progress_traces[segment_id] = traces_done
+                            worker_progress_gathers[segment_id] = gathers_done
+                        except:
+                            break
+
+                    # Update progress callback
+                    if progress_callback:
+                        total_traces_done = sum(worker_progress_traces.values())
+                        total_gathers_done = sum(worker_progress_gathers.values())
+                        elapsed = time.time() - start_time
+                        rate = total_traces_done / elapsed if elapsed > 0 else 0
+                        eta = (n_traces - total_traces_done) / rate if rate > 0 else 0
+
+                        try:
+                            progress_callback(ProcessingProgress(
+                                phase='processing',
+                                current_traces=total_traces_done,
+                                total_traces=n_traces,
+                                current_gathers=total_gathers_done,
+                                total_gathers=n_gathers,
+                                active_workers=len(futures) - len(processed_futures),
+                                worker_progress=worker_progress_traces.copy(),
+                                elapsed_time=elapsed,
+                                eta_seconds=eta
                             ))
+                        except Exception as cb_err:
+                            _early_log(f">>> ERROR in progress_callback: {type(cb_err).__name__}: {cb_err}")
 
-                # Drain progress queue
-                while not progress_queue.empty():
-                    try:
-                        segment_id, traces_done, gathers_done = progress_queue.get_nowait()
-                        worker_progress_traces[segment_id] = traces_done
-                        worker_progress_gathers[segment_id] = gathers_done
-                    except:
-                        break
+                    # Small sleep to avoid busy-waiting
+                    time.sleep(0.1)
 
-                # Update progress callback
-                if progress_callback:
-                    total_traces_done = sum(worker_progress_traces.values())
-                    total_gathers_done = sum(worker_progress_gathers.values())
-                    elapsed = time.time() - start_time
-                    rate = total_traces_done / elapsed if elapsed > 0 else 0
-                    eta = (n_traces - total_traces_done) / rate if rate > 0 else 0
-
-                    progress_callback(ProcessingProgress(
-                        phase='processing',
-                        current_traces=total_traces_done,
-                        total_traces=n_traces,
-                        current_gathers=total_gathers_done,
-                        total_gathers=n_gathers,
-                        active_workers=len(futures) - len(processed_futures),
-                        worker_progress=worker_progress_traces.copy(),
-                        elapsed_time=elapsed,
-                        eta_seconds=eta
-                    ))
-
-                # Small sleep to avoid busy-waiting
-                time.sleep(0.1)
+        except Exception as executor_err:
+            _early_log(f">>> EXECUTOR EXCEPTION: {type(executor_err).__name__}: {executor_err}")
+            import traceback
+            _early_log(f">>> TRACEBACK:\n{traceback.format_exc()}")
+            raise
+        finally:
+            # Clean up shared headers to free memory
+            if sys.platform == 'linux':
+                try:
+                    from .worker import clear_shared_headers
+                    clear_shared_headers()
+                    _early_log(">>> Cleared shared headers from memory")
+                except Exception:
+                    pass
 
         return results
 
@@ -685,3 +1289,55 @@ class ParallelProcessingCoordinator:
     def cancel(self):
         """Request cancellation of processing."""
         self._cancel_requested = True
+
+    def _check_memory_budget(
+        self,
+        n_workers: int,
+        max_gather_traces: int,
+        n_samples: int,
+        sorting_enabled: bool = False,
+        output_noise: bool = False,
+        output_mode: str = 'processed'
+    ) -> Optional[Tuple[bool, float, float, float, str, str]]:
+        """
+        Check memory budget for parallel processing.
+
+        Uses settings from AppSettings if available, otherwise uses defaults.
+
+        Args:
+            n_workers: Number of parallel workers
+            max_gather_traces: Maximum traces in any single gather
+            n_samples: Samples per trace
+            sorting_enabled: Whether sorting is enabled
+            output_noise: Whether noise output is enabled (legacy)
+            output_mode: 'processed', 'noise', or 'both'
+
+        Returns:
+            Tuple of (is_safe, available_mb, required_mb, ratio, risk_level, message)
+            or None if check is disabled
+        """
+        # Get settings
+        if SETTINGS_AVAILABLE:
+            settings = get_settings()
+            safety_factor = settings.get_parallel_memory_safety_factor() / 100.0
+            memory_copies = settings.get_parallel_memory_copies_estimate()
+            warn_enabled = settings.get_parallel_warn_on_memory_risk()
+        else:
+            # Defaults if settings not available
+            safety_factor = 0.7
+            memory_copies = 4
+            warn_enabled = True
+
+        if not warn_enabled:
+            return None
+
+        return check_parallel_processing_memory_budget(
+            n_workers=n_workers,
+            max_gather_traces=max_gather_traces,
+            n_samples=n_samples,
+            memory_copies=memory_copies,
+            safety_factor=safety_factor,
+            output_noise=output_noise,
+            sorting_enabled=sorting_enabled,
+            output_mode=output_mode
+        )

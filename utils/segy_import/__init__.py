@@ -30,6 +30,7 @@ from .multiprocess_import import (
     ImportConfig,
     ImportProgress,
     ImportResult,
+    ImportStageResult,
 )
 from .multiprocess_import.coordinator import get_optimal_workers
 
@@ -55,6 +56,7 @@ __all__ = [
     'ImportConfig',
     'ImportProgress',
     'ImportResult',
+    'ImportStageResult',
     'get_optimal_workers',
     # Utilities
     'CancellationToken',

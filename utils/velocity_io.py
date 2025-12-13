@@ -3,6 +3,9 @@ Velocity Model I/O Utilities
 
 Read/write velocity models from various formats:
 - Simple text format (t, v pairs)
+- CDP-Time-Velocity triplets (spatially varying)
+- Inline-Xline-Time-Velocity format (3D)
+- SEG-Y velocity files
 - JSON format (with metadata)
 - NumPy binary format
 
@@ -10,14 +13,18 @@ Supports:
 - RMS velocity functions
 - Interval velocity functions
 - 1D v(z) models
+- 2D v(x,z) models
 - Constant velocity models
 """
 
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Optional, Dict, Any, Tuple, List, Union
 import numpy as np
 import json
 import logging
+import re
+from dataclasses import dataclass, field
+from enum import Enum
 
 from models.velocity_model import (
     VelocityModel,
@@ -25,11 +32,418 @@ from models.velocity_model import (
     create_constant_velocity,
     create_linear_gradient_velocity,
     create_from_rms_velocity,
+    create_2d_velocity,
     rms_to_interval_velocity,
     interval_to_rms_velocity,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Velocity File Format Detection and Preview
+# =============================================================================
+
+class VelocityFileFormat(Enum):
+    """Detected velocity file format."""
+    ASCII_TV = "ascii_tv"           # Time-Velocity pairs (single location)
+    ASCII_CDPTV = "ascii_cdp_tv"    # CDP-Time-Velocity triplets
+    ASCII_ILXLTV = "ascii_ilxl_tv"  # Inline-Xline-Time-Velocity
+    SEGY = "segy"                   # SEG-Y velocity file
+    JSON = "json"                   # JSON format
+    NPZ = "npz"                     # NumPy format
+    UNKNOWN = "unknown"
+
+
+@dataclass
+class VelocityFileInfo:
+    """
+    Metadata about a velocity file for preview purposes.
+
+    Attributes:
+        path: Path to velocity file
+        format: Detected file format
+        n_locations: Number of spatial locations (CDPs or inline/xline)
+        n_time_samples: Number of time samples per location
+        time_range: (min_time, max_time) in seconds
+        velocity_range: (min_velocity, max_velocity) in m/s
+        cdp_range: (min_cdp, max_cdp) if applicable
+        inline_range: (min_inline, max_inline) if applicable
+        xline_range: (min_xline, max_xline) if applicable
+        sample_interval: Time sample interval if regular
+        is_valid: Whether file was successfully parsed
+        error_message: Error description if parsing failed
+        raw_data: Parsed data arrays (for conversion to VelocityModel)
+    """
+    path: Path
+    format: VelocityFileFormat = VelocityFileFormat.UNKNOWN
+    n_locations: int = 0
+    n_time_samples: int = 0
+    time_range: Tuple[float, float] = (0.0, 0.0)
+    velocity_range: Tuple[float, float] = (0.0, 0.0)
+    cdp_range: Optional[Tuple[int, int]] = None
+    inline_range: Optional[Tuple[int, int]] = None
+    xline_range: Optional[Tuple[int, int]] = None
+    sample_interval: Optional[float] = None
+    is_valid: bool = False
+    error_message: Optional[str] = None
+    raw_data: Optional[Dict[str, Any]] = field(default=None, repr=False)
+
+
+def detect_velocity_format(filepath: Union[str, Path]) -> VelocityFileFormat:
+    """
+    Auto-detect velocity file format.
+
+    Args:
+        filepath: Path to velocity file
+
+    Returns:
+        Detected VelocityFileFormat
+    """
+    filepath = Path(filepath)
+
+    if not filepath.exists():
+        return VelocityFileFormat.UNKNOWN
+
+    suffix = filepath.suffix.lower()
+
+    # Check by extension first
+    if suffix in ['.sgy', '.segy']:
+        return VelocityFileFormat.SEGY
+    elif suffix == '.json':
+        return VelocityFileFormat.JSON
+    elif suffix in ['.npy', '.npz']:
+        return VelocityFileFormat.NPZ
+
+    # For text files, analyze content
+    try:
+        with open(filepath, 'r') as f:
+            lines = []
+            for i, line in enumerate(f):
+                line = line.strip()
+                if not line or line.startswith('#') or line.startswith('//'):
+                    continue
+                lines.append(line)
+                if len(lines) >= 20:
+                    break
+
+        if not lines:
+            return VelocityFileFormat.UNKNOWN
+
+        # Analyze column count
+        column_counts = []
+        for line in lines:
+            parts = re.split(r'[,\s\t]+', line)
+            numeric_parts = []
+            for p in parts:
+                try:
+                    float(p)
+                    numeric_parts.append(p)
+                except ValueError:
+                    pass
+            if numeric_parts:
+                column_counts.append(len(numeric_parts))
+
+        if not column_counts:
+            return VelocityFileFormat.UNKNOWN
+
+        most_common = max(set(column_counts), key=column_counts.count)
+
+        if most_common == 2:
+            return VelocityFileFormat.ASCII_TV
+        elif most_common == 3:
+            return VelocityFileFormat.ASCII_CDPTV
+        elif most_common >= 4:
+            return VelocityFileFormat.ASCII_ILXLTV
+        else:
+            return VelocityFileFormat.UNKNOWN
+
+    except Exception as e:
+        logger.warning(f"Error detecting format: {e}")
+        return VelocityFileFormat.UNKNOWN
+
+
+def preview_velocity_file(filepath: Union[str, Path]) -> VelocityFileInfo:
+    """
+    Preview velocity file without full loading.
+
+    Args:
+        filepath: Path to velocity file
+
+    Returns:
+        VelocityFileInfo with metadata and optional raw_data
+    """
+    filepath = Path(filepath)
+    info = VelocityFileInfo(path=filepath)
+
+    if not filepath.exists():
+        info.error_message = f"File not found: {filepath}"
+        return info
+
+    info.format = detect_velocity_format(filepath)
+
+    try:
+        if info.format == VelocityFileFormat.SEGY:
+            info = _preview_velocity_segy(filepath, info)
+        elif info.format == VelocityFileFormat.JSON:
+            info = _preview_velocity_json(filepath, info)
+        elif info.format == VelocityFileFormat.NPZ:
+            info = _preview_velocity_npz(filepath, info)
+        elif info.format == VelocityFileFormat.ASCII_TV:
+            info = _preview_velocity_ascii_tv(filepath, info)
+        elif info.format == VelocityFileFormat.ASCII_CDPTV:
+            info = _preview_velocity_ascii_cdptv(filepath, info)
+        elif info.format == VelocityFileFormat.ASCII_ILXLTV:
+            info = _preview_velocity_ascii_ilxltv(filepath, info)
+        else:
+            info.error_message = "Unknown file format"
+
+    except Exception as e:
+        info.error_message = f"Preview error: {str(e)}"
+        logger.exception(f"Error previewing {filepath}")
+
+    return info
+
+
+def _preview_velocity_ascii_tv(filepath: Path, info: VelocityFileInfo) -> VelocityFileInfo:
+    """Preview Time-Velocity pair format."""
+    times = []
+    velocities = []
+
+    with open(filepath, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#') or line.startswith('//'):
+                continue
+            parts = re.split(r'[,\s\t]+', line)
+            try:
+                if len(parts) >= 2:
+                    times.append(float(parts[0]))
+                    velocities.append(float(parts[1]))
+            except ValueError:
+                continue
+
+    if not times:
+        info.error_message = "No valid data found"
+        return info
+
+    times = np.array(times)
+    velocities = np.array(velocities)
+
+    info.n_locations = 1
+    info.n_time_samples = len(times)
+    info.time_range = (float(times.min()), float(times.max()))
+    info.velocity_range = (float(velocities.min()), float(velocities.max()))
+
+    if len(times) > 1:
+        dt = np.diff(times)
+        if np.allclose(dt, dt[0], rtol=0.01):
+            info.sample_interval = float(dt[0])
+
+    info.raw_data = {'times': times, 'velocities': velocities, 'format': 'tv'}
+    info.is_valid = True
+    return info
+
+
+def _preview_velocity_ascii_cdptv(filepath: Path, info: VelocityFileInfo) -> VelocityFileInfo:
+    """Preview CDP-Time-Velocity triplet format."""
+    cdps = []
+    times = []
+    velocities = []
+
+    with open(filepath, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#') or line.startswith('//'):
+                continue
+            parts = re.split(r'[,\s\t]+', line)
+            try:
+                if len(parts) >= 3:
+                    cdps.append(int(float(parts[0])))
+                    times.append(float(parts[1]))
+                    velocities.append(float(parts[2]))
+            except ValueError:
+                continue
+
+    if not times:
+        info.error_message = "No valid data found"
+        return info
+
+    cdps = np.array(cdps)
+    times = np.array(times)
+    velocities = np.array(velocities)
+    unique_cdps = np.unique(cdps)
+
+    info.n_locations = len(unique_cdps)
+    info.n_time_samples = len(times) // len(unique_cdps) if len(unique_cdps) > 0 else 0
+    info.time_range = (float(times.min()), float(times.max()))
+    info.velocity_range = (float(velocities.min()), float(velocities.max()))
+    info.cdp_range = (int(unique_cdps.min()), int(unique_cdps.max()))
+
+    info.raw_data = {
+        'cdps': cdps, 'times': times, 'velocities': velocities,
+        'unique_cdps': unique_cdps, 'format': 'cdp_tv'
+    }
+    info.is_valid = True
+    return info
+
+
+def _preview_velocity_ascii_ilxltv(filepath: Path, info: VelocityFileInfo) -> VelocityFileInfo:
+    """Preview Inline-Xline-Time-Velocity format."""
+    inlines = []
+    xlines = []
+    times = []
+    velocities = []
+
+    with open(filepath, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#') or line.startswith('//'):
+                continue
+            parts = re.split(r'[,\s\t]+', line)
+            try:
+                if len(parts) >= 4:
+                    inlines.append(int(float(parts[0])))
+                    xlines.append(int(float(parts[1])))
+                    times.append(float(parts[2]))
+                    velocities.append(float(parts[3]))
+            except ValueError:
+                continue
+
+    if not times:
+        info.error_message = "No valid data found"
+        return info
+
+    inlines = np.array(inlines)
+    xlines = np.array(xlines)
+    times = np.array(times)
+    velocities = np.array(velocities)
+
+    unique_inlines = np.unique(inlines)
+    unique_xlines = np.unique(xlines)
+    n_locations = len(np.unique(list(zip(inlines, xlines))))
+
+    info.n_locations = n_locations
+    info.n_time_samples = len(times) // n_locations if n_locations > 0 else 0
+    info.time_range = (float(times.min()), float(times.max()))
+    info.velocity_range = (float(velocities.min()), float(velocities.max()))
+    info.inline_range = (int(unique_inlines.min()), int(unique_inlines.max()))
+    info.xline_range = (int(unique_xlines.min()), int(unique_xlines.max()))
+
+    info.raw_data = {
+        'inlines': inlines, 'xlines': xlines, 'times': times, 'velocities': velocities,
+        'unique_inlines': unique_inlines, 'unique_xlines': unique_xlines, 'format': 'ilxl_tv'
+    }
+    info.is_valid = True
+    return info
+
+
+def _preview_velocity_segy(filepath: Path, info: VelocityFileInfo) -> VelocityFileInfo:
+    """Preview SEG-Y velocity file."""
+    try:
+        import segyio
+
+        with segyio.open(str(filepath), 'r', ignore_geometry=True) as f:
+            n_traces = f.tracecount
+            n_samples = len(f.samples)
+            sample_interval = f.bin[segyio.BinField.Interval] / 1e6
+
+            # Sample first few traces for velocity range
+            sample_traces = min(10, n_traces)
+            v_min, v_max = float('inf'), float('-inf')
+            cdps = []
+
+            for i in range(sample_traces):
+                trace = f.trace[i]
+                v_min = min(v_min, trace.min())
+                v_max = max(v_max, trace.max())
+                cdps.append(f.header[i][segyio.TraceField.CDP])
+
+            times = f.samples / 1000.0
+
+            info.n_locations = n_traces
+            info.n_time_samples = n_samples
+            info.time_range = (float(times.min()), float(times.max()))
+            info.velocity_range = (float(v_min), float(v_max))
+            info.sample_interval = float(sample_interval)
+
+            if any(c != 0 for c in cdps):
+                # Read all CDPs for range
+                all_cdps = [f.header[i][segyio.TraceField.CDP] for i in range(n_traces)]
+                info.cdp_range = (min(all_cdps), max(all_cdps))
+
+            info.raw_data = {'format': 'segy', 'filepath': str(filepath)}
+            info.is_valid = True
+
+    except ImportError:
+        info.error_message = "segyio library not installed"
+    except Exception as e:
+        info.error_message = f"SEG-Y error: {str(e)}"
+
+    return info
+
+
+def _preview_velocity_json(filepath: Path, info: VelocityFileInfo) -> VelocityFileInfo:
+    """Preview JSON velocity file."""
+    with open(filepath, 'r') as f:
+        data = json.load(f)
+
+    vel_type = data.get('velocity_type', 'v_of_z')
+    vel_data = data.get('data')
+
+    if isinstance(vel_data, (int, float)):
+        info.n_locations = 1
+        info.n_time_samples = 1
+        info.velocity_range = (float(vel_data), float(vel_data))
+    elif isinstance(vel_data, list):
+        vel_arr = np.array(vel_data)
+        if vel_arr.ndim == 1:
+            info.n_locations = 1
+            info.n_time_samples = len(vel_arr)
+        else:
+            info.n_time_samples = vel_arr.shape[0]
+            info.n_locations = vel_arr.shape[1] if vel_arr.ndim > 1 else 1
+        info.velocity_range = (float(vel_arr.min()), float(vel_arr.max()))
+
+    if 'z_axis' in data:
+        z_arr = np.array(data['z_axis'])
+        info.time_range = (float(z_arr.min()), float(z_arr.max()))
+        if len(z_arr) > 1:
+            info.sample_interval = float(z_arr[1] - z_arr[0])
+
+    info.raw_data = {'format': 'json', 'data': data}
+    info.is_valid = True
+    return info
+
+
+def _preview_velocity_npz(filepath: Path, info: VelocityFileInfo) -> VelocityFileInfo:
+    """Preview NPZ velocity file."""
+    npz = np.load(filepath, allow_pickle=True)
+
+    vel_data = npz['data']
+    if vel_data.ndim == 0:
+        info.n_locations = 1
+        info.n_time_samples = 1
+        info.velocity_range = (float(vel_data), float(vel_data))
+    elif vel_data.ndim == 1:
+        info.n_locations = 1
+        info.n_time_samples = len(vel_data)
+        info.velocity_range = (float(vel_data.min()), float(vel_data.max()))
+    else:
+        info.n_time_samples = vel_data.shape[0]
+        info.n_locations = vel_data.shape[1] if vel_data.ndim > 1 else 1
+        info.velocity_range = (float(vel_data.min()), float(vel_data.max()))
+
+    if 'z_axis' in npz:
+        z_arr = npz['z_axis']
+        if z_arr.ndim > 0:
+            info.time_range = (float(z_arr.min()), float(z_arr.max()))
+            if len(z_arr) > 1:
+                info.sample_interval = float(z_arr[1] - z_arr[0])
+
+    info.raw_data = {'format': 'npz', 'filepath': str(filepath)}
+    info.is_valid = True
+    return info
 
 
 def read_velocity_text(
@@ -518,3 +932,371 @@ def create_velocity_from_picks(
     )
 
     return model
+
+
+# =============================================================================
+# Extended Velocity File Reading (CDP-TV, SEG-Y)
+# =============================================================================
+
+def read_velocity_cdptv(
+    filepath: Union[str, Path],
+    time_unit: str = 'ms',
+    velocity_unit: str = 'm/s',
+    velocity_type: str = 'rms',
+) -> VelocityModel:
+    """
+    Read spatially-varying velocity from CDP-Time-Velocity format.
+
+    Format: Three columns (CDP, Time, Velocity) per line.
+    Creates a 2D velocity model v(CDP, t).
+
+    Args:
+        filepath: Path to ASCII velocity file
+        time_unit: Input time unit ('s', 'ms')
+        velocity_unit: Input velocity unit ('m/s', 'km/s', 'ft/s')
+        velocity_type: 'rms' or 'interval'
+
+    Returns:
+        VelocityModel (2D: v(x,z) where x=CDP, z=time)
+    """
+    filepath = Path(filepath)
+    if not filepath.exists():
+        raise FileNotFoundError(f"Velocity file not found: {filepath}")
+
+    # Use preview function to parse the file
+    info = preview_velocity_file(filepath)
+
+    if not info.is_valid:
+        raise ValueError(f"Failed to read velocity file: {info.error_message}")
+
+    if info.format != VelocityFileFormat.ASCII_CDPTV:
+        raise ValueError(f"Expected CDP-TV format, got {info.format.value}")
+
+    raw = info.raw_data
+    cdps = raw['cdps']
+    times = raw['times']
+    velocities = raw['velocities']
+    unique_cdps = raw['unique_cdps']
+
+    # Convert units
+    if time_unit == 'ms':
+        times = times / 1000.0
+    if velocity_unit == 'km/s':
+        velocities = velocities * 1000.0
+    elif velocity_unit == 'ft/s':
+        velocities = velocities * 0.3048
+
+    # Build time axis from first CDP
+    first_cdp_mask = cdps == unique_cdps[0]
+    time_axis = np.sort(times[first_cdp_mask])
+
+    # Build 2D array (n_time x n_cdp)
+    n_time = len(time_axis)
+    n_cdp = len(unique_cdps)
+    vel_2d = np.zeros((n_time, n_cdp), dtype=np.float32)
+
+    for i, cdp in enumerate(unique_cdps):
+        mask = cdps == cdp
+        cdp_t = times[mask]
+        cdp_v = velocities[mask]
+        # Sort by time and interpolate to regular grid
+        sort_idx = np.argsort(cdp_t)
+        vel_2d[:, i] = np.interp(time_axis, cdp_t[sort_idx], cdp_v[sort_idx])
+
+    model = create_2d_velocity(
+        data=vel_2d,
+        z_axis=time_axis.astype(np.float32),
+        x_axis=unique_cdps.astype(np.float32),
+        is_time=True,
+        metadata={
+            'source_file': str(filepath),
+            'velocity_type': velocity_type,
+            'cdp_range': (int(unique_cdps.min()), int(unique_cdps.max())),
+            'original_time_unit': time_unit,
+            'original_velocity_unit': velocity_unit,
+        }
+    )
+
+    logger.info(
+        f"Read 2D velocity model from {filepath}: "
+        f"{n_cdp} CDPs x {n_time} samples, "
+        f"CDP=[{unique_cdps.min()}, {unique_cdps.max()}], "
+        f"v=[{vel_2d.min():.0f}, {vel_2d.max():.0f}] m/s"
+    )
+
+    return model
+
+
+def read_velocity_segy(
+    filepath: Union[str, Path],
+    velocity_type: str = 'rms',
+) -> VelocityModel:
+    """
+    Read velocity model from SEG-Y file.
+
+    Each trace represents velocity function at one CDP/location.
+    Trace samples are velocities at regular time intervals.
+
+    Args:
+        filepath: Path to SEG-Y velocity file
+        velocity_type: 'rms' or 'interval'
+
+    Returns:
+        VelocityModel (1D if single trace, 2D if multiple)
+    """
+    filepath = Path(filepath)
+    if not filepath.exists():
+        raise FileNotFoundError(f"Velocity file not found: {filepath}")
+
+    try:
+        import segyio
+    except ImportError:
+        raise ImportError("segyio library required for SEG-Y velocity files")
+
+    with segyio.open(str(filepath), 'r', ignore_geometry=True) as f:
+        n_traces = f.tracecount
+        n_samples = len(f.samples)
+        sample_interval = f.bin[segyio.BinField.Interval] / 1e6  # microsec to sec
+
+        # Build time axis
+        times = f.samples / 1000.0  # ms to seconds
+
+        if n_traces == 1:
+            # Single trace - 1D model
+            velocities = f.trace[0].astype(np.float32)
+            model = VelocityModel(
+                data=velocities,
+                z_axis=times.astype(np.float32),
+                is_time=True,
+                metadata={
+                    'source_file': str(filepath),
+                    'velocity_type': velocity_type,
+                    'format': 'segy',
+                }
+            )
+        else:
+            # Multiple traces - 2D model
+            velocities = np.zeros((n_samples, n_traces), dtype=np.float32)
+            cdps = np.zeros(n_traces, dtype=np.int32)
+
+            for i in range(n_traces):
+                velocities[:, i] = f.trace[i]
+                cdps[i] = f.header[i][segyio.TraceField.CDP]
+
+            # Use CDP as x-axis if available
+            if np.any(cdps != 0):
+                x_axis = cdps.astype(np.float32)
+            else:
+                x_axis = np.arange(n_traces, dtype=np.float32)
+
+            model = create_2d_velocity(
+                data=velocities,
+                z_axis=times.astype(np.float32),
+                x_axis=x_axis,
+                is_time=True,
+                metadata={
+                    'source_file': str(filepath),
+                    'velocity_type': velocity_type,
+                    'format': 'segy',
+                    'cdp_range': (int(cdps.min()), int(cdps.max())) if np.any(cdps != 0) else None,
+                }
+            )
+
+    logger.info(f"Read velocity model from SEG-Y {filepath}: {model}")
+    return model
+
+
+def velocity_info_to_model(
+    info: VelocityFileInfo,
+    velocity_type: str = 'rms',
+    time_unit: str = 'ms',
+    velocity_unit: str = 'm/s',
+) -> VelocityModel:
+    """
+    Convert VelocityFileInfo (from preview) to VelocityModel.
+
+    Args:
+        info: VelocityFileInfo from preview_velocity_file()
+        velocity_type: 'rms' or 'interval'
+        time_unit: Time unit for ASCII files ('s' or 'ms')
+        velocity_unit: Velocity unit for ASCII files ('m/s', 'km/s', 'ft/s')
+
+    Returns:
+        VelocityModel instance
+
+    Raises:
+        ValueError: If info is invalid
+    """
+    if not info.is_valid:
+        raise ValueError(f"Invalid velocity file: {info.error_message}")
+
+    raw = info.raw_data
+    fmt = raw.get('format', '')
+
+    if fmt == 'tv':
+        # Single location - 1D model
+        times = raw['times'].copy()
+        velocities = raw['velocities'].copy()
+
+        # Convert units
+        if time_unit == 'ms':
+            times = times / 1000.0
+        if velocity_unit == 'km/s':
+            velocities = velocities * 1000.0
+        elif velocity_unit == 'ft/s':
+            velocities = velocities * 0.3048
+
+        return VelocityModel(
+            data=velocities.astype(np.float32),
+            z_axis=times.astype(np.float32),
+            is_time=True,
+            metadata={
+                'source_file': str(info.path),
+                'velocity_type': velocity_type,
+            }
+        )
+
+    elif fmt == 'cdp_tv':
+        # Use the dedicated reader
+        return read_velocity_cdptv(
+            info.path,
+            time_unit=time_unit,
+            velocity_unit=velocity_unit,
+            velocity_type=velocity_type,
+        )
+
+    elif fmt == 'ilxl_tv':
+        # Inline-Xline format - create 2D model using inline as x-axis
+        inlines = raw['inlines']
+        times = raw['times'].copy()
+        velocities = raw['velocities'].copy()
+        unique_inlines = raw['unique_inlines']
+
+        # Convert units
+        if time_unit == 'ms':
+            times = times / 1000.0
+        if velocity_unit == 'km/s':
+            velocities = velocities * 1000.0
+        elif velocity_unit == 'ft/s':
+            velocities = velocities * 0.3048
+
+        # Build time axis from first inline
+        first_il_mask = inlines == unique_inlines[0]
+        time_axis = np.sort(times[first_il_mask])
+
+        # Build 2D array
+        n_time = len(time_axis)
+        n_il = len(unique_inlines)
+        vel_2d = np.zeros((n_time, n_il), dtype=np.float32)
+
+        for i, il in enumerate(unique_inlines):
+            mask = inlines == il
+            il_t = times[mask]
+            il_v = velocities[mask]
+            sort_idx = np.argsort(il_t)
+            vel_2d[:, i] = np.interp(time_axis, il_t[sort_idx], il_v[sort_idx])
+
+        return create_2d_velocity(
+            data=vel_2d,
+            z_axis=time_axis.astype(np.float32),
+            x_axis=unique_inlines.astype(np.float32),
+            is_time=True,
+            metadata={
+                'source_file': str(info.path),
+                'velocity_type': velocity_type,
+                'inline_range': info.inline_range,
+                'xline_range': info.xline_range,
+            }
+        )
+
+    elif fmt == 'segy':
+        return read_velocity_segy(info.path, velocity_type=velocity_type)
+
+    elif fmt == 'json':
+        return read_velocity_json(str(info.path))
+
+    elif fmt == 'npz':
+        return read_velocity_npy(str(info.path))
+
+    else:
+        raise ValueError(f"Unknown velocity format: {fmt}")
+
+
+def get_velocity_at_cdp(
+    model: VelocityModel,
+    cdp: int,
+    times: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Extract velocity function at a specific CDP location.
+
+    For 2D models, interpolates to the requested CDP.
+    For 1D models, returns the single velocity function.
+
+    Args:
+        model: VelocityModel (1D or 2D)
+        cdp: CDP number to extract
+        times: Optional time values to interpolate to
+
+    Returns:
+        Tuple of (times, velocities) arrays
+    """
+    if model.velocity_type == VelocityType.CONSTANT:
+        if times is None:
+            times = np.array([0.0, 6.0], dtype=np.float32)
+        return times, np.full_like(times, model.data)
+
+    elif model.velocity_type == VelocityType.V_OF_Z:
+        if times is None:
+            return model.z_axis, model.data
+        else:
+            return times, np.interp(times, model.z_axis, model.data).astype(np.float32)
+
+    elif model.velocity_type == VelocityType.V_OF_XZ:
+        if times is None:
+            times = model.z_axis
+
+        # Interpolate velocity at CDP location
+        velocities = model.get_velocity_at(times, x=float(cdp))
+        return times, velocities
+
+    else:
+        raise ValueError(f"Unsupported velocity type: {model.velocity_type}")
+
+
+def get_velocity_summary(model: VelocityModel) -> str:
+    """
+    Generate human-readable summary of velocity model.
+
+    Args:
+        model: VelocityModel instance
+
+    Returns:
+        Formatted summary string
+    """
+    lines = [f"Velocity Model: {model.velocity_type.value}"]
+
+    if model.velocity_type == VelocityType.CONSTANT:
+        lines.append(f"  Constant: {model.data:.0f} m/s")
+    elif model.velocity_type == VelocityType.V_OF_Z:
+        lines.extend([
+            f"  Samples: {len(model.data)}",
+            f"  Time range: {model.z_axis[0]:.3f} - {model.z_axis[-1]:.3f} s",
+            f"  Velocity range: {model.data.min():.0f} - {model.data.max():.0f} m/s",
+            f"  V0: {model.v0:.0f} m/s",
+            f"  Gradient: {model.gradient:.2f} m/s/s" if model.gradient else "",
+        ])
+    elif model.velocity_type == VelocityType.V_OF_XZ:
+        lines.extend([
+            f"  Shape: {model.data.shape[1]} locations x {model.data.shape[0]} samples",
+            f"  Time range: {model.z_axis[0]:.3f} - {model.z_axis[-1]:.3f} s",
+            f"  X range: {model.x_axis[0]:.0f} - {model.x_axis[-1]:.0f}",
+            f"  Velocity range: {model.data.min():.0f} - {model.data.max():.0f} m/s",
+        ])
+
+    if model.metadata.get('velocity_type'):
+        lines.append(f"  Type: {model.metadata['velocity_type']}")
+    if model.metadata.get('source_file'):
+        lines.append(f"  Source: {Path(model.metadata['source_file']).name}")
+
+    return "\n".join(filter(None, lines))

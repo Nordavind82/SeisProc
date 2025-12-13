@@ -85,12 +85,19 @@ class LazySeismicData:
         """
         storage_path = Path(storage_dir)
 
-        # Check required files
+        # Handle case where user selected traces.zarr or noise.zarr directory directly
+        if storage_path.name in ('traces.zarr', 'noise.zarr'):
+            storage_path = storage_path.parent
+
+        # Check required files - try traces.zarr first, fall back to noise.zarr
         zarr_path = storage_path / 'traces.zarr'
+        if not zarr_path.exists():
+            # Fall back to noise.zarr for noise-only output datasets
+            zarr_path = storage_path / 'noise.zarr'
         metadata_path = storage_path / 'metadata.json'
 
         if not zarr_path.exists():
-            raise FileNotFoundError(f"Zarr array not found: {zarr_path}")
+            raise FileNotFoundError(f"Zarr array not found: {storage_path / 'traces.zarr'}")
         if not metadata_path.exists():
             raise FileNotFoundError(f"Metadata not found: {metadata_path}")
 

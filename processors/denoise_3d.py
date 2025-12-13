@@ -2,42 +2,39 @@
 3D Spatial Denoising Processor.
 
 Implements 3D spatial statistics for robust noise estimation by:
-1. Building a 3D volume from 2D gather using user-selected headers
+1. Building a 3D volume from 2D gather using CDP coordinates or headers
 2. Computing spatial noise statistics in 3D (inline x crossline apertures)
 3. Applying DWT-based denoising with 3D MAD thresholding
 4. Extracting results back to original 2D gather organization
 
-Key advantages:
-- Exploits spatial coherence in both inline and crossline directions
-- More robust noise estimation than 1D aperture
-- User-selectable headers for flexible volume organization
-- DWT for fast computation with perfect reconstruction
+Supports two volume building modes:
+- Coordinate-based: Uses CDP_X/CDP_Y with user-specified bin size (handles multi-fold)
+- Header-based: Uses header keys like field_record/trace_number (legacy mode)
 
-Best suited for:
-- Organized gathers (shot, CDP, receiver, etc.)
-- Data with coherent signal in multiple spatial directions
-- Random noise attenuation with strong spatial constraints
+Multi-fold handling (when multiple traces fall into same bin):
+- noise_subtract: Fast, compute noise model from representative and subtract from all traces
+- residual_preserve: Store per-trace residuals, add back after denoising
+- multi_pass: Most accurate, denoise each trace individually (N passes for max fold N)
 """
 import numpy as np
 import pandas as pd
-from typing import Optional, Literal, Tuple, Dict, Any, List
+from typing import Optional, Literal, Tuple, Dict, Any, List, Callable
+from dataclasses import dataclass
 import logging
 import pywt
 
 from models.seismic_data import SeismicData
+from models.seismic_volume import SeismicVolume
 from processors.base_processor import BaseProcessor
+from utils.coordinate_volume_builder import (
+    CoordinateVolumeBuilder,
+    BinningConfig,
+    BinningGeometry,
+    ReconstructionMethod,
+    RepresentativeMethod,
+)
 
 logger = logging.getLogger(__name__)
-
-# Try to import joblib for parallel processing
-try:
-    from joblib import Parallel, delayed
-    import multiprocessing
-    JOBLIB_AVAILABLE = True
-    N_JOBS = max(1, multiprocessing.cpu_count() - 1)
-except ImportError:
-    JOBLIB_AVAILABLE = False
-    N_JOBS = 1
 
 
 def compute_3d_mad(data_3d: np.ndarray,
@@ -74,7 +71,7 @@ def compute_3d_mad(data_3d: np.ndarray,
             xl_end = min(n_xlines, xl + half_xl + 1)
 
             # Extract spatial patch for all time samples
-            patch = data_3d[:, il_start:il_end, xl_start:xl_end]  # (n_samples, patch_il, patch_xl)
+            patch = data_3d[:, il_start:il_end, xl_start:xl_end]
 
             # Reshape to (n_samples, patch_size) for per-time-sample statistics
             patch_flat = patch.reshape(n_samples, -1)
@@ -87,127 +84,6 @@ def compute_3d_mad(data_3d: np.ndarray,
             mad_3d[:, il, xl] = mad
 
     return median_3d, mad_3d
-
-
-def build_volume_from_headers(
-    traces: np.ndarray,
-    headers_df: pd.DataFrame,
-    inline_key: str,
-    xline_key: str
-) -> Tuple[np.ndarray, Dict[str, Any]]:
-    """
-    Build a 3D volume from 2D traces using header keys.
-
-    Args:
-        traces: 2D array (n_samples, n_traces)
-        headers_df: DataFrame with trace headers
-        inline_key: Header name for inline axis
-        xline_key: Header name for crossline axis
-
-    Returns:
-        Tuple of:
-        - volume: 3D array (n_samples, n_inlines, n_xlines)
-        - geometry: Dict with mapping information for extraction
-    """
-    n_samples, n_traces = traces.shape
-
-    if inline_key not in headers_df.columns:
-        raise ValueError(f"Inline key '{inline_key}' not found in headers. "
-                        f"Available: {list(headers_df.columns)[:10]}")
-    if xline_key not in headers_df.columns:
-        raise ValueError(f"Crossline key '{xline_key}' not found in headers. "
-                        f"Available: {list(headers_df.columns)[:10]}")
-
-    if len(headers_df) != n_traces:
-        raise ValueError(f"Header count ({len(headers_df)}) doesn't match trace count ({n_traces})")
-
-    # Get unique values
-    inline_vals = np.sort(headers_df[inline_key].unique())
-    xline_vals = np.sort(headers_df[xline_key].unique())
-
-    n_inlines = len(inline_vals)
-    n_xlines = len(xline_vals)
-
-    # Create mappings
-    inline_to_idx = {v: i for i, v in enumerate(inline_vals)}
-    xline_to_idx = {v: i for i, v in enumerate(xline_vals)}
-
-    # Initialize volume
-    volume = np.zeros((n_samples, n_inlines, n_xlines), dtype=traces.dtype)
-
-    # Track which positions have data
-    has_data = np.zeros((n_inlines, n_xlines), dtype=bool)
-
-    # Fill volume
-    for trace_idx in range(n_traces):
-        il_val = headers_df.iloc[trace_idx][inline_key]
-        xl_val = headers_df.iloc[trace_idx][xline_key]
-
-        il_idx = inline_to_idx.get(il_val)
-        xl_idx = xline_to_idx.get(xl_val)
-
-        if il_idx is not None and xl_idx is not None:
-            volume[:, il_idx, xl_idx] = traces[:, trace_idx]
-            has_data[il_idx, xl_idx] = True
-
-    coverage = has_data.sum() / (n_inlines * n_xlines) * 100
-
-    geometry = {
-        'inline_key': inline_key,
-        'xline_key': xline_key,
-        'inline_vals': inline_vals,
-        'xline_vals': xline_vals,
-        'inline_to_idx': inline_to_idx,
-        'xline_to_idx': xline_to_idx,
-        'n_inlines': n_inlines,
-        'n_xlines': n_xlines,
-        'has_data': has_data,
-        'coverage': coverage
-    }
-
-    logger.info(f"Built volume: {n_samples}×{n_inlines}×{n_xlines}, "
-               f"coverage={coverage:.1f}%")
-
-    return volume, geometry
-
-
-def extract_traces_from_volume(
-    volume: np.ndarray,
-    headers_df: pd.DataFrame,
-    geometry: Dict[str, Any]
-) -> np.ndarray:
-    """
-    Extract traces from 3D volume back to original 2D organization.
-
-    Args:
-        volume: 3D array (n_samples, n_inlines, n_xlines)
-        headers_df: DataFrame with trace headers
-        geometry: Dict with mapping information from build_volume_from_headers
-
-    Returns:
-        traces: 2D array (n_samples, n_traces) in original order
-    """
-    n_samples = volume.shape[0]
-    n_traces = len(headers_df)
-
-    inline_key = geometry['inline_key']
-    xline_key = geometry['xline_key']
-    inline_to_idx = geometry['inline_to_idx']
-    xline_to_idx = geometry['xline_to_idx']
-
-    traces = np.zeros((n_samples, n_traces), dtype=volume.dtype)
-
-    for trace_idx in range(n_traces):
-        il_val = headers_df.iloc[trace_idx][inline_key]
-        xl_val = headers_df.iloc[trace_idx][xline_key]
-
-        il_idx = inline_to_idx.get(il_val)
-        xl_idx = xline_to_idx.get(xl_val)
-
-        if il_idx is not None and xl_idx is not None:
-            traces[:, trace_idx] = volume[:, il_idx, xl_idx]
-
-    return traces
 
 
 def get_available_headers(headers_df: pd.DataFrame, min_unique: int = 2) -> List[str]:
@@ -237,41 +113,105 @@ def get_available_headers(headers_df: pd.DataFrame, min_unique: int = 2) -> List
     return [h for h, _ in available]
 
 
+@dataclass
+class Denoise3DConfig:
+    """Configuration for 3D spatial denoising."""
+
+    # Volume building mode
+    use_coordinates: bool = True  # True = CDP coordinates, False = header keys
+
+    # Coordinate-based parameters (when use_coordinates=True)
+    bin_size_x: float = 25.0
+    bin_size_y: float = 25.0
+    coord_x_key: str = 'CDP_X'
+    coord_y_key: str = 'CDP_Y'
+
+    # Header-based parameters (when use_coordinates=False)
+    inline_key: str = 'field_record'
+    xline_key: str = 'trace_number'
+
+    # Multi-fold handling
+    representative_method: str = 'median'  # 'mean', 'median', 'first', 'nearest'
+    reconstruction_method: str = 'noise_subtract'  # 'noise_subtract', 'residual_preserve', 'multi_pass'
+
+    # Spatial aperture
+    aperture_inline: int = 3
+    aperture_xline: int = 3
+
+    # DWT parameters
+    wavelet: str = 'db4'
+    level: Optional[int] = None
+    threshold_k: float = 3.0
+    threshold_mode: str = 'soft'  # 'soft' or 'hard'
+
+
 class Denoise3D(BaseProcessor):
     """
     3D Spatial Denoising using DWT with 3D MAD statistics.
 
-    Builds a 3D volume from 2D gather data using user-specified headers,
-    computes robust noise estimates using 2D spatial apertures (inline × crossline),
-    and applies DWT-based thresholding.
+    Supports two volume building modes:
+    1. Coordinate-based: Uses CDP_X/CDP_Y with bin size (handles multi-fold bins)
+    2. Header-based: Uses header keys for inline/xline axes (legacy mode)
 
-    The result is extracted back to the original 2D gather organization.
+    Multi-fold reconstruction methods:
+    - noise_subtract: Fast, for design/preview
+    - residual_preserve: Medium, preserves per-trace differences
+    - multi_pass: Accurate, each trace denoised individually
     """
 
-    def __init__(self,
-                 inline_key: str = 'field_record',
-                 xline_key: str = 'trace_number',
-                 aperture_inline: int = 3,
-                 aperture_xline: int = 3,
-                 wavelet: str = 'db4',
-                 level: Optional[int] = None,
-                 threshold_k: float = 3.0,
-                 threshold_mode: Literal['soft', 'hard'] = 'soft'):
+    def __init__(
+        self,
+        # Volume building mode
+        use_coordinates: bool = False,
+        # Coordinate-based params
+        bin_size_x: float = 25.0,
+        bin_size_y: float = 25.0,
+        coord_x_key: str = 'CDP_X',
+        coord_y_key: str = 'CDP_Y',
+        # Header-based params (legacy)
+        inline_key: str = 'field_record',
+        xline_key: str = 'trace_number',
+        # Multi-fold handling
+        representative_method: str = 'median',
+        reconstruction_method: str = 'noise_subtract',
+        # Spatial aperture
+        aperture_inline: int = 3,
+        aperture_xline: int = 3,
+        # DWT params
+        wavelet: str = 'db4',
+        level: Optional[int] = None,
+        threshold_k: float = 3.0,
+        threshold_mode: Literal['soft', 'hard'] = 'soft'
+    ):
         """
         Initialize 3D Denoise processor.
 
         Args:
-            inline_key: Header name for inline (X) axis of 3D volume
-            xline_key: Header name for crossline (Y) axis of 3D volume
-            aperture_inline: Spatial aperture in inline direction (odd, ≥3)
-            aperture_xline: Spatial aperture in crossline direction (odd, ≥3)
-            wavelet: Wavelet name (default 'db4')
-            level: Decomposition level (None = auto)
+            use_coordinates: True = use CDP coordinates with binning, False = use headers
+            bin_size_x: Bin size in X direction (meters) for coordinate mode
+            bin_size_y: Bin size in Y direction (meters) for coordinate mode
+            coord_x_key: X coordinate header name
+            coord_y_key: Y coordinate header name
+            inline_key: Header name for inline axis (header mode)
+            xline_key: Header name for crossline axis (header mode)
+            representative_method: How to combine traces in bin ('median', 'mean', 'first', 'nearest')
+            reconstruction_method: How to reconstruct traces ('noise_subtract', 'residual_preserve', 'multi_pass')
+            aperture_inline: Spatial aperture in inline direction (odd, >=1)
+            aperture_xline: Spatial aperture in crossline direction (odd, >=1)
+            wavelet: Wavelet name for DWT
+            level: DWT decomposition level (None = auto)
             threshold_k: MAD threshold multiplier
             threshold_mode: 'soft' or 'hard' thresholding
         """
+        self.use_coordinates = use_coordinates
+        self.bin_size_x = bin_size_x
+        self.bin_size_y = bin_size_y
+        self.coord_x_key = coord_x_key
+        self.coord_y_key = coord_y_key
         self.inline_key = inline_key
         self.xline_key = xline_key
+        self.representative_method = representative_method
+        self.reconstruction_method = reconstruction_method
         self.aperture_inline = aperture_inline
         self.aperture_xline = aperture_xline
         self.wavelet = wavelet
@@ -279,9 +219,20 @@ class Denoise3D(BaseProcessor):
         self.threshold_k = threshold_k
         self.threshold_mode = threshold_mode
 
+        # Internal state
+        self._volume_builder: Optional[CoordinateVolumeBuilder] = None
+        self._geometry: Optional[Dict[str, Any]] = None
+
         super().__init__(
+            use_coordinates=use_coordinates,
+            bin_size_x=bin_size_x,
+            bin_size_y=bin_size_y,
+            coord_x_key=coord_x_key,
+            coord_y_key=coord_y_key,
             inline_key=inline_key,
             xline_key=xline_key,
+            representative_method=representative_method,
+            reconstruction_method=reconstruction_method,
             aperture_inline=aperture_inline,
             aperture_xline=aperture_xline,
             wavelet=wavelet,
@@ -304,6 +255,8 @@ class Denoise3D(BaseProcessor):
             raise ValueError("threshold_k must be positive")
         if self.threshold_mode not in ['soft', 'hard']:
             raise ValueError("threshold_mode must be 'soft' or 'hard'")
+        if self.reconstruction_method not in ['noise_subtract', 'residual_preserve', 'multi_pass']:
+            raise ValueError("reconstruction_method must be 'noise_subtract', 'residual_preserve', or 'multi_pass'")
 
         # Validate wavelet
         try:
@@ -311,29 +264,38 @@ class Denoise3D(BaseProcessor):
         except Exception:
             raise ValueError(f"Invalid wavelet: {self.wavelet}")
 
+        # Validate bin size for coordinate mode
+        if self.use_coordinates:
+            if self.bin_size_x <= 0:
+                raise ValueError(f"bin_size_x must be positive, got {self.bin_size_x}")
+            if self.bin_size_y <= 0:
+                raise ValueError(f"bin_size_y must be positive, got {self.bin_size_y}")
+
     def get_description(self) -> str:
         """Get processor description."""
-        return (f"3D-Denoise: "
-                f"keys={self.inline_key}×{self.xline_key}, "
-                f"aperture={self.aperture_inline}×{self.aperture_xline}, "
-                f"wavelet={self.wavelet}, "
-                f"k={self.threshold_k:.1f}, {self.threshold_mode}")
+        if self.use_coordinates:
+            mode = f"coords({self.bin_size_x}x{self.bin_size_y}m)"
+        else:
+            mode = f"headers({self.inline_key}x{self.xline_key})"
+
+        return (
+            f"3D-Denoise: {mode}, "
+            f"aperture={self.aperture_inline}x{self.aperture_xline}, "
+            f"wavelet={self.wavelet}, k={self.threshold_k:.1f}, "
+            f"recon={self.reconstruction_method}"
+        )
 
     def process(self, data: SeismicData) -> SeismicData:
         """
         Apply 3D spatial denoising.
 
-        Requires SeismicData to have headers containing the specified
-        inline_key and xline_key columns.
-
         Args:
             data: Input seismic data with headers
 
         Returns:
-            Denoised seismic data (same organization as input)
+            Denoised seismic data (same trace count as input)
         """
         import time
-
         start_time = time.time()
 
         traces = data.traces.copy()
@@ -352,52 +314,29 @@ class Denoise3D(BaseProcessor):
         if len(headers_df) != n_traces:
             raise ValueError(f"Header count ({len(headers_df)}) != trace count ({n_traces})")
 
+        sample_rate_ms = data.sample_rate * 1000  # Convert to ms
+
         logger.info(
-            f"3D-Denoise: {n_traces} traces × {n_samples} samples | "
-            f"keys={self.inline_key}×{self.xline_key} | "
-            f"aperture={self.aperture_inline}×{self.aperture_xline} | "
-            f"k={self.threshold_k}, {self.threshold_mode}"
+            f"3D-Denoise: {n_traces} traces x {n_samples} samples | "
+            f"mode={'coordinates' if self.use_coordinates else 'headers'} | "
+            f"recon={self.reconstruction_method}"
         )
 
-        # Build 3D volume from headers
-        try:
-            volume, geometry = build_volume_from_headers(
-                traces, headers_df, self.inline_key, self.xline_key
+        if self.use_coordinates:
+            denoised_traces = self._process_coordinate_mode(
+                traces, headers_df, sample_rate_ms
             )
-        except ValueError as e:
-            logger.error(f"Failed to build volume: {e}")
-            raise
-
-        n_inlines = geometry['n_inlines']
-        n_xlines = geometry['n_xlines']
-
-        # Clamp apertures to volume size
-        eff_ap_il = min(self.aperture_inline, n_inlines)
-        if eff_ap_il % 2 == 0:
-            eff_ap_il = max(1, eff_ap_il - 1)
-        eff_ap_xl = min(self.aperture_xline, n_xlines)
-        if eff_ap_xl % 2 == 0:
-            eff_ap_xl = max(1, eff_ap_xl - 1)
-
-        if eff_ap_il != self.aperture_inline or eff_ap_xl != self.aperture_xline:
-            logger.warning(
-                f"Volume too small for aperture, using {eff_ap_il}×{eff_ap_xl}"
+        else:
+            denoised_traces = self._process_header_mode(
+                traces, headers_df
             )
-
-        # Apply 3D denoising
-        denoised_volume = self._denoise_volume_3d(volume, eff_ap_il, eff_ap_xl)
-
-        # Extract back to 2D
-        denoised_traces = extract_traces_from_volume(
-            denoised_volume, headers_df, geometry
-        )
 
         # Compute metrics
         elapsed = time.time() - start_time
         throughput = n_traces / elapsed if elapsed > 0 else 0
 
-        input_rms = np.sqrt(np.mean(traces**2))
-        output_rms = np.sqrt(np.mean(denoised_traces**2))
+        input_rms = np.sqrt(np.mean(traces ** 2))
+        output_rms = np.sqrt(np.mean(denoised_traces ** 2))
         energy_ratio = output_rms / input_rms if input_rms > 0 else 0
 
         logger.info(
@@ -411,22 +350,227 @@ class Denoise3D(BaseProcessor):
         elif energy_ratio > 0.95:
             logger.warning("Output >95% of input energy - minimal denoising occurred")
 
+        # Build metadata
+        metadata = {
+            **data.metadata,
+            'processor': self.get_description(),
+            'reconstruction_method': self.reconstruction_method,
+        }
+
+        if self._volume_builder and self._volume_builder.get_geometry():
+            geom = self._volume_builder.get_geometry()
+            metadata['volume_shape'] = f"{n_samples}x{geom.n_bins_x}x{geom.n_bins_y}"
+            metadata['volume_coverage'] = f"{geom.coverage_percent:.1f}%"
+            metadata['max_fold'] = geom.max_fold
+            metadata['mean_fold'] = geom.mean_fold
+        elif self._geometry:
+            metadata['volume_shape'] = f"{n_samples}x{self._geometry['n_inlines']}x{self._geometry['n_xlines']}"
+            metadata['volume_coverage'] = f"{self._geometry['coverage']:.1f}%"
+
         return SeismicData(
             traces=denoised_traces,
             sample_rate=data.sample_rate,
             headers=data.headers,
-            metadata={
-                **data.metadata,
-                'processor': self.get_description(),
-                'volume_shape': f"{n_samples}×{n_inlines}×{n_xlines}",
-                'volume_coverage': f"{geometry['coverage']:.1f}%"
-            }
+            metadata=metadata
         )
 
-    def _denoise_volume_3d(self,
-                          volume: np.ndarray,
-                          aperture_il: int,
-                          aperture_xl: int) -> np.ndarray:
+    def _process_coordinate_mode(
+        self,
+        traces: np.ndarray,
+        headers_df: pd.DataFrame,
+        sample_rate_ms: float
+    ) -> np.ndarray:
+        """Process using coordinate-based volume building with multi-fold support."""
+        n_samples, n_traces = traces.shape
+
+        # Create binning config
+        binning_config = BinningConfig(
+            bin_size_x=self.bin_size_x,
+            bin_size_y=self.bin_size_y,
+            coord_x_key=self.coord_x_key,
+            coord_y_key=self.coord_y_key,
+            representative_method=RepresentativeMethod(self.representative_method),
+            reconstruction_method=ReconstructionMethod(self.reconstruction_method),
+        )
+
+        # Build volume
+        self._volume_builder = CoordinateVolumeBuilder(binning_config)
+        volume = self._volume_builder.build(traces, headers_df, sample_rate_ms)
+
+        geom = self._volume_builder.get_geometry()
+        logger.info(f"Volume: {geom.n_bins_x}x{geom.n_bins_y} bins, "
+                   f"max_fold={geom.max_fold}, coverage={geom.coverage_percent:.1f}%")
+
+        # Apply 3D denoising to volume
+        denoised_volume_data = self._denoise_volume_3d(
+            volume.data,
+            min(self.aperture_inline, geom.n_bins_x),
+            min(self.aperture_xline, geom.n_bins_y)
+        )
+
+        denoised_volume = SeismicVolume(
+            data=denoised_volume_data,
+            dt=volume.dt,
+            dx=volume.dx,
+            dy=volume.dy
+        )
+
+        # Reconstruct traces using selected method
+        if self.reconstruction_method == 'multi_pass':
+            # Multi-pass needs a denoise function
+            def denoise_func(vol: SeismicVolume) -> SeismicVolume:
+                denoised_data = self._denoise_volume_3d(
+                    vol.data,
+                    min(self.aperture_inline, vol.data.shape[1]),
+                    min(self.aperture_xline, vol.data.shape[2])
+                )
+                return SeismicVolume(
+                    data=denoised_data,
+                    dt=vol.dt, dx=vol.dx, dy=vol.dy
+                )
+
+            denoised_traces = self._volume_builder.reconstruct_traces(
+                denoised_volume,
+                filter_func=denoise_func
+            )
+        else:
+            denoised_traces = self._volume_builder.reconstruct_traces(denoised_volume)
+
+        return denoised_traces
+
+    def _process_header_mode(
+        self,
+        traces: np.ndarray,
+        headers_df: pd.DataFrame
+    ) -> np.ndarray:
+        """Process using header-based volume building (legacy mode, no multi-fold)."""
+        n_samples, n_traces = traces.shape
+
+        # Build volume from headers
+        volume, geometry = self._build_volume_from_headers(
+            traces, headers_df, self.inline_key, self.xline_key
+        )
+        self._geometry = geometry
+
+        n_inlines = geometry['n_inlines']
+        n_xlines = geometry['n_xlines']
+
+        logger.info(f"Volume: {n_inlines}x{n_xlines}, coverage={geometry['coverage']:.1f}%")
+
+        # Clamp apertures to volume size
+        eff_ap_il = min(self.aperture_inline, n_inlines)
+        if eff_ap_il % 2 == 0:
+            eff_ap_il = max(1, eff_ap_il - 1)
+        eff_ap_xl = min(self.aperture_xline, n_xlines)
+        if eff_ap_xl % 2 == 0:
+            eff_ap_xl = max(1, eff_ap_xl - 1)
+
+        # Apply 3D denoising
+        denoised_volume = self._denoise_volume_3d(volume, eff_ap_il, eff_ap_xl)
+
+        # Extract back to 2D
+        denoised_traces = self._extract_traces_from_volume(
+            denoised_volume, headers_df, geometry
+        )
+
+        return denoised_traces
+
+    def _build_volume_from_headers(
+        self,
+        traces: np.ndarray,
+        headers_df: pd.DataFrame,
+        inline_key: str,
+        xline_key: str
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """Build a 3D volume from 2D traces using header keys (legacy)."""
+        n_samples, n_traces = traces.shape
+
+        if inline_key not in headers_df.columns:
+            raise ValueError(f"Inline key '{inline_key}' not found in headers. "
+                           f"Available: {list(headers_df.columns)[:10]}")
+        if xline_key not in headers_df.columns:
+            raise ValueError(f"Crossline key '{xline_key}' not found in headers. "
+                           f"Available: {list(headers_df.columns)[:10]}")
+
+        # Get unique values
+        inline_vals = np.sort(headers_df[inline_key].unique())
+        xline_vals = np.sort(headers_df[xline_key].unique())
+
+        n_inlines = len(inline_vals)
+        n_xlines = len(xline_vals)
+
+        # Create mappings
+        inline_to_idx = {v: i for i, v in enumerate(inline_vals)}
+        xline_to_idx = {v: i for i, v in enumerate(xline_vals)}
+
+        # Initialize volume
+        volume = np.zeros((n_samples, n_inlines, n_xlines), dtype=traces.dtype)
+        has_data = np.zeros((n_inlines, n_xlines), dtype=bool)
+
+        # Fill volume (last trace wins for duplicates)
+        for trace_idx in range(n_traces):
+            il_val = headers_df.iloc[trace_idx][inline_key]
+            xl_val = headers_df.iloc[trace_idx][xline_key]
+
+            il_idx = inline_to_idx.get(il_val)
+            xl_idx = xline_to_idx.get(xl_val)
+
+            if il_idx is not None and xl_idx is not None:
+                volume[:, il_idx, xl_idx] = traces[:, trace_idx]
+                has_data[il_idx, xl_idx] = True
+
+        coverage = has_data.sum() / (n_inlines * n_xlines) * 100
+
+        geometry = {
+            'inline_key': inline_key,
+            'xline_key': xline_key,
+            'inline_vals': inline_vals,
+            'xline_vals': xline_vals,
+            'inline_to_idx': inline_to_idx,
+            'xline_to_idx': xline_to_idx,
+            'n_inlines': n_inlines,
+            'n_xlines': n_xlines,
+            'has_data': has_data,
+            'coverage': coverage
+        }
+
+        return volume, geometry
+
+    def _extract_traces_from_volume(
+        self,
+        volume: np.ndarray,
+        headers_df: pd.DataFrame,
+        geometry: Dict[str, Any]
+    ) -> np.ndarray:
+        """Extract traces from 3D volume back to original 2D organization."""
+        n_samples = volume.shape[0]
+        n_traces = len(headers_df)
+
+        inline_key = geometry['inline_key']
+        xline_key = geometry['xline_key']
+        inline_to_idx = geometry['inline_to_idx']
+        xline_to_idx = geometry['xline_to_idx']
+
+        traces = np.zeros((n_samples, n_traces), dtype=volume.dtype)
+
+        for trace_idx in range(n_traces):
+            il_val = headers_df.iloc[trace_idx][inline_key]
+            xl_val = headers_df.iloc[trace_idx][xline_key]
+
+            il_idx = inline_to_idx.get(il_val)
+            xl_idx = xline_to_idx.get(xl_val)
+
+            if il_idx is not None and xl_idx is not None:
+                traces[:, trace_idx] = volume[:, il_idx, xl_idx]
+
+        return traces
+
+    def _denoise_volume_3d(
+        self,
+        volume: np.ndarray,
+        aperture_il: int,
+        aperture_xl: int
+    ) -> np.ndarray:
         """
         Apply DWT denoising with 3D MAD spatial statistics.
 
@@ -485,7 +629,6 @@ class Denoise3D(BaseProcessor):
 
                     if patch_coeffs:
                         # Stack and compute MAD across spatial dimension
-                        # Pad to same length if needed
                         max_len = max(len(c) for c in patch_coeffs)
                         patch_stack = np.zeros((len(patch_coeffs), max_len))
                         for j, c in enumerate(patch_coeffs):
@@ -526,3 +669,81 @@ class Denoise3D(BaseProcessor):
                 denoised[:, il, xl] = rec
 
         return denoised
+
+
+# Convenience functions for common use cases
+
+def apply_denoise3d_design_mode(
+    traces: np.ndarray,
+    headers_df: pd.DataFrame,
+    sample_rate_ms: float,
+    bin_size: float = 25.0,
+    aperture: int = 3,
+    threshold_k: float = 3.0,
+    wavelet: str = 'db4'
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """
+    Apply 3D denoising in design mode (fast).
+
+    Uses noise_subtract reconstruction for speed.
+    """
+    processor = Denoise3D(
+        use_coordinates=True,
+        bin_size_x=bin_size,
+        bin_size_y=bin_size,
+        aperture_inline=aperture,
+        aperture_xline=aperture,
+        threshold_k=threshold_k,
+        wavelet=wavelet,
+        reconstruction_method='noise_subtract'
+    )
+
+    from models.seismic_data import SeismicData
+    data = SeismicData(
+        traces=traces,
+        sample_rate=sample_rate_ms / 1000.0,
+        headers=headers_df
+    )
+
+    result = processor.process(data)
+    stats = processor._volume_builder.get_statistics() if processor._volume_builder else {}
+
+    return result.traces, stats
+
+
+def apply_denoise3d_application_mode(
+    traces: np.ndarray,
+    headers_df: pd.DataFrame,
+    sample_rate_ms: float,
+    bin_size: float = 25.0,
+    aperture: int = 3,
+    threshold_k: float = 3.0,
+    wavelet: str = 'db4'
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """
+    Apply 3D denoising in application mode (accurate).
+
+    Uses multi_pass reconstruction for best quality.
+    """
+    processor = Denoise3D(
+        use_coordinates=True,
+        bin_size_x=bin_size,
+        bin_size_y=bin_size,
+        aperture_inline=aperture,
+        aperture_xline=aperture,
+        threshold_k=threshold_k,
+        wavelet=wavelet,
+        reconstruction_method='multi_pass'
+    )
+
+    from models.seismic_data import SeismicData
+    data = SeismicData(
+        traces=traces,
+        sample_rate=sample_rate_ms / 1000.0,
+        headers=headers_df
+    )
+
+    result = processor.process(data)
+    stats = processor._volume_builder.get_statistics() if processor._volume_builder else {}
+
+    return result.traces, stats

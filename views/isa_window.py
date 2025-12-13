@@ -49,6 +49,11 @@ class ISAWindow(QMainWindow):
         self.current_trace_idx = 0
         self.show_average = False
 
+        # Trace range for spectral estimation
+        self.use_trace_range = False
+        self.trace_range_start = 0
+        self.trace_range_end = data.n_traces - 1
+
         # Frequency range for display
         self.freq_min = 0
         self.freq_max = data.nyquist_freq
@@ -151,6 +156,36 @@ class ISAWindow(QMainWindow):
         self.average_checkbox = QCheckBox("Show average spectrum (all traces)")
         self.average_checkbox.stateChanged.connect(self._on_average_changed)
         trace_layout.addWidget(self.average_checkbox)
+
+        # Trace range selection
+        self.trace_range_checkbox = QCheckBox("Use trace range for estimation")
+        self.trace_range_checkbox.setToolTip("Compute spectrum using a range of traces")
+        self.trace_range_checkbox.stateChanged.connect(self._on_trace_range_changed)
+        trace_layout.addWidget(self.trace_range_checkbox)
+
+        # Start trace for range
+        trace_start_layout = QHBoxLayout()
+        trace_start_layout.addWidget(QLabel("Start Trace:"))
+        self.trace_start_spinbox = QSpinBox()
+        self.trace_start_spinbox.setMinimum(0)
+        self.trace_start_spinbox.setMaximum(self.data.n_traces - 1)
+        self.trace_start_spinbox.setValue(0)
+        self.trace_start_spinbox.valueChanged.connect(self._on_trace_range_values_changed)
+        self.trace_start_spinbox.setEnabled(False)
+        trace_start_layout.addWidget(self.trace_start_spinbox)
+        trace_layout.addLayout(trace_start_layout)
+
+        # End trace for range
+        trace_end_layout = QHBoxLayout()
+        trace_end_layout.addWidget(QLabel("End Trace:"))
+        self.trace_end_spinbox = QSpinBox()
+        self.trace_end_spinbox.setMinimum(0)
+        self.trace_end_spinbox.setMaximum(self.data.n_traces - 1)
+        self.trace_end_spinbox.setValue(self.data.n_traces - 1)
+        self.trace_end_spinbox.valueChanged.connect(self._on_trace_range_values_changed)
+        self.trace_end_spinbox.setEnabled(False)
+        trace_end_layout.addWidget(self.trace_end_spinbox)
+        trace_layout.addLayout(trace_end_layout)
 
         trace_group.setLayout(trace_layout)
         layout.addWidget(trace_group)
@@ -321,7 +356,35 @@ class ISAWindow(QMainWindow):
     def _on_average_changed(self, state):
         """Handle average spectrum checkbox change."""
         self.show_average = (state == Qt.CheckState.Checked.value)
+        # Disable trace range when showing average of all traces
+        if self.show_average:
+            self.trace_range_checkbox.setEnabled(False)
+        else:
+            self.trace_range_checkbox.setEnabled(True)
         self._update_spectrum()
+
+    def _on_trace_range_changed(self, state):
+        """Handle trace range checkbox change."""
+        self.use_trace_range = (state == Qt.CheckState.Checked.value)
+        self.trace_start_spinbox.setEnabled(self.use_trace_range)
+        self.trace_end_spinbox.setEnabled(self.use_trace_range)
+        self._update_spectrum()
+
+    def _on_trace_range_values_changed(self):
+        """Handle trace range start/end value changes."""
+        if self.use_trace_range:
+            self.trace_range_start = self.trace_start_spinbox.value()
+            self.trace_range_end = self.trace_end_spinbox.value()
+            # Ensure start <= end
+            if self.trace_range_start > self.trace_range_end:
+                self.trace_range_start, self.trace_range_end = self.trace_range_end, self.trace_range_start
+                self.trace_start_spinbox.blockSignals(True)
+                self.trace_end_spinbox.blockSignals(True)
+                self.trace_start_spinbox.setValue(self.trace_range_start)
+                self.trace_end_spinbox.setValue(self.trace_range_end)
+                self.trace_start_spinbox.blockSignals(False)
+                self.trace_end_spinbox.blockSignals(False)
+            self._update_spectrum()
 
     def _on_time_window_changed(self, state):
         """Handle time window checkbox change."""
@@ -446,6 +509,20 @@ class ISAWindow(QMainWindow):
                 frequencies, amplitudes_db = self.spectral_analyzer.compute_average_spectrum(windowed_traces)
                 phase_deg = None
             title = f"Average Spectrum (All Traces){window_info}"
+        elif self.use_trace_range:
+            # Use trace range for spectral estimation
+            range_start = max(0, min(self.trace_range_start, windowed_traces.shape[1] - 1))
+            range_end = max(0, min(self.trace_range_end, windowed_traces.shape[1] - 1))
+            if range_start > range_end:
+                range_start, range_end = range_end, range_start
+            range_traces = windowed_traces[:, range_start:range_end + 1]
+            trace_range_info = f" (Traces {range_start}-{range_end})"
+            if self.show_phase:
+                frequencies, amplitudes_db, phase_deg = self.spectral_analyzer.compute_average_spectrum_with_phase(range_traces)
+            else:
+                frequencies, amplitudes_db = self.spectral_analyzer.compute_average_spectrum(range_traces)
+                phase_deg = None
+            title = f"Average Spectrum{trace_range_info}{window_info}"
         else:
             trace = windowed_traces[:, self.current_trace_idx]
             if self.show_phase:
@@ -464,6 +541,17 @@ class ISAWindow(QMainWindow):
                     _, proc_amps_db, proc_phase_deg = self.spectral_analyzer.compute_average_spectrum_with_phase(windowed_processed)
                 else:
                     _, proc_amps_db = self.spectral_analyzer.compute_average_spectrum(windowed_processed)
+            elif self.use_trace_range:
+                # Use same trace range for processed data
+                range_start = max(0, min(self.trace_range_start, windowed_processed.shape[1] - 1))
+                range_end = max(0, min(self.trace_range_end, windowed_processed.shape[1] - 1))
+                if range_start > range_end:
+                    range_start, range_end = range_end, range_start
+                range_processed = windowed_processed[:, range_start:range_end + 1]
+                if self.show_phase:
+                    _, proc_amps_db, proc_phase_deg = self.spectral_analyzer.compute_average_spectrum_with_phase(range_processed)
+                else:
+                    _, proc_amps_db = self.spectral_analyzer.compute_average_spectrum(range_processed)
             else:
                 proc_trace = windowed_processed[:, self.current_trace_idx]
                 if self.show_phase:
@@ -553,7 +641,13 @@ class ISAWindow(QMainWindow):
             f"Nyquist: {self.data.nyquist_freq:.1f} Hz<br>"
         )
 
-        if not self.show_average:
+        if self.show_average:
+            info_text += f"<br><b>Mode:</b> All traces average"
+        elif self.use_trace_range:
+            n_traces_in_range = self.trace_range_end - self.trace_range_start + 1
+            info_text += f"<br><b>Trace Range:</b> {self.trace_range_start}-{self.trace_range_end}"
+            info_text += f"<br><b>Traces Used:</b> {n_traces_in_range}"
+        else:
             info_text += f"<br><b>Current Trace:</b> {self.current_trace_idx}"
 
         self.info_label.setText(info_text)

@@ -41,6 +41,7 @@ class WorkerTask:
     header_mapping_dict: Dict[str, Tuple[int, str]]  # Serialized: {name: (byte_location, format)}
     chunk_size: int = 10000
     report_interval: int = 5000  # Report progress every N traces
+    header_flush_interval: int = 100000  # Flush headers to disk every N traces
 
 
 @dataclass
@@ -91,9 +92,12 @@ def import_segment(task: WorkerTask, progress_queue: Optional[Queue] = None) -> 
         with segyio.open(task.segy_path, 'r', ignore_geometry=True) as f:
             f.mmap()
 
-            # Process in chunks
-            all_headers = []
+            # Process in chunks with streaming header writes
+            pending_headers = []
+            pending_start_trace = task.start_trace
             traces_done = 0
+            header_part_num = 0
+            header_part_files = []
 
             for chunk_start in range(task.start_trace, task.end_trace, task.chunk_size):
                 chunk_end = min(chunk_start + task.chunk_size, task.end_trace)
@@ -111,21 +115,49 @@ def import_segment(task: WorkerTask, progress_queue: Optional[Queue] = None) -> 
                 chunk_headers = _read_headers_batch(
                     f, chunk_start, chunk_end, task.header_mapping_dict
                 )
-                all_headers.extend(chunk_headers)
+                pending_headers.extend(chunk_headers)
 
                 traces_done += chunk_size
 
-                # Report progress
+                # Flush headers to disk periodically to avoid memory buildup
+                if len(pending_headers) >= task.header_flush_interval:
+                    part_path = output_dir / f"headers_segment_{task.segment_id}_part{header_part_num}.parquet"
+                    _write_headers_parquet(pending_headers, part_path, pending_start_trace)
+                    header_part_files.append(part_path)
+                    pending_start_trace += len(pending_headers)
+                    pending_headers = []
+                    header_part_num += 1
+                    gc.collect()
+
+                # Report progress (non-blocking to prevent hang on full queue)
                 if progress_queue is not None:
-                    progress_queue.put((task.segment_id, traces_done))
+                    try:
+                        progress_queue.put_nowait((task.segment_id, traces_done))
+                    except:
+                        pass  # Skip if queue is full - better than blocking
 
                 # Cleanup
                 del traces_buffer
                 if traces_done % 50000 == 0:
                     gc.collect()
 
-        # Write headers to segment parquet with global trace indices
-        _write_headers_parquet(all_headers, headers_path, task.start_trace)
+        # Write any remaining headers
+        if pending_headers:
+            if header_part_files:
+                # Had partial files, write final part
+                part_path = output_dir / f"headers_segment_{task.segment_id}_part{header_part_num}.parquet"
+                _write_headers_parquet(pending_headers, part_path, pending_start_trace)
+                header_part_files.append(part_path)
+            else:
+                # No partial files, write directly to final path
+                _write_headers_parquet(pending_headers, headers_path, task.start_trace)
+
+        # If we had multiple parts, merge them
+        if header_part_files:
+            _merge_header_parts(header_part_files, headers_path)
+
+        del pending_headers
+        gc.collect()
 
         elapsed = time.time() - start_time
 
@@ -241,3 +273,38 @@ def _write_headers_parquet(headers: List[Dict], output_path: Path, start_trace: 
         compression='snappy',
         index=False
     )
+
+
+def _merge_header_parts(part_files: List[Path], output_path: Path):
+    """
+    Merge multiple header part files into a single parquet file.
+
+    Args:
+        part_files: List of partial header parquet files
+        output_path: Path to merged output file
+    """
+    dfs = []
+    for part_path in part_files:
+        if part_path.exists():
+            dfs.append(pd.read_parquet(part_path))
+
+    if dfs:
+        merged = pd.concat(dfs, ignore_index=True)
+        merged.to_parquet(
+            output_path,
+            engine='pyarrow',
+            compression='snappy',
+            index=False
+        )
+        del merged
+
+    # Clean up part files
+    for part_path in part_files:
+        try:
+            if part_path.exists():
+                part_path.unlink()
+        except:
+            pass
+
+    del dfs
+    gc.collect()

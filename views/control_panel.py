@@ -16,6 +16,7 @@ from processors.emd_denoise import EMDDenoise, PYEMD_AVAILABLE
 from processors.stft_denoise import STFTDenoise
 from processors.stockwell_denoise import StockwellDenoise
 from processors.omp_denoise import OMPDenoise
+from processors.deconvolution import DeconvolutionProcessor, DeconConfig
 from models.fk_config import FKConfigManager, FKFilterConfig
 from models.fkk_config import FKKConfig, FKK_PRESETS
 
@@ -56,6 +57,8 @@ class ControlPanel(QWidget):
     # PSTM signals
     pstm_apply_requested = pyqtSignal(float, float, float)  # velocity, aperture, max_angle
     pstm_wizard_requested = pyqtSignal()  # Request to open PSTM wizard
+    # Mute signals
+    mute_apply_requested = pyqtSignal(object)  # MuteConfig or None
 
     def __init__(self, nyquist_freq: float = 250.0, parent=None):
         super().__init__(parent)
@@ -123,6 +126,11 @@ class ControlPanel(QWidget):
         controls_layout.addWidget(self.fk_filter_group)
         controls_layout.addWidget(self.fkk_filter_group)
         controls_layout.addWidget(self.pstm_group)
+        self.mute_group = self._create_mute_group()
+        controls_layout.addWidget(self.mute_group)
+        self.deconvolution_group = self._create_deconvolution_group()
+        controls_layout.addWidget(self.deconvolution_group)
+        self.deconvolution_group.hide()  # Initially hidden
         self.stockwell_group.hide()  # Initially hidden
         self.stft_group.hide()  # Initially hidden
         self.dwtdenoise_group.hide()  # Initially hidden
@@ -175,7 +183,8 @@ class ControlPanel(QWidget):
             "3D Spatial Denoise",
             "FK Filter",
             "3D FKK Filter",
-            "Kirchhoff PSTM"
+            "Kirchhoff PSTM",
+            "Deconvolution"
         ])
         self.algorithm_combo.currentIndexChanged.connect(self._on_algorithm_changed)
         algo_layout.addWidget(self.algorithm_combo)
@@ -1102,61 +1111,125 @@ class ControlPanel(QWidget):
 
         # Info label
         info_label = QLabel(
-            "Build 3D volume from 2D gather using\n"
-            "selected headers for inline/crossline axes,\n"
-            "then apply DWT denoising with 3D spatial MAD."
+            "Build 3D volume from 2D gather,\n"
+            "then apply DWT denoising with 3D spatial MAD.\n"
+            "Handles multi-fold bins properly."
         )
         info_label.setStyleSheet("color: #666; font-size: 10px;")
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
 
-        # Header selection
-        header_group = QGroupBox("Volume Organization")
-        header_layout = QFormLayout()
+        # Volume building mode
+        mode_group = QGroupBox("Volume Building Mode")
+        mode_layout = QVBoxLayout()
 
-        # Inline key combo - populated from dataset headers
+        self.denoise3d_coord_radio = QRadioButton("Coordinate-based (CDP_X/CDP_Y + bin size)")
+        self.denoise3d_header_radio = QRadioButton("Header-based (inline/xline keys)")
+        self.denoise3d_coord_radio.setChecked(True)
+        self.denoise3d_coord_radio.setToolTip(
+            "Use CDP coordinates with user-specified bin size.\n"
+            "Properly handles multiple traces per bin."
+        )
+        self.denoise3d_header_radio.setToolTip(
+            "Legacy mode: use header keys for inline/xline.\n"
+            "Last trace wins for duplicate positions."
+        )
+
+        self.denoise3d_mode_btn_group = QButtonGroup()
+        self.denoise3d_mode_btn_group.addButton(self.denoise3d_coord_radio, 0)
+        self.denoise3d_mode_btn_group.addButton(self.denoise3d_header_radio, 1)
+        self.denoise3d_mode_btn_group.buttonClicked.connect(self._on_denoise3d_mode_changed)
+
+        mode_layout.addWidget(self.denoise3d_coord_radio)
+        mode_layout.addWidget(self.denoise3d_header_radio)
+        mode_group.setLayout(mode_layout)
+        layout.addWidget(mode_group)
+
+        # Coordinate mode parameters
+        self.denoise3d_coord_widget = QWidget()
+        coord_layout = QFormLayout()
+        coord_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.denoise3d_bin_x_spin = QDoubleSpinBox()
+        self.denoise3d_bin_x_spin.setRange(1.0, 500.0)
+        self.denoise3d_bin_x_spin.setValue(25.0)
+        self.denoise3d_bin_x_spin.setSuffix(" m")
+        self.denoise3d_bin_x_spin.setToolTip("Bin size in X (inline) direction")
+        coord_layout.addRow("Bin Size X:", self.denoise3d_bin_x_spin)
+
+        self.denoise3d_bin_y_spin = QDoubleSpinBox()
+        self.denoise3d_bin_y_spin.setRange(1.0, 500.0)
+        self.denoise3d_bin_y_spin.setValue(25.0)
+        self.denoise3d_bin_y_spin.setSuffix(" m")
+        self.denoise3d_bin_y_spin.setToolTip("Bin size in Y (crossline) direction")
+        coord_layout.addRow("Bin Size Y:", self.denoise3d_bin_y_spin)
+
+        self.denoise3d_coord_widget.setLayout(coord_layout)
+        layout.addWidget(self.denoise3d_coord_widget)
+
+        # Header mode parameters
+        self.denoise3d_header_widget = QWidget()
+        header_layout = QFormLayout()
+        header_layout.setContentsMargins(0, 0, 0, 0)
+
         self.denoise3d_inline_combo = QComboBox()
         self.denoise3d_inline_combo.setToolTip(
             "Header for inline (X) axis.\n"
             "For shot gather: field_record, sin, source_x\n"
             "For CDP: CDP, inline"
         )
-        # Default items shown when no dataset loaded
-        self.denoise3d_inline_combo.addItems([
-            "(load dataset first)"
-        ])
+        self.denoise3d_inline_combo.addItems(["(load dataset first)"])
         header_layout.addRow("Inline Key:", self.denoise3d_inline_combo)
 
-        # Crossline key combo - populated from dataset headers
         self.denoise3d_xline_combo = QComboBox()
         self.denoise3d_xline_combo.setToolTip(
             "Header for crossline (Y) axis.\n"
             "For shot gather: trace_number, rec_sloc, receiver_x\n"
             "For CDP: crossline"
         )
-        self.denoise3d_xline_combo.addItems([
-            "(load dataset first)"
-        ])
+        self.denoise3d_xline_combo.addItems(["(load dataset first)"])
         header_layout.addRow("Crossline Key:", self.denoise3d_xline_combo)
 
-        # Status label showing unique values
+        self.denoise3d_header_widget.setLayout(header_layout)
+        self.denoise3d_header_widget.hide()  # Hidden by default (coord mode)
+        layout.addWidget(self.denoise3d_header_widget)
+
+        # Status label
         self.denoise3d_status_label = QLabel("")
         self.denoise3d_status_label.setStyleSheet("color: #888; font-size: 10px;")
         self.denoise3d_status_label.setWordWrap(True)
-        header_layout.addRow(self.denoise3d_status_label)
+        layout.addWidget(self.denoise3d_status_label)
 
         # Connect combo changes to update status
         self.denoise3d_inline_combo.currentIndexChanged.connect(self._update_denoise3d_status)
         self.denoise3d_xline_combo.currentIndexChanged.connect(self._update_denoise3d_status)
 
-        header_group.setLayout(header_layout)
-        layout.addWidget(header_group)
+        # Multi-fold reconstruction method
+        recon_group = QGroupBox("Multi-Fold Reconstruction")
+        recon_layout = QFormLayout()
+
+        self.denoise3d_recon_combo = QComboBox()
+        self.denoise3d_recon_combo.addItems([
+            "noise_subtract (fast)",
+            "residual_preserve (medium)",
+            "multi_pass (accurate)"
+        ])
+        self.denoise3d_recon_combo.setCurrentIndex(0)
+        self.denoise3d_recon_combo.setToolTip(
+            "How to handle multiple traces per bin:\n"
+            "- noise_subtract: Fast, compute common noise model\n"
+            "- residual_preserve: Store per-trace residuals\n"
+            "- multi_pass: Filter each trace individually (N passes)"
+        )
+        recon_layout.addRow("Method:", self.denoise3d_recon_combo)
+
+        recon_group.setLayout(recon_layout)
+        layout.addWidget(recon_group)
 
         # Aperture controls
         aperture_group = QGroupBox("3D Spatial Aperture")
         aperture_layout = QFormLayout()
 
-        # Inline aperture
         self.denoise3d_ap_inline_spin = QSpinBox()
         self.denoise3d_ap_inline_spin.setRange(1, 15)
         self.denoise3d_ap_inline_spin.setSingleStep(2)
@@ -1164,7 +1237,6 @@ class ControlPanel(QWidget):
         self.denoise3d_ap_inline_spin.setToolTip("Aperture in inline direction (odd)")
         aperture_layout.addRow("Inline Aperture:", self.denoise3d_ap_inline_spin)
 
-        # Crossline aperture
         self.denoise3d_ap_xline_spin = QSpinBox()
         self.denoise3d_ap_xline_spin.setRange(1, 15)
         self.denoise3d_ap_xline_spin.setSingleStep(2)
@@ -1179,16 +1251,14 @@ class ControlPanel(QWidget):
         dwt_group = QGroupBox("DWT Parameters")
         dwt_layout = QFormLayout()
 
-        # Wavelet selection
         self.denoise3d_wavelet_combo = QComboBox()
         self.denoise3d_wavelet_combo.addItems([
             "db4", "db6", "db8", "sym4", "sym6", "coif2", "bior2.2"
         ])
-        self.denoise3d_wavelet_combo.setCurrentIndex(0)  # db4 default
+        self.denoise3d_wavelet_combo.setCurrentIndex(0)
         self.denoise3d_wavelet_combo.setToolTip("Wavelet for DWT decomposition")
         dwt_layout.addRow("Wavelet:", self.denoise3d_wavelet_combo)
 
-        # Threshold k
         self.denoise3d_k_spin = QDoubleSpinBox()
         self.denoise3d_k_spin.setRange(1.0, 10.0)
         self.denoise3d_k_spin.setSingleStep(0.5)
@@ -1196,10 +1266,9 @@ class ControlPanel(QWidget):
         self.denoise3d_k_spin.setToolTip("MAD threshold multiplier (k)")
         dwt_layout.addRow("Threshold k:", self.denoise3d_k_spin)
 
-        # Threshold mode
         self.denoise3d_mode_combo = QComboBox()
         self.denoise3d_mode_combo.addItems(["soft", "hard"])
-        self.denoise3d_mode_combo.setCurrentIndex(0)  # soft default
+        self.denoise3d_mode_combo.setCurrentIndex(0)
         self.denoise3d_mode_combo.setToolTip("Thresholding mode")
         dwt_layout.addRow("Threshold Mode:", self.denoise3d_mode_combo)
 
@@ -1225,6 +1294,12 @@ class ControlPanel(QWidget):
 
         group.setLayout(layout)
         return group
+
+    def _on_denoise3d_mode_changed(self, button):
+        """Handle 3D denoise volume mode change."""
+        use_coordinates = self.denoise3d_coord_radio.isChecked()
+        self.denoise3d_coord_widget.setVisible(use_coordinates)
+        self.denoise3d_header_widget.setVisible(not use_coordinates)
 
     def _create_fk_filter_group(self) -> QGroupBox:
         """Create FK filter group with Design/Apply modes."""
@@ -1833,6 +1908,275 @@ class ControlPanel(QWidget):
             self.pstm_angle_spin.value()
         )
 
+    def _create_mute_group(self) -> QGroupBox:
+        """Create mute controls group for top/bottom mute based on velocity."""
+        group = QGroupBox("Mute Controls")
+        layout = QVBoxLayout()
+
+        # Top mute checkbox
+        self.mute_top_checkbox = QCheckBox("Top Mute")
+        self.mute_top_checkbox.setToolTip("Zero samples before mute time (T = offset/velocity)")
+        self.mute_top_checkbox.stateChanged.connect(self._on_mute_checkbox_changed)
+        layout.addWidget(self.mute_top_checkbox)
+
+        # Bottom mute checkbox
+        self.mute_bottom_checkbox = QCheckBox("Bottom Mute")
+        self.mute_bottom_checkbox.setToolTip("Zero samples after mute time (T = offset/velocity)")
+        self.mute_bottom_checkbox.stateChanged.connect(self._on_mute_checkbox_changed)
+        layout.addWidget(self.mute_bottom_checkbox)
+
+        # Velocity
+        vel_layout = QHBoxLayout()
+        vel_layout.addWidget(QLabel("Velocity (m/s):"))
+        self.mute_velocity_spin = QDoubleSpinBox()
+        self.mute_velocity_spin.setRange(500, 8000)
+        self.mute_velocity_spin.setValue(2500)
+        self.mute_velocity_spin.setSingleStep(100)
+        self.mute_velocity_spin.setDecimals(0)
+        self.mute_velocity_spin.setToolTip("Mute velocity: T_mute = offset / velocity")
+        vel_layout.addWidget(self.mute_velocity_spin)
+        layout.addLayout(vel_layout)
+
+        # Taper samples
+        taper_layout = QHBoxLayout()
+        taper_layout.addWidget(QLabel("Taper (samples):"))
+        self.mute_taper_spin = QSpinBox()
+        self.mute_taper_spin.setRange(0, 100)
+        self.mute_taper_spin.setValue(20)
+        self.mute_taper_spin.setToolTip("Number of samples for cosine taper at mute boundary")
+        taper_layout.addWidget(self.mute_taper_spin)
+        layout.addLayout(taper_layout)
+
+        # Info label
+        info_label = QLabel("Linear mute: T = offset / velocity")
+        info_label.setStyleSheet("color: #666; font-size: 9pt;")
+        layout.addWidget(info_label)
+
+        # Apply button
+        self.mute_apply_btn = QPushButton("Apply Mute")
+        self.mute_apply_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #FF9800;
+                color: white;
+                font-weight: bold;
+                padding: 8px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #F57C00;
+            }
+            QPushButton:pressed {
+                background-color: #E65100;
+            }
+            QPushButton:disabled {
+                background-color: #BDBDBD;
+            }
+        """)
+        self.mute_apply_btn.setEnabled(False)  # Disabled until mute type selected
+        self.mute_apply_btn.clicked.connect(self._on_mute_apply)
+        layout.addWidget(self.mute_apply_btn)
+
+        # Clear mute button
+        self.mute_clear_btn = QPushButton("Clear Mute")
+        self.mute_clear_btn.clicked.connect(self._on_mute_clear)
+        layout.addWidget(self.mute_clear_btn)
+
+        group.setLayout(layout)
+        return group
+
+    def _on_mute_checkbox_changed(self):
+        """Enable/disable apply button based on mute type selection."""
+        has_mute = self.mute_top_checkbox.isChecked() or self.mute_bottom_checkbox.isChecked()
+        self.mute_apply_btn.setEnabled(has_mute)
+
+    def _on_mute_apply(self):
+        """Handle mute apply button click."""
+        from processors.mute_processor import MuteConfig
+
+        top_mute = self.mute_top_checkbox.isChecked()
+        bottom_mute = self.mute_bottom_checkbox.isChecked()
+
+        if not top_mute and not bottom_mute:
+            return  # Nothing to apply
+
+        config = MuteConfig(
+            velocity=self.mute_velocity_spin.value(),
+            top_mute=top_mute,
+            bottom_mute=bottom_mute,
+            taper_samples=self.mute_taper_spin.value()
+        )
+        self.mute_apply_requested.emit(config)
+
+    def _on_mute_clear(self):
+        """Handle mute clear button click."""
+        self.mute_top_checkbox.setChecked(False)
+        self.mute_bottom_checkbox.setChecked(False)
+        self.mute_apply_requested.emit(None)
+
+    def _create_deconvolution_group(self) -> QGroupBox:
+        """Create deconvolution parameters group."""
+        group = QGroupBox("Deconvolution Parameters")
+        layout = QVBoxLayout()
+
+        # Mode selection (Spiking / Predictive)
+        mode_layout = QHBoxLayout()
+        mode_layout.addWidget(QLabel("Mode:"))
+        self.decon_mode_combo = QComboBox()
+        self.decon_mode_combo.addItems(["Spiking", "Predictive"])
+        self.decon_mode_combo.setToolTip(
+            "Spiking: Compress wavelet to spike (whitening)\n"
+            "Predictive: Attenuate multiples with known period"
+        )
+        self.decon_mode_combo.currentIndexChanged.connect(self._on_decon_mode_changed)
+        mode_layout.addWidget(self.decon_mode_combo)
+        layout.addLayout(mode_layout)
+
+        # Top Window section header
+        top_header = QLabel("─── Top Window ───")
+        top_header.setStyleSheet("color: #666; font-size: 9pt; font-weight: bold;")
+        layout.addWidget(top_header)
+
+        # Time top (start time at zero offset)
+        ttop_layout = QHBoxLayout()
+        ttop_layout.addWidget(QLabel("T0 Top (ms):"))
+        self.decon_time_top_spin = QDoubleSpinBox()
+        self.decon_time_top_spin.setRange(0, 5000)
+        self.decon_time_top_spin.setValue(100)
+        self.decon_time_top_spin.setSingleStep(50)
+        self.decon_time_top_spin.setDecimals(0)
+        self.decon_time_top_spin.setToolTip("Top window start time at zero offset (ms)")
+        ttop_layout.addWidget(self.decon_time_top_spin)
+        layout.addLayout(ttop_layout)
+
+        # Velocity top
+        vtop_layout = QHBoxLayout()
+        vtop_layout.addWidget(QLabel("V Top (m/s):"))
+        self.decon_velocity_top_spin = QDoubleSpinBox()
+        self.decon_velocity_top_spin.setRange(500, 10000)
+        self.decon_velocity_top_spin.setValue(3500)
+        self.decon_velocity_top_spin.setSingleStep(100)
+        self.decon_velocity_top_spin.setDecimals(0)
+        self.decon_velocity_top_spin.setToolTip("Top window moveout velocity (m/s)")
+        vtop_layout.addWidget(self.decon_velocity_top_spin)
+        layout.addLayout(vtop_layout)
+
+        # Bottom Window section header
+        bot_header = QLabel("─── Bottom Window ───")
+        bot_header.setStyleSheet("color: #666; font-size: 9pt; font-weight: bold;")
+        layout.addWidget(bot_header)
+
+        # Time bottom (start time at zero offset)
+        tbot_layout = QHBoxLayout()
+        tbot_layout.addWidget(QLabel("T0 Bot (ms):"))
+        self.decon_time_bottom_spin = QDoubleSpinBox()
+        self.decon_time_bottom_spin.setRange(100, 10000)
+        self.decon_time_bottom_spin.setValue(500)
+        self.decon_time_bottom_spin.setSingleStep(100)
+        self.decon_time_bottom_spin.setDecimals(0)
+        self.decon_time_bottom_spin.setToolTip("Bottom window start time at zero offset (ms)")
+        tbot_layout.addWidget(self.decon_time_bottom_spin)
+        layout.addLayout(tbot_layout)
+
+        # Velocity bottom
+        vbot_layout = QHBoxLayout()
+        vbot_layout.addWidget(QLabel("V Bot (m/s):"))
+        self.decon_velocity_bottom_spin = QDoubleSpinBox()
+        self.decon_velocity_bottom_spin.setRange(300, 8000)
+        self.decon_velocity_bottom_spin.setValue(1500)
+        self.decon_velocity_bottom_spin.setSingleStep(100)
+        self.decon_velocity_bottom_spin.setDecimals(0)
+        self.decon_velocity_bottom_spin.setToolTip("Bottom window moveout velocity (m/s)")
+        vbot_layout.addWidget(self.decon_velocity_bottom_spin)
+        layout.addLayout(vbot_layout)
+
+        # Filter parameters header
+        filter_header = QLabel("─── Filter ───")
+        filter_header.setStyleSheet("color: #666; font-size: 9pt; font-weight: bold;")
+        layout.addWidget(filter_header)
+
+        # Filter length
+        filter_layout = QHBoxLayout()
+        filter_layout.addWidget(QLabel("Length (ms):"))
+        self.decon_filter_length_spin = QDoubleSpinBox()
+        self.decon_filter_length_spin.setRange(20, 500)
+        self.decon_filter_length_spin.setValue(160)
+        self.decon_filter_length_spin.setSingleStep(20)
+        self.decon_filter_length_spin.setDecimals(0)
+        self.decon_filter_length_spin.setToolTip("Length of the deconvolution operator")
+        filter_layout.addWidget(self.decon_filter_length_spin)
+        layout.addLayout(filter_layout)
+
+        # White noise percentage
+        noise_layout = QHBoxLayout()
+        noise_layout.addWidget(QLabel("White Noise (%):"))
+        self.decon_white_noise_spin = QDoubleSpinBox()
+        self.decon_white_noise_spin.setRange(0.01, 20)
+        self.decon_white_noise_spin.setValue(1.0)
+        self.decon_white_noise_spin.setSingleStep(0.5)
+        self.decon_white_noise_spin.setDecimals(2)
+        self.decon_white_noise_spin.setToolTip(
+            "Pre-whitening percentage for stability\n"
+            "Typical values: 0.1-5%"
+        )
+        noise_layout.addWidget(self.decon_white_noise_spin)
+        layout.addLayout(noise_layout)
+
+        # Prediction distance (for predictive mode)
+        pred_layout = QHBoxLayout()
+        pred_layout.addWidget(QLabel("Prediction (ms):"))
+        self.decon_prediction_spin = QDoubleSpinBox()
+        self.decon_prediction_spin.setRange(4, 1000)
+        self.decon_prediction_spin.setValue(100)
+        self.decon_prediction_spin.setSingleStep(10)
+        self.decon_prediction_spin.setDecimals(0)
+        self.decon_prediction_spin.setToolTip(
+            "Prediction distance for predictive deconvolution\n"
+            "Set to multiple period (e.g., water bottom 2-way time)"
+        )
+        self.decon_prediction_spin.setEnabled(False)  # Disabled for spiking mode
+        pred_layout.addWidget(self.decon_prediction_spin)
+        self.decon_prediction_label = pred_layout.itemAt(0).widget()
+        layout.addLayout(pred_layout)
+
+        # Info label
+        info_label = QLabel("T(x) = T0 + (offset/V) × 1000")
+        info_label.setStyleSheet("color: #666; font-size: 9pt;")
+        layout.addWidget(info_label)
+
+        # Apply button
+        self.decon_apply_btn = QPushButton("Apply Deconvolution")
+        self.decon_apply_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #9C27B0;
+                color: white;
+                font-weight: bold;
+                padding: 8px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #7B1FA2;
+            }
+            QPushButton:pressed {
+                background-color: #6A1B9A;
+            }
+        """)
+        self.decon_apply_btn.clicked.connect(self._on_apply_clicked)
+        layout.addWidget(self.decon_apply_btn)
+
+        group.setLayout(layout)
+        return group
+
+    def _on_decon_mode_changed(self, index: int):
+        """Handle deconvolution mode change."""
+        is_predictive = index == 1
+        self.decon_prediction_spin.setEnabled(is_predictive)
+        # Update prediction label style to show enabled/disabled
+        if hasattr(self, 'decon_prediction_label'):
+            if is_predictive:
+                self.decon_prediction_label.setStyleSheet("")
+            else:
+                self.decon_prediction_label.setStyleSheet("color: #999;")
+
     def _create_display_group(self) -> QGroupBox:
         """Create display controls group."""
         group = QGroupBox("Display Controls")
@@ -2000,6 +2344,7 @@ class ControlPanel(QWidget):
         self.fk_filter_group.hide()
         self.fkk_filter_group.hide()
         self.pstm_group.hide()
+        self.deconvolution_group.hide()
 
         if index == 0:  # Bandpass Filter
             self.bandpass_group.show()
@@ -2056,6 +2401,11 @@ class ControlPanel(QWidget):
             # Enable GPU for PSTM if available
             if self.gpu_checkbox is not None and self.gpu_available:
                 self.gpu_checkbox.setEnabled(True)
+        elif index == 11:  # Deconvolution
+            self.deconvolution_group.show()
+            # Disable GPU for deconvolution (CPU-only)
+            if self.gpu_checkbox is not None:
+                self.gpu_checkbox.setEnabled(False)
 
     def _on_gpu_checkbox_changed(self, state):
         """Handle GPU checkbox state change."""
@@ -2375,17 +2725,8 @@ class ControlPanel(QWidget):
             elif algo_index == 7:  # 3D Spatial Denoise
                 from processors.denoise_3d import Denoise3D
 
-                # Get header keys from combo data (actual header name, not display text)
-                inline_key = self.denoise3d_inline_combo.currentData()
-                xline_key = self.denoise3d_xline_combo.currentData()
-
-                if not inline_key or not xline_key:
-                    print("Error: Please select valid header keys for 3D volume")
-                    return
-
-                if inline_key == xline_key:
-                    print("Error: Inline and Crossline keys must be different")
-                    return
+                # Get volume building mode
+                use_coordinates = self.denoise3d_coord_radio.isChecked()
 
                 # Get apertures (ensure odd)
                 ap_inline = self.denoise3d_ap_inline_spin.value()
@@ -2401,19 +2742,86 @@ class ControlPanel(QWidget):
                 threshold_k = self.denoise3d_k_spin.value()
                 threshold_mode = self.denoise3d_mode_combo.currentText()
 
-                processor = Denoise3D(
-                    inline_key=inline_key,
-                    xline_key=xline_key,
-                    aperture_inline=ap_inline,
-                    aperture_xline=ap_xline,
-                    wavelet=wavelet,
-                    threshold_k=threshold_k,
-                    threshold_mode=threshold_mode
-                )
-                print(f"✓ Using 3D Spatial Denoise")
-                print(f"  Volume: {inline_key} × {xline_key}")
+                # Get reconstruction method
+                recon_text = self.denoise3d_recon_combo.currentText()
+                reconstruction_method = recon_text.split(' ')[0]  # Extract method name
+
+                if use_coordinates:
+                    # Coordinate-based mode
+                    bin_size_x = self.denoise3d_bin_x_spin.value()
+                    bin_size_y = self.denoise3d_bin_y_spin.value()
+
+                    processor = Denoise3D(
+                        use_coordinates=True,
+                        bin_size_x=bin_size_x,
+                        bin_size_y=bin_size_y,
+                        reconstruction_method=reconstruction_method,
+                        aperture_inline=ap_inline,
+                        aperture_xline=ap_xline,
+                        wavelet=wavelet,
+                        threshold_k=threshold_k,
+                        threshold_mode=threshold_mode
+                    )
+                    print(f"✓ Using 3D Spatial Denoise (coordinate mode)")
+                    print(f"  Bin size: {bin_size_x}×{bin_size_y}m")
+                    print(f"  Reconstruction: {reconstruction_method}")
+                else:
+                    # Header-based mode (legacy)
+                    inline_key = self.denoise3d_inline_combo.currentData()
+                    xline_key = self.denoise3d_xline_combo.currentData()
+
+                    if not inline_key or not xline_key:
+                        print("Error: Please select valid header keys for 3D volume")
+                        return
+
+                    if inline_key == xline_key:
+                        print("Error: Inline and Crossline keys must be different")
+                        return
+
+                    processor = Denoise3D(
+                        use_coordinates=False,
+                        inline_key=inline_key,
+                        xline_key=xline_key,
+                        reconstruction_method=reconstruction_method,
+                        aperture_inline=ap_inline,
+                        aperture_xline=ap_xline,
+                        wavelet=wavelet,
+                        threshold_k=threshold_k,
+                        threshold_mode=threshold_mode
+                    )
+                    print(f"✓ Using 3D Spatial Denoise (header mode)")
+                    print(f"  Volume: {inline_key} × {xline_key}")
+
                 print(f"  Aperture: {ap_inline}×{ap_xline}, Wavelet: {wavelet}")
                 print(f"  k={threshold_k}, mode={threshold_mode}")
+
+            elif algo_index == 11:  # Deconvolution
+                # Get deconvolution mode
+                mode = 'spiking' if self.decon_mode_combo.currentIndex() == 0 else 'predictive'
+
+                # Get prediction distance for predictive mode
+                prediction_distance_ms = 0.0
+                if mode == 'predictive':
+                    prediction_distance_ms = self.decon_prediction_spin.value()
+
+                config = DeconConfig(
+                    mode=mode,
+                    time_top_ms=self.decon_time_top_spin.value(),
+                    time_bottom_ms=self.decon_time_bottom_spin.value(),
+                    velocity_top=self.decon_velocity_top_spin.value(),
+                    velocity_bottom=self.decon_velocity_bottom_spin.value(),
+                    filter_length_ms=self.decon_filter_length_spin.value(),
+                    white_noise_percent=self.decon_white_noise_spin.value(),
+                    prediction_distance_ms=prediction_distance_ms,
+                )
+
+                processor = DeconvolutionProcessor(config=config)
+                print(f"✓ Using {mode.capitalize()} Deconvolution")
+                print(f"  Top: T0={config.time_top_ms:.0f}ms, V={config.velocity_top:.0f} m/s")
+                print(f"  Bot: T0={config.time_bottom_ms:.0f}ms, V={config.velocity_bottom:.0f} m/s")
+                print(f"  Filter: {config.filter_length_ms:.0f}ms, White noise: {config.white_noise_percent:.1f}%")
+                if mode == 'predictive':
+                    print(f"  Prediction distance: {prediction_distance_ms:.0f}ms")
 
             else:
                 # Other algorithms not handled here (FK, FKK, PSTM have their own handlers)

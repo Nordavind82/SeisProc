@@ -25,6 +25,17 @@ class ProcessingConfig:
     n_workers: Optional[int] = None  # Auto-detect if None
     chunk_size: int = 10000     # Traces per processing chunk within gather
     sort_options: Optional[SortOptions] = None  # Optional in-gather sorting
+    # Output mode: 'processed' (default), 'noise' (only difference), 'both' (both outputs)
+    # 'noise' mode is memory-optimized: outputs only (input - processed) with minimal memory
+    output_mode: str = 'processed'
+    # Legacy noise output option (deprecated, use output_mode='both' instead)
+    output_noise: bool = False  # Also output noise (input - processed)
+    # Mute options (applied during processing)
+    mute_velocity: float = 0.0  # Mute velocity in m/s (0 = disabled)
+    mute_top: bool = False      # Apply top mute
+    mute_bottom: bool = False   # Apply bottom mute
+    mute_taper: int = 20        # Taper samples for mute transition
+    mute_target: str = 'output' # 'output', 'input', or 'processed'
 
 
 @dataclass
@@ -44,7 +55,7 @@ class ProcessingTask:
     """Task definition for a worker process."""
     segment_id: int
     input_zarr_path: str        # Path to input traces.zarr
-    output_zarr_path: str       # Path to shared output traces.zarr
+    output_zarr_path: Optional[str]  # Path to shared output traces.zarr (None for noise-only mode)
     headers_parquet_path: str   # Path to headers.parquet
     ensemble_index_path: str    # Path to ensemble_index.parquet
     processor_config: Dict[str, Any]  # Serialized processor config
@@ -55,6 +66,17 @@ class ProcessingTask:
     metadata: Dict[str, Any] = field(default_factory=dict)  # Additional metadata
     sort_options: Optional[SortOptions] = None  # Optional in-gather sorting
     sort_mapping_path: Optional[str] = None  # Path to write sort mapping
+    # Output mode: 'processed', 'noise', or 'both'
+    output_mode: str = 'processed'
+    # Legacy noise output options (use output_mode='both' for new code)
+    output_noise: bool = False  # Also output noise (input - processed)
+    noise_zarr_path: Optional[str] = None  # Path to noise output zarr
+    # Mute options
+    mute_velocity: float = 0.0  # Mute velocity in m/s (0 = disabled)
+    mute_top: bool = False      # Apply top mute
+    mute_bottom: bool = False   # Apply bottom mute
+    mute_taper: int = 20        # Taper samples for mute transition
+    mute_target: str = 'output' # 'output', 'input', or 'processed'
 
 
 @dataclass
@@ -96,3 +118,4 @@ class ProcessingResult:
     throughput_traces_per_sec: float
     n_workers_used: int
     error: Optional[str] = None
+    noise_zarr_path: Optional[str] = None  # Path to noise output if generated

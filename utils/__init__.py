@@ -6,6 +6,14 @@ from .subgather_detector import detect_subgathers, extract_subgather_traces
 from .trace_spacing import TraceSpacingStats, calculate_trace_spacing_with_stats
 from .unit_conversion import UnitConverter
 from .window_cache import WindowCache
+from .coordinate_volume_builder import (
+    CoordinateVolumeBuilder,
+    BinningConfig,
+    BinningGeometry,
+    ReconstructionMethod,
+    RepresentativeMethod,
+    estimate_grid_from_coordinates,
+)
 
 __all__ = [
     'generate_sample_seismic_data',
@@ -20,4 +28,11 @@ __all__ = [
     'calculate_trace_spacing_with_stats',
     'UnitConverter',
     'WindowCache',
+    # Coordinate volume builder
+    'CoordinateVolumeBuilder',
+    'BinningConfig',
+    'BinningGeometry',
+    'ReconstructionMethod',
+    'RepresentativeMethod',
+    'estimate_grid_from_coordinates',
 ]

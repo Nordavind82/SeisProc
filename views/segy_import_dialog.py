@@ -7,9 +7,9 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                               QFileDialog, QGroupBox, QLineEdit, QComboBox,
                               QTextEdit, QMessageBox, QSpinBox, QCheckBox,
                               QHeaderView, QProgressDialog, QTabWidget, QScrollArea,
-                              QWidget)
+                              QWidget, QSplitter, QFrame, QFormLayout, QApplication)
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QIcon
 from typing import Optional, List
 import sys
 
@@ -27,6 +27,7 @@ from utils.segy_import import (
     ParallelImportCoordinator,
     ImportConfig,
     ImportProgress,
+    ImportStageResult,
     get_optimal_workers,
 )
 from models.seismic_data import SeismicData
@@ -99,37 +100,46 @@ class SEGYImportDialog(QDialog):
             self._on_file_selected(self._initial_file)
 
     def _init_ui(self):
-        """Initialize user interface."""
-        logger.info("    _init_ui() - Creating layout...")
+        """Initialize user interface with tabbed layout."""
+        logger.info("    _init_ui() - Creating tabbed layout...")
         layout = QVBoxLayout()
         logger.info("    ✓ Layout created")
 
-        # File selection
+        # File selection - always visible at top
         logger.info("    → Creating file selection group...")
         layout.addWidget(self._create_file_selection_group())
         logger.info("    ✓ File selection group added")
 
-        # Header mapping table
-        logger.info("    → Creating header mapping group...")
-        layout.addWidget(self._create_header_mapping_group())
-        logger.info("    ✓ Header mapping group added")
+        # Tab widget for main content
+        logger.info("    → Creating tab widget...")
+        self.tab_widget = QTabWidget()
 
-        # Computed headers configuration
-        logger.info("    → Creating computed headers group...")
-        layout.addWidget(self._create_computed_headers_group())
-        logger.info("    ✓ Computed headers group added")
+        # Create tabs
+        logger.info("    → Creating Headers tab...")
+        self.tab_widget.addTab(self._create_headers_tab(), "Headers")
+        logger.info("    ✓ Headers tab added")
 
-        # Ensemble configuration
-        logger.info("    → Creating ensemble group...")
-        layout.addWidget(self._create_ensemble_group())
-        logger.info("    ✓ Ensemble group added")
+        logger.info("    → Creating Import Settings tab...")
+        self.tab_widget.addTab(self._create_import_settings_tab(), "Import Settings")
+        logger.info("    ✓ Import Settings tab added")
 
-        # Preview area
-        logger.info("    → Creating preview group...")
-        layout.addWidget(self._create_preview_group())
-        logger.info("    ✓ Preview group added")
+        logger.info("    → Creating QC Inlines tab...")
+        self.tab_widget.addTab(self._create_qc_inlines_tab(), "QC Inlines")
+        logger.info("    ✓ QC Inlines tab added")
 
-        # Action buttons
+        logger.info("    → Creating Preview tab...")
+        self.tab_widget.addTab(self._create_preview_tab(), "Preview")
+        logger.info("    ✓ Preview tab added")
+
+        layout.addWidget(self.tab_widget)
+        logger.info("    ✓ Tab widget added")
+
+        # Summary bar
+        logger.info("    → Creating summary bar...")
+        layout.addWidget(self._create_summary_bar())
+        logger.info("    ✓ Summary bar added")
+
+        # Action buttons - always visible at bottom
         logger.info("    → Creating action buttons...")
         layout.addLayout(self._create_action_buttons())
         logger.info("    ✓ Action buttons added")
@@ -158,6 +168,471 @@ class SEGYImportDialog(QDialog):
 
         group.setLayout(layout)
         return group
+
+    # =========================================================================
+    # Tab Creation Methods
+    # =========================================================================
+
+    def _create_headers_tab(self) -> QWidget:
+        """Create Headers tab with header mapping and computed headers."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        # Use splitter for adjustable sizing
+        splitter = QSplitter(Qt.Orientation.Vertical)
+
+        # Header mapping group (main table)
+        splitter.addWidget(self._create_header_mapping_group())
+
+        # Computed headers group
+        splitter.addWidget(self._create_computed_headers_group())
+
+        # Set initial sizes (70% for mapping, 30% for computed)
+        splitter.setSizes([400, 150])
+
+        layout.addWidget(splitter)
+        return tab
+
+    def _create_import_settings_tab(self) -> QWidget:
+        """Create Import Settings tab with ensemble and output configuration."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        # Ensemble configuration
+        ensemble_group = QGroupBox("Ensemble Configuration")
+        ensemble_layout = QFormLayout(ensemble_group)
+
+        # Ensemble keys
+        self.ensemble_keys_edit = QLineEdit()
+        self.ensemble_keys_edit.setPlaceholderText("e.g., cdp or inline,crossline")
+        self.ensemble_keys_edit.setToolTip(
+            "Headers that define ensemble boundaries.\n"
+            "Traces with the same ensemble key values are grouped together."
+        )
+        ensemble_layout.addRow("Ensemble Keys:", self.ensemble_keys_edit)
+
+        # Preset buttons
+        preset_layout = QHBoxLayout()
+        preset_layout.addWidget(QLabel("Presets:"))
+
+        cdp_btn = QPushButton("CDP")
+        cdp_btn.clicked.connect(lambda: self.ensemble_keys_edit.setText("cdp"))
+        preset_layout.addWidget(cdp_btn)
+
+        shot_btn = QPushButton("Shot")
+        shot_btn.clicked.connect(lambda: self.ensemble_keys_edit.setText("source_station"))
+        preset_layout.addWidget(shot_btn)
+
+        inline_btn = QPushButton("Inline/Xline")
+        inline_btn.clicked.connect(lambda: self.ensemble_keys_edit.setText("inline,crossline"))
+        preset_layout.addWidget(inline_btn)
+
+        preset_layout.addStretch()
+        ensemble_layout.addRow("", preset_layout)
+
+        layout.addWidget(ensemble_group)
+
+        # Coordinate settings
+        coord_group = QGroupBox("Coordinate Settings")
+        coord_layout = QFormLayout(coord_group)
+
+        # Spatial units
+        self.spatial_units_combo = QComboBox()
+        self.spatial_units_combo.addItem("Meters (m)", AppSettings.METERS)
+        self.spatial_units_combo.addItem("Feet (ft)", AppSettings.FEET)
+        self.spatial_units_combo.setToolTip(
+            "Select spatial units for coordinates and distances.\n"
+            "This will be applied throughout the entire application."
+        )
+
+        # Set current value from AppSettings
+        try:
+            from models.app_settings import get_settings
+            app_settings = get_settings()
+            current_units = app_settings.get_spatial_units()
+            if current_units == 'feet':
+                self.spatial_units_combo.setCurrentIndex(1)
+        except Exception as e:
+            logger.warning(f"Could not load units from settings: {e}")
+
+        coord_layout.addRow("Spatial Units:", self.spatial_units_combo)
+
+        # Coordinate scalar info
+        scalar_info = QLabel(
+            "Coordinate scalars are automatically applied from trace headers.\n"
+            "Negative scalars indicate division, positive indicate multiplication."
+        )
+        scalar_info.setStyleSheet("color: #666; font-style: italic;")
+        scalar_info.setWordWrap(True)
+        coord_layout.addRow("", scalar_info)
+
+        layout.addWidget(coord_group)
+
+        # Output settings
+        output_group = QGroupBox("Output Settings")
+        output_layout = QFormLayout(output_group)
+
+        output_info = QLabel(
+            "Output is automatically saved to the configured storage directory.\n"
+            "Configure storage location in: Edit → Settings"
+        )
+        output_info.setStyleSheet("color: #666;")
+        output_info.setWordWrap(True)
+        output_layout.addRow("", output_info)
+
+        layout.addWidget(output_group)
+
+        layout.addStretch()
+        return tab
+
+    def _create_qc_inlines_tab(self) -> QWidget:
+        """Create QC Inlines tab for configuring QC inline selection."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        # Enable checkbox
+        enable_group = QGroupBox("QC Inlines Configuration")
+        enable_layout = QVBoxLayout(enable_group)
+
+        self.qc_inlines_enabled = QCheckBox("Enable QC inline marking during import")
+        self.qc_inlines_enabled.setToolTip(
+            "Marks specific inlines for later QC stacking and batch processing.\n"
+            "This information is stored in the dataset metadata."
+        )
+        self.qc_inlines_enabled.stateChanged.connect(self._on_qc_enabled_changed)
+        enable_layout.addWidget(self.qc_inlines_enabled)
+
+        layout.addWidget(enable_group)
+
+        # Inline selection (initially disabled)
+        self.qc_selection_group = QGroupBox("Inline Selection")
+        self.qc_selection_group.setEnabled(False)
+        selection_layout = QVBoxLayout(self.qc_selection_group)
+
+        # Available range info
+        self.qc_range_label = QLabel("Available range: (load file to detect)")
+        self.qc_range_label.setStyleSheet("color: #666;")
+        selection_layout.addWidget(self.qc_range_label)
+
+        # Inline input
+        input_layout = QHBoxLayout()
+        input_layout.addWidget(QLabel("QC Inlines:"))
+        self.qc_inlines_edit = QLineEdit()
+        self.qc_inlines_edit.setPlaceholderText("e.g., 100, 500, 1000-1100, 2000")
+        self.qc_inlines_edit.setToolTip(
+            "Enter inline numbers separated by commas.\n"
+            "Use ranges with hyphen: 100-110\n"
+            "Example: 100, 500, 1000-1100, 2000"
+        )
+        self.qc_inlines_edit.textChanged.connect(self._update_qc_count)
+        input_layout.addWidget(self.qc_inlines_edit)
+        selection_layout.addLayout(input_layout)
+
+        # Quick select buttons
+        quick_layout = QHBoxLayout()
+        quick_layout.addWidget(QLabel("Quick select:"))
+
+        every_10_btn = QPushButton("Every 10th")
+        every_10_btn.clicked.connect(lambda: self._qc_quick_select(10))
+        quick_layout.addWidget(every_10_btn)
+
+        every_50_btn = QPushButton("Every 50th")
+        every_50_btn.clicked.connect(lambda: self._qc_quick_select(50))
+        quick_layout.addWidget(every_50_btn)
+
+        every_100_btn = QPushButton("Every 100th")
+        every_100_btn.clicked.connect(lambda: self._qc_quick_select(100))
+        quick_layout.addWidget(every_100_btn)
+
+        clear_btn = QPushButton("Clear")
+        clear_btn.clicked.connect(lambda: self.qc_inlines_edit.clear())
+        quick_layout.addWidget(clear_btn)
+
+        quick_layout.addStretch()
+        selection_layout.addLayout(quick_layout)
+
+        # Selected count
+        self.qc_count_label = QLabel("Selected: 0 QC inlines")
+        selection_layout.addWidget(self.qc_count_label)
+
+        layout.addWidget(self.qc_selection_group)
+
+        # Post-import options
+        post_group = QGroupBox("Post-Import Options")
+        post_layout = QVBoxLayout(post_group)
+
+        self.auto_open_qc_batch = QCheckBox("Open QC Batch Processing dialog after import")
+        self.auto_open_qc_batch.setToolTip(
+            "Automatically opens the QC Batch Processing dialog\n"
+            "after import completes, with QC inlines pre-configured."
+        )
+        self.auto_open_qc_batch.setEnabled(False)
+        post_layout.addWidget(self.auto_open_qc_batch)
+
+        layout.addWidget(post_group)
+
+        layout.addStretch()
+        return tab
+
+    def _create_preview_tab(self) -> QWidget:
+        """Create Preview tab with header preview and file statistics."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        # Header preview section
+        preview_group = QGroupBox("Header Preview")
+        preview_layout = QVBoxLayout(preview_group)
+
+        # Preview buttons
+        btn_layout = QHBoxLayout()
+        preview_btn = QPushButton("Preview First 10 Traces")
+        preview_btn.clicked.connect(self._preview_headers)
+        btn_layout.addWidget(preview_btn)
+
+        clear_btn = QPushButton("Clear")
+        clear_btn.clicked.connect(lambda: self.preview_text.clear())
+        btn_layout.addWidget(clear_btn)
+
+        btn_layout.addStretch()
+        preview_layout.addLayout(btn_layout)
+
+        # Preview text area
+        self.preview_text = QTextEdit()
+        self.preview_text.setReadOnly(True)
+        self.preview_text.setFont(QFont("Courier New", 9))
+        preview_layout.addWidget(self.preview_text)
+
+        layout.addWidget(preview_group)
+
+        # File statistics section
+        stats_group = QGroupBox("File Statistics")
+        stats_layout = QVBoxLayout(stats_group)
+
+        self.stats_text = QTextEdit()
+        self.stats_text.setReadOnly(True)
+        self.stats_text.setMaximumHeight(150)
+        self.stats_text.setPlaceholderText("Load a SEG-Y file to view statistics")
+        stats_layout.addWidget(self.stats_text)
+
+        layout.addWidget(stats_group)
+
+        return tab
+
+    def _create_summary_bar(self) -> QFrame:
+        """Create summary bar showing import configuration summary."""
+        frame = QFrame()
+        frame.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Sunken)
+        frame.setStyleSheet("background-color: #f5f5f5; padding: 2px;")
+
+        layout = QHBoxLayout(frame)
+        layout.setContentsMargins(8, 4, 8, 4)
+
+        self.summary_label = QLabel("Select a SEG-Y file to begin")
+        self.summary_label.setStyleSheet("color: #666;")
+        layout.addWidget(self.summary_label)
+
+        layout.addStretch()
+
+        # Validation indicator
+        self.validation_label = QLabel()
+        layout.addWidget(self.validation_label)
+
+        return frame
+
+    # =========================================================================
+    # QC Inlines Tab Helper Methods
+    # =========================================================================
+
+    def _on_qc_enabled_changed(self, state: int):
+        """Handle QC inlines enabled checkbox change."""
+        enabled = state == Qt.CheckState.Checked.value
+        self.qc_selection_group.setEnabled(enabled)
+        self.auto_open_qc_batch.setEnabled(enabled)
+        self._update_summary()
+
+    def _qc_quick_select(self, interval: int):
+        """Quick select QC inlines at regular interval."""
+        if not hasattr(self, '_inline_range') or self._inline_range is None:
+            QMessageBox.warning(
+                self, "No Data",
+                "Load a SEG-Y file first to detect inline range."
+            )
+            return
+
+        min_il, max_il = self._inline_range
+        inlines = list(range(min_il, max_il + 1, interval))
+        self.qc_inlines_edit.setText(", ".join(str(i) for i in inlines))
+
+    def _update_qc_count(self):
+        """Update QC line count display."""
+        inlines = self._parse_qc_inlines()
+        self.qc_count_label.setText(f"Selected: {len(inlines)} QC inlines")
+        self._update_summary()
+
+    def _parse_qc_inlines(self) -> List[int]:
+        """Parse QC inline numbers from input field."""
+        text = self.qc_inlines_edit.text().strip()
+        if not text:
+            return []
+
+        inlines = []
+        try:
+            for part in text.split(','):
+                part = part.strip()
+                if not part:
+                    continue
+                if '-' in part:
+                    start, end = part.split('-')
+                    inlines.extend(range(int(start), int(end) + 1))
+                else:
+                    inlines.append(int(part))
+            return sorted(set(inlines))
+        except Exception:
+            return []
+
+    def _update_summary(self):
+        """Update summary bar with current configuration."""
+        parts = []
+
+        if self.reader:
+            try:
+                info = self.reader.read_file_info()
+                parts.append(f"{info['n_traces']:,} traces")
+                parts.append(f"{info['n_samples']} samples")
+            except Exception:
+                pass
+
+        if hasattr(self, 'ensemble_keys_edit') and self.ensemble_keys_edit.text():
+            parts.append(f"Sort: {self.ensemble_keys_edit.text()}")
+
+        if hasattr(self, 'qc_inlines_enabled') and self.qc_inlines_enabled.isChecked():
+            n_qc = len(self._parse_qc_inlines())
+            if n_qc > 0:
+                parts.append(f"{n_qc} QC inlines")
+
+        if parts:
+            self.summary_label.setText(" | ".join(parts))
+            self.summary_label.setStyleSheet("color: #333;")
+        else:
+            self.summary_label.setText("Select a SEG-Y file to begin")
+            self.summary_label.setStyleSheet("color: #666;")
+
+    def _update_file_statistics(self):
+        """Update file statistics display."""
+        if not self.reader:
+            if hasattr(self, 'stats_text'):
+                self.stats_text.clear()
+            return
+
+        try:
+            info = self.reader.read_file_info()
+
+            stats_html = f"""
+            <table style="width: 100%;">
+            <tr><td><b>Traces:</b></td><td>{info['n_traces']:,}</td>
+                <td><b>Samples:</b></td><td>{info['n_samples']}</td></tr>
+            <tr><td><b>Sample Interval:</b></td><td>{info['sample_interval']:.2f} ms</td>
+                <td><b>Trace Length:</b></td><td>{info['trace_length_ms']:.1f} ms</td></tr>
+            <tr><td><b>Data Format:</b></td><td>{info['format']}</td>
+                <td><b>Est. Size:</b></td><td>{(info['n_traces'] * info['n_samples'] * 4 / 1024 / 1024):.1f} MB</td></tr>
+            </table>
+            """
+
+            if hasattr(self, 'stats_text'):
+                self.stats_text.setHtml(stats_html)
+
+            # Try to detect inline range for QC
+            self._detect_inline_range()
+
+        except Exception as e:
+            if hasattr(self, 'stats_text'):
+                self.stats_text.setText(f"Error reading file info: {e}")
+
+    def _detect_inline_range(self):
+        """Detect inline range from first few traces using header mapping."""
+        self._inline_range = None
+
+        if not self.reader:
+            return
+
+        try:
+            # First, find the inline field name from the header mapping
+            inline_field_name = None
+            inline_patterns = ['inline', 'inline_no', 'inline_3d', 'il', 'iline']
+
+            # Search through defined header fields
+            for field_name in self.header_mapping.fields.keys():
+                if any(pattern in field_name.lower() for pattern in inline_patterns):
+                    inline_field_name = field_name
+                    break
+
+            # Also check computed headers
+            if not inline_field_name:
+                for computed_field in self.header_mapping.computed_fields:
+                    if any(pattern in computed_field.name.lower() for pattern in inline_patterns):
+                        inline_field_name = computed_field.name
+                        break
+
+            if not inline_field_name:
+                if hasattr(self, 'qc_range_label'):
+                    self.qc_range_label.setText(
+                        "No inline header detected in mapping.\n"
+                        "Add an 'inline' or 'INLINE_NO' field to header mapping."
+                    )
+                return
+
+            # Read sample headers using the mapping
+            headers = self.reader.read_sample_headers(n_traces=100)
+
+            # Extract inline values using the detected field name
+            inline_values = []
+            for header in headers:
+                if inline_field_name in header:
+                    val = header[inline_field_name]
+                    if val is not None and val != 0:
+                        inline_values.append(val)
+
+            if inline_values:
+                min_il = min(inline_values)
+                max_il = max(inline_values)
+                # Estimate full range
+                self._inline_range = (min_il, max_il)
+                if hasattr(self, 'qc_range_label'):
+                    self.qc_range_label.setText(
+                        f"Detected range (sample): {min_il} - {max_il}\n"
+                        f"Using header field: '{inline_field_name}'"
+                    )
+            else:
+                if hasattr(self, 'qc_range_label'):
+                    self.qc_range_label.setText(
+                        f"Field '{inline_field_name}' found but no valid values.\n"
+                        "Check header mapping configuration."
+                    )
+
+        except Exception as e:
+            logger.warning(f"Could not detect inline range: {e}")
+            if hasattr(self, 'qc_range_label'):
+                self.qc_range_label.setText(f"Error detecting range: {e}")
+
+    def _on_file_selected(self, filepath: str):
+        """Handle file selection - update reader and UI."""
+        self.segy_file = filepath
+        self._update_reader()
+        self.import_btn.setEnabled(True)
+
+        # Load sample header values if table has headers
+        if self.header_table.rowCount() > 0:
+            self._load_sample_header_values()
+
+        # Update file statistics
+        self._update_file_statistics()
+
+        # Update summary
+        self._update_summary()
+
+    # =========================================================================
+    # Original Group Creation Methods (now used by tabs)
+    # =========================================================================
 
     def _create_header_mapping_group(self) -> QGroupBox:
         """Create header mapping configuration table."""
@@ -290,83 +765,8 @@ class SEGYImportDialog(QDialog):
         group.setLayout(layout)
         return group
 
-    def _create_ensemble_group(self) -> QGroupBox:
-        """Create ensemble configuration group."""
-        logger.info("      _create_ensemble_group() - START")
-        group = QGroupBox("Import Configuration")
-        layout = QVBoxLayout()
-
-        # Ensemble keys row
-        logger.info("        → Creating ensemble keys row...")
-        ensemble_row = QHBoxLayout()
-        ensemble_row.addWidget(QLabel("Ensemble Keys (comma-separated):"))
-
-        self.ensemble_keys_edit = QLineEdit()
-        self.ensemble_keys_edit.setPlaceholderText("e.g., cdp or inline,crossline")
-        ensemble_row.addWidget(self.ensemble_keys_edit)
-
-        ensemble_row.addWidget(QLabel("(Headers that define ensemble boundaries)"))
-        layout.addLayout(ensemble_row)
-        logger.info("        ✓ Ensemble keys row created")
-
-        # Spatial units row
-        logger.info("        → Creating spatial units row...")
-        units_row = QHBoxLayout()
-        units_row.addWidget(QLabel("Spatial Units:"))
-
-        logger.info("        → Creating QComboBox...")
-        self.spatial_units_combo = QComboBox()
-        logger.info("        ✓ QComboBox created")
-
-        logger.info("        → Adding combo items...")
-        self.spatial_units_combo.addItem("Meters (m)", AppSettings.METERS)
-        self.spatial_units_combo.addItem("Feet (ft)", AppSettings.FEET)
-        logger.info("        ✓ Combo items added")
-
-        # Set current value from AppSettings
-        logger.info("        → Loading units from settings...")
-        try:
-            from models.app_settings import get_settings
-            app_settings = get_settings()
-            current_units = app_settings.get_spatial_units()
-            if current_units == 'feet':
-                self.spatial_units_combo.setCurrentIndex(1)
-            else:
-                self.spatial_units_combo.setCurrentIndex(0)
-            logger.info(f"        ✓ Units loaded: {current_units}")
-        except Exception as e:
-            logger.warning(f"        Could not load units from settings: {e}")
-            self.spatial_units_combo.setCurrentIndex(0)  # Default to meters
-
-        self.spatial_units_combo.setToolTip(
-            "Select spatial units for coordinates and distances.\n"
-            "This will be applied throughout the entire application."
-        )
-        units_row.addWidget(self.spatial_units_combo)
-
-        units_row.addWidget(QLabel("(Used for coordinates, offsets, and distances)"))
-        units_row.addStretch()
-        layout.addLayout(units_row)
-
-        group.setLayout(layout)
-        return group
-
-    def _create_preview_group(self) -> QGroupBox:
-        """Create header preview group."""
-        group = QGroupBox("Header Preview (First 10 Traces)")
-        layout = QVBoxLayout()
-
-        preview_btn = QPushButton("Preview Headers")
-        preview_btn.clicked.connect(self._preview_headers)
-        layout.addWidget(preview_btn)
-
-        self.preview_text = QTextEdit()
-        self.preview_text.setReadOnly(True)
-        self.preview_text.setMaximumHeight(150)
-        layout.addWidget(self.preview_text)
-
-        group.setLayout(layout)
-        return group
+    # NOTE: _create_ensemble_group removed - now in _create_import_settings_tab
+    # NOTE: _create_preview_group removed - now in _create_preview_tab
 
     def _create_action_buttons(self) -> QHBoxLayout:
         """Create action buttons."""
@@ -415,19 +815,8 @@ class SEGYImportDialog(QDialog):
             logger.info(f"  ✓ QFileDialog returned: {filename}")
 
             if filename:
-                logger.info(f"  → Setting segy_file to: {filename}")
-                self.segy_file = filename
                 self.file_path_edit.setText(filename)
-                logger.info("  → Calling _update_reader()...")
-                self._update_reader()
-                logger.info("  ✓ Reader updated")
-                self.import_btn.setEnabled(True)
-
-                # Load sample header values if table has headers
-                if self.header_table.rowCount() > 0:
-                    logger.info("  → Loading sample header values...")
-                    self._load_sample_header_values()
-                    logger.info("  ✓ Sample headers loaded")
+                self._on_file_selected(filename)
 
             logger.info("_browse_segy_file() - COMPLETE")
         except Exception as e:
@@ -1014,6 +1403,26 @@ The binary header contains file-level metadata about the entire SEG-Y dataset.
         progress.setLabelText("Saving to Zarr/Parquet...")
         storage = DataStorage(output_dir)
         storage.save_seismic_data(seismic_data, headers, ensembles)
+        progress.setValue(85)
+
+        # Add QC configuration if enabled
+        if hasattr(self, 'qc_inlines_enabled') and self.qc_inlines_enabled.isChecked():
+            import json
+            from pathlib import Path
+            qc_inlines = self._parse_qc_inlines()
+            if qc_inlines:
+                metadata_path = Path(output_dir) / 'metadata.json'
+                if metadata_path.exists():
+                    with open(metadata_path, 'r') as f:
+                        metadata = json.load(f)
+                    metadata['qc_config'] = {
+                        'enabled': True,
+                        'inline_numbers': qc_inlines,
+                        'auto_open_batch': self.auto_open_qc_batch.isChecked(),
+                    }
+                    with open(metadata_path, 'w') as f:
+                        json.dump(metadata, f, indent=2)
+
         progress.setValue(90)
 
         # Load back for verification
@@ -1036,20 +1445,13 @@ The binary header contains file-level metadata about the entire SEG-Y dataset.
     def _import_streaming(self, output_dir: str, file_info: dict, ensemble_keys: List[str]):
         """Import using multiprocess parallel method (for large files)."""
         import time
-        start_time = time.time()
+        import json
+        import shutil
+        from pathlib import Path
 
         n_traces = file_info['n_traces']
         n_samples = file_info['n_samples']
         n_workers = get_optimal_workers()
-
-        # Create progress dialog
-        progress = QProgressDialog(
-            f"Parallel import with {n_workers} workers...",
-            "Cancel", 0, n_traces, self
-        )
-        progress.setWindowModality(Qt.WindowModality.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.setValue(0)
 
         # Configure parallel import
         config = ImportConfig(
@@ -1065,14 +1467,25 @@ The binary header contains file-level metadata about the entire SEG-Y dataset.
         cancelled = False
 
         try:
-            # Progress callback
-            def on_progress(prog: ImportProgress):
+            # ═══════════════════════════════════════════════════════════════════
+            # STAGE 1: Parallel Import (traces progress)
+            # ═══════════════════════════════════════════════════════════════════
+            import_progress = QProgressDialog(
+                f"Parallel import with {n_workers} workers...",
+                "Cancel", 0, n_traces, self
+            )
+            import_progress.setWindowModality(Qt.WindowModality.WindowModal)
+            import_progress.setWindowTitle("Parallel Import - Stage 1/4")
+            import_progress.setMinimumDuration(0)
+            import_progress.setValue(0)
+
+            def on_import_progress(prog: ImportProgress):
                 nonlocal cancelled
-                if progress.wasCanceled():
+                if import_progress.wasCanceled():
                     coordinator.cancel()
                     cancelled = True
                     return
-                progress.setValue(prog.current_traces)
+                import_progress.setValue(prog.current_traces)
 
                 # Format ETA
                 if prog.eta_seconds > 0 and prog.eta_seconds < float('inf'):
@@ -1080,27 +1493,100 @@ The binary header contains file-level metadata about the entire SEG-Y dataset.
                 else:
                     eta_str = "calculating..."
 
-                progress.setLabelText(
-                    f"Phase: {prog.phase}\n"
-                    f"Progress: {prog.current_traces:,}/{prog.total_traces:,} traces\n"
-                    f"Workers: {prog.active_workers}, ETA: {eta_str}"
+                import_progress.setLabelText(
+                    f"Importing traces ({prog.active_workers} workers)...\n"
+                    f"{prog.current_traces:,} / {prog.total_traces:,} traces\n"
+                    f"ETA: {eta_str}"
                 )
+                QApplication.processEvents()
 
-            # Run parallel import
+            # Run parallel import stage
             print(f"Starting parallel import with {n_workers} workers...")
-            result = coordinator.run(progress_callback=on_progress)
+            stage_result = coordinator.run_parallel_import(progress_callback=on_import_progress)
 
-            if cancelled:
+            was_canceled = import_progress.wasCanceled()
+            import_progress.close()
+
+            if was_canceled or coordinator.was_cancelled:
                 raise InterruptedError("Import cancelled by user")
+
+            if not stage_result.success:
+                raise RuntimeError(stage_result.error)
+
+            # ═══════════════════════════════════════════════════════════════════
+            # STAGE 2: Merge Headers (segments progress)
+            # ═══════════════════════════════════════════════════════════════════
+            n_segments = len(stage_result.worker_results)
+
+            merge_progress = QProgressDialog(
+                "Merging header files...",
+                None, 0, n_segments, self  # No cancel for post-processing
+            )
+            merge_progress.setWindowModality(Qt.WindowModality.WindowModal)
+            merge_progress.setWindowTitle("Parallel Import - Stage 2/4")
+            merge_progress.setMinimumDuration(0)
+            merge_progress.setCancelButton(None)
+
+            def on_merge_progress(segments_done: int, total: int):
+                merge_progress.setValue(segments_done)
+                merge_progress.setLabelText(f"Merging headers... segment {segments_done}/{total}")
+                QApplication.processEvents()
+
+            headers_path = coordinator.run_merge_headers(stage_result, progress_callback=on_merge_progress)
+            merge_progress.close()
+
+            # ═══════════════════════════════════════════════════════════════════
+            # STAGE 3: Build Ensemble Index (traces progress)
+            # ═══════════════════════════════════════════════════════════════════
+            index_progress = QProgressDialog(
+                "Building ensemble index...",
+                None, 0, n_traces, self
+            )
+            index_progress.setWindowModality(Qt.WindowModality.WindowModal)
+            index_progress.setWindowTitle("Parallel Import - Stage 3/4")
+            index_progress.setMinimumDuration(0)
+            index_progress.setCancelButton(None)
+
+            def on_index_progress(traces_done: int, total: int):
+                index_progress.setValue(traces_done)
+                index_progress.setLabelText(
+                    f"Building ensemble index...\n"
+                    f"{traces_done:,} / {total:,} traces scanned"
+                )
+                QApplication.processEvents()
+
+            coordinator.run_build_index(stage_result, headers_path, progress_callback=on_index_progress)
+            index_progress.close()
+
+            # ═══════════════════════════════════════════════════════════════════
+            # STAGE 4: Cleanup (files progress)
+            # ═══════════════════════════════════════════════════════════════════
+            cleanup_progress = QProgressDialog(
+                "Cleaning up temporary files...",
+                None, 0, n_segments, self
+            )
+            cleanup_progress.setWindowModality(Qt.WindowModality.WindowModal)
+            cleanup_progress.setWindowTitle("Parallel Import - Stage 4/4")
+            cleanup_progress.setMinimumDuration(0)
+            cleanup_progress.setCancelButton(None)
+
+            def on_cleanup_progress(files_done: int, total: int):
+                cleanup_progress.setValue(files_done)
+                cleanup_progress.setLabelText(f"Cleaning up... {files_done}/{total} files")
+                QApplication.processEvents()
+
+            coordinator.run_cleanup(stage_result, progress_callback=on_cleanup_progress)
+            cleanup_progress.close()
+
+            # ═══════════════════════════════════════════════════════════════════
+            # Get Final Result
+            # ═══════════════════════════════════════════════════════════════════
+            result = coordinator.get_final_result(stage_result, headers_path)
 
             if not result.success:
                 raise RuntimeError(result.error)
 
-            elapsed_time = time.time() - start_time
-
             # Update metadata with source file info
-            import json
-            from pathlib import Path
             metadata_path = Path(output_dir) / 'metadata.json'
             if metadata_path.exists():
                 with open(metadata_path, 'r') as f:
@@ -1111,6 +1597,17 @@ The binary header contains file-level metadata about the entire SEG-Y dataset.
                     'file_info': file_info,
                     'header_mapping': self.header_mapping.to_dict(),
                 }
+
+                # Add QC configuration if enabled
+                if hasattr(self, 'qc_inlines_enabled') and self.qc_inlines_enabled.isChecked():
+                    qc_inlines = self._parse_qc_inlines()
+                    if qc_inlines:
+                        metadata['qc_config'] = {
+                            'enabled': True,
+                            'inline_numbers': qc_inlines,
+                            'auto_open_batch': self.auto_open_qc_batch.isChecked(),
+                        }
+
                 with open(metadata_path, 'w') as f:
                     json.dump(metadata, f, indent=2)
 
@@ -1124,8 +1621,8 @@ Data Statistics:
 - Segments: {result.n_segments}
 
 Performance:
-- Import time: {elapsed_time:.1f}s
-- Throughput: {n_traces / elapsed_time:,.0f} traces/sec
+- Import time: {result.elapsed_time:.1f}s
+- Throughput: {n_traces / result.elapsed_time:,.0f} traces/sec
 - Workers used: {n_workers}
 
 Output: {output_dir}
@@ -1136,7 +1633,6 @@ Output: {output_dir}
             # Load back for viewer using lazy loading
             from models.lazy_seismic_data import LazySeismicData
 
-            progress.setLabelText("Preparing data for viewing...")
             lazy_data = LazySeismicData.from_storage_dir(output_dir)
 
             # Load ensemble index if exists
@@ -1150,16 +1646,12 @@ Output: {output_dir}
 
         except InterruptedError:
             # User cancelled - clean up
-            import shutil
-            from pathlib import Path
             output_path = Path(output_dir)
             if output_path.exists():
                 shutil.rmtree(output_path, ignore_errors=True)
             QMessageBox.information(self, "Import Cancelled", "Import was cancelled by user.")
         except Exception as e:
             # Error - clean up
-            import shutil
-            from pathlib import Path
             output_path = Path(output_dir)
             if output_path.exists():
                 shutil.rmtree(output_path, ignore_errors=True)

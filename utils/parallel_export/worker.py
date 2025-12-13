@@ -3,6 +3,11 @@ Worker function for parallel SEG-Y export.
 
 Each worker runs in a separate process to bypass Python GIL.
 Workers write their segment of traces to individual temp SEG-Y files.
+
+Supports:
+- Standard processed data export
+- Noise export (input - processed)
+- On-the-fly mute application (top/bottom with taper)
 """
 
 import gc
@@ -11,12 +16,114 @@ import time
 import numpy as np
 import zarr
 import segyio
+import psutil
 from pathlib import Path
 from typing import Optional, Dict
 from multiprocessing import Queue
 
 from .config import ExportTask, ExportWorkerResult
 from .header_vectorizer import HeaderVectorizer
+
+
+def apply_mute_to_trace(
+    trace: np.ndarray,
+    offset: float,
+    sample_interval_ms: float,
+    velocity: float,
+    top_mute: bool,
+    bottom_mute: bool,
+    taper_samples: int
+) -> np.ndarray:
+    """
+    Apply linear mute to a single trace (in-place modification).
+
+    Mute formula: T = |offset| / velocity
+
+    Args:
+        trace: Trace data array (modified in place)
+        offset: Offset in meters
+        sample_interval_ms: Sample interval in milliseconds
+        velocity: Mute velocity in m/s
+        top_mute: Zero samples before mute time
+        bottom_mute: Zero samples after mute time
+        taper_samples: Number of samples for cosine taper
+
+    Returns:
+        Modified trace
+    """
+    n_samples = len(trace)
+
+    # Calculate mute sample
+    velocity_m_per_ms = velocity / 1000.0
+    mute_time_ms = abs(offset) / velocity_m_per_ms
+    mute_sample = int(mute_time_ms / sample_interval_ms)
+
+    # Pre-compute taper if needed
+    if taper_samples > 0:
+        taper = 0.5 * (1 - np.cos(np.linspace(0, np.pi, taper_samples)))
+    else:
+        taper = np.array([])
+
+    # Apply top mute
+    if top_mute and mute_sample > 0:
+        mute_end = min(mute_sample, n_samples)
+        trace[:mute_end] = 0
+
+        # Apply taper after mute zone
+        if taper_samples > 0 and mute_end < n_samples:
+            taper_end = min(mute_end + taper_samples, n_samples)
+            actual_taper_len = taper_end - mute_end
+            if actual_taper_len > 0:
+                trace[mute_end:taper_end] *= taper[:actual_taper_len]
+
+    # Apply bottom mute
+    if bottom_mute and mute_sample < n_samples:
+        mute_start = max(0, mute_sample)
+
+        # Apply taper before mute zone
+        if taper_samples > 0 and mute_start > 0:
+            taper_start = max(0, mute_start - taper_samples)
+            actual_taper_len = mute_start - taper_start
+            if actual_taper_len > 0:
+                trace[taper_start:mute_start] *= taper[:actual_taper_len][::-1]
+
+        # Zero after mute
+        trace[mute_start:] = 0
+
+    return trace
+
+
+def get_adaptive_chunk_size(n_samples: int, n_workers: int = 4) -> int:
+    """
+    Calculate adaptive chunk size based on available memory and trace depth.
+
+    Aims to keep per-worker memory usage reasonable while maintaining throughput.
+
+    Args:
+        n_samples: Number of samples per trace
+        n_workers: Number of parallel workers
+
+    Returns:
+        Optimal chunk size in traces
+    """
+    try:
+        available_mb = psutil.virtual_memory().available / (1024 * 1024)
+    except Exception:
+        available_mb = 4000  # Conservative default: 4GB available
+
+    # Reserve 2GB for system + app, divide remaining among workers
+    usable_mb = max(500, (available_mb - 2000) / n_workers)
+
+    # Calculate bytes per trace chunk
+    bytes_per_trace = n_samples * 4  # float32
+
+    # Target chunk memory: 100-200MB per chunk for good I/O performance
+    target_chunk_mb = min(200, usable_mb * 0.5)
+
+    chunk_size = int((target_chunk_mb * 1024 * 1024) / bytes_per_trace)
+
+    # Clamp to reasonable range
+    return max(100, min(5000, chunk_size))
 
 
 def export_trace_range(
@@ -36,6 +143,11 @@ def export_trace_range(
     5. Writes traces with vectorized header access
     6. Reports progress via queue
 
+    Supports:
+    - 'processed': Export processed data as-is
+    - 'noise': Export input - processed (noise estimation)
+    - Mute: Apply top/bottom mute based on offset and velocity
+
     Args:
         task: ExportTask with all configuration
         progress_queue: Optional queue for progress updates (segment_id, traces_done)
@@ -52,6 +164,21 @@ def export_trace_range(
 
         # Open processed Zarr for trace data
         processed_zarr = zarr.open(task.processed_zarr_path, mode='r')
+
+        # Open input Zarr if noise export
+        input_zarr = None
+        if task.export_type == 'noise' and task.input_zarr_path:
+            input_zarr = zarr.open(task.input_zarr_path, mode='r')
+
+        # Check if mute is enabled
+        apply_mute = (
+            task.mute_velocity is not None and
+            task.mute_velocity > 0 and
+            (task.mute_top or task.mute_bottom)
+        )
+
+        # Get sample interval in milliseconds for mute calculation
+        sample_interval_ms = task.sample_interval / 1000.0  # microseconds to ms
 
         # Create segment spec
         n_traces = task.end_trace - task.start_trace + 1
@@ -81,35 +208,109 @@ def export_trace_range(
                 dst.bin[segyio.BinField.Format] = task.data_format
 
             # Write traces in chunks for memory efficiency
-            chunk_size = 1000
+            # Use adaptive chunk size based on available memory and trace depth
+            chunk_size = get_adaptive_chunk_size(task.n_samples)
             local_idx = 0
 
             for chunk_start in range(task.start_trace, task.end_trace + 1, chunk_size):
                 chunk_end = min(chunk_start + chunk_size, task.end_trace + 1)
                 chunk_n = chunk_end - chunk_start
 
-                # Load chunk of trace data
-                chunk_data = np.array(processed_zarr[:, chunk_start:chunk_end])
+                # Helper function to apply mute to a chunk
+                def apply_mute_to_chunk(chunk, chunk_start_idx):
+                    """Apply mute to all traces in chunk."""
+                    if not apply_mute:
+                        return chunk
+                    for i in range(chunk.shape[1]):
+                        local_header_idx = (chunk_start_idx - task.start_trace) + i
+                        offset = 0.0
+                        for offset_field in ['offset', 'OFFSET', 'Offset']:
+                            if offset_field in header_arrays:
+                                offset = float(header_arrays[offset_field][local_header_idx])
+                                break
+                        if offset != 0.0:
+                            chunk[:, i] = apply_mute_to_trace(
+                                chunk[:, i].copy(),
+                                offset,
+                                sample_interval_ms,
+                                task.mute_velocity,
+                                task.mute_top,
+                                task.mute_bottom,
+                                task.mute_taper
+                            )
+                    return chunk
+
+                # Load chunk of trace data based on export type and mute target
+                if task.export_type == 'noise' and input_zarr is not None:
+                    # Noise = Input - Processed
+                    input_chunk = np.array(input_zarr[:, chunk_start:chunk_end])
+                    processed_chunk = np.array(processed_zarr[:, chunk_start:chunk_end])
+
+                    # Apply mute based on target
+                    if apply_mute and task.mute_target == 'input':
+                        input_chunk = apply_mute_to_chunk(input_chunk, chunk_start)
+                    elif apply_mute and task.mute_target == 'processed':
+                        processed_chunk = apply_mute_to_chunk(processed_chunk, chunk_start)
+
+                    chunk_data = input_chunk - processed_chunk
+
+                    # Apply mute to output if target is 'output'
+                    if apply_mute and task.mute_target == 'output':
+                        chunk_data = apply_mute_to_chunk(chunk_data, chunk_start)
+
+                    del input_chunk, processed_chunk
+                else:
+                    # Standard processed export
+                    chunk_data = np.array(processed_zarr[:, chunk_start:chunk_end])
+
+                    # Apply mute to output (only option for processed-only export)
+                    if apply_mute:
+                        chunk_data = apply_mute_to_chunk(chunk_data, chunk_start)
 
                 # Write each trace with vectorized headers
+                # Note: header_arrays is now a SLICE for this segment only,
+                # indexed 0 to (end_trace - start_trace), not global indices
                 for i in range(chunk_n):
-                    global_trace_idx = chunk_start + i
+                    # Local index within this segment's header slice
+                    local_header_idx = (chunk_start - task.start_trace) + i
+
+                    # Get trace data for this trace
+                    trace_data = chunk_data[:, i]
 
                     # Write trace data
-                    dst.trace[local_idx] = chunk_data[:, i]
+                    dst.trace[local_idx] = trace_data
 
-                    # Write headers using vectorized access
-                    for field_name, arr in header_arrays.items():
-                        if hasattr(segyio.TraceField, field_name):
-                            field = getattr(segyio.TraceField, field_name)
-                            dst.header[local_idx][field] = int(arr[global_trace_idx])
+                    # Write headers using custom mapping if provided, otherwise use auto-detection
+                    if task.header_mapping_list:
+                        # Use custom header mapping
+                        for mapping in task.header_mapping_list:
+                            parquet_col = mapping['parquet_column']
+                            byte_pos = mapping['segy_byte_pos']
+                            if parquet_col in header_arrays:
+                                # Find the segyio TraceField for this byte position
+                                field = None
+                                for tf in segyio.TraceField:
+                                    if tf.value == byte_pos:
+                                        field = tf
+                                        break
+                                if field:
+                                    dst.header[local_idx][field] = int(header_arrays[parquet_col][local_header_idx])
+                    else:
+                        # Auto-detect: write headers using standard field name mapping
+                        for field_name, arr in header_arrays.items():
+                            if hasattr(segyio.TraceField, field_name):
+                                field = getattr(segyio.TraceField, field_name)
+                                dst.header[local_idx][field] = int(arr[local_header_idx])
 
                     local_idx += 1
                     traces_done += 1
 
-                # Report progress periodically
+                # Report progress periodically (non-blocking to avoid deadlock)
                 if progress_queue is not None:
-                    progress_queue.put((task.segment_id, traces_done))
+                    try:
+                        progress_queue.put_nowait((task.segment_id, traces_done))
+                    except Exception:
+                        pass  # Queue full, skip this update
 
                 # Cleanup chunk memory
                 del chunk_data

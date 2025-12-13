@@ -90,6 +90,9 @@ class MainWindow(QMainWindow):
         self.sorted_headers_df = None  # Sorted headers DataFrame (for export)
         self.is_full_dataset_processed = False  # Flag to track if all gathers processed
 
+        # Mute configuration for viewing
+        self.mute_config = None  # MuteConfig or None
+
         # Dataset navigator - manages multiple loaded datasets
         self.dataset_navigator = DatasetNavigator(
             max_cached_datasets=self.app_settings.get_dataset_cache_limit()
@@ -171,6 +174,8 @@ class MainWindow(QMainWindow):
         # PSTM signals
         self.control_panel.pstm_apply_requested.connect(self._on_pstm_apply_requested)
         self.control_panel.pstm_wizard_requested.connect(self._on_pstm_wizard_requested)
+        # Mute signals
+        self.control_panel.mute_apply_requested.connect(self._on_mute_apply_requested)
         # Connect auto-scale button to auto-scale method
         auto_scale_btn = self.control_panel.findChild(QPushButton, "Auto Scale from Data")
         if not auto_scale_btn:
@@ -332,6 +337,20 @@ class MainWindow(QMainWindow):
         resume_migration_action.triggered.connect(self._resume_migration)
         process_menu.addAction(resume_migration_action)
 
+        process_menu.addSeparator()
+
+        # QC Stacking
+        qc_stacking_action = QAction("&QC Stacking...", self)
+        qc_stacking_action.setToolTip("Stack selected inlines for QC analysis")
+        qc_stacking_action.triggered.connect(self._open_qc_stacking)
+        process_menu.addAction(qc_stacking_action)
+
+        # QC Batch Processing
+        qc_batch_action = QAction("QC &Batch Processing...", self)
+        qc_batch_action.setToolTip("Apply processing chain to selected gathers for QC")
+        qc_batch_action.triggered.connect(self._open_qc_batch_processing)
+        process_menu.addAction(qc_batch_action)
+
         # View menu
         view_menu = menubar.addMenu("&View")
 
@@ -348,6 +367,19 @@ class MainWindow(QMainWindow):
         isa_action.setToolTip("Open Interactive Spectral Analysis window")
         isa_action.triggered.connect(self._open_isa_window)
         view_menu.addAction(isa_action)
+
+        # QC Stack Viewer
+        qc_viewer_action = QAction("Open &QC Stack Viewer", self)
+        qc_viewer_action.setToolTip("Compare before/after stacks with difference display")
+        qc_viewer_action.triggered.connect(self._open_qc_stack_viewer)
+        view_menu.addAction(qc_viewer_action)
+
+        # QC Presentation Tool
+        qc_presentation_action = QAction("QC &Presentation Tool...", self)
+        qc_presentation_action.setShortcut("Ctrl+Shift+Q")
+        qc_presentation_action.setToolTip("Multi-band QC analysis with PowerPoint export")
+        qc_presentation_action.triggered.connect(self._open_qc_presentation)
+        view_menu.addAction(qc_presentation_action)
 
         view_menu.addSeparator()
 
@@ -1258,6 +1290,199 @@ class MainWindow(QMainWindow):
             3000
         )
 
+    def _open_qc_presentation(self):
+        """Open QC Presentation Tool window."""
+        if self.input_data is None:
+            QMessageBox.warning(
+                self,
+                "No Data",
+                "Please load or generate seismic data first."
+            )
+            return
+
+        # Import QC Presentation window
+        from views.qc_presentation_window import QCPresentationWindow
+
+        # Create and show QC Presentation window
+        qc_window = QCPresentationWindow(self.viewport_state, parent=self)
+        qc_window.set_data(self.input_data, self.processed_data)
+        qc_window.show()
+
+        # Status message
+        self.statusBar().showMessage(
+            "QC Presentation Tool opened. LMB/RMB to flip, adjust gains, then export to PowerPoint.",
+            5000
+        )
+
+    def _open_qc_stacking(self):
+        """Open QC Stacking dialog."""
+        # Get dataset path
+        dataset_path = None
+        if hasattr(self, 'lazy_seismic_data') and self.lazy_seismic_data:
+            dataset_path = str(self.lazy_seismic_data.zarr_path.parent)
+        elif hasattr(self, 'input_storage_dir') and self.input_storage_dir:
+            dataset_path = str(self.input_storage_dir)
+
+        if not dataset_path:
+            QMessageBox.warning(
+                self,
+                "No Dataset",
+                "Please load a dataset first.\n\n"
+                "Use File → Import SEG-Y to load seismic data."
+            )
+            return
+
+        from views.qc_stacking_dialog import QCStackingDialog, QCStackingConfig
+        from processors.qc_stacking_engine import QCStackingWorker, StackingProgress
+
+        dialog = QCStackingDialog(dataset_path, parent=self)
+
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            config = dialog.get_config()
+
+            # Create progress dialog
+            progress = QProgressDialog(
+                "Initializing QC stacking...",
+                "Cancel",
+                0, 100,
+                self
+            )
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setWindowTitle("QC Stacking")
+            progress.setMinimumDuration(0)
+            progress.setMinimumWidth(400)
+
+            # Create and run worker
+            worker = QCStackingWorker(config)
+
+            def on_progress(prog: StackingProgress):
+                if progress.wasCanceled():
+                    worker.cancel()
+                    return
+                pct = int(prog.current / max(prog.total, 1) * 100)
+                progress.setValue(pct)
+                progress.setLabelText(f"{prog.phase}: {prog.message}")
+                QApplication.processEvents()
+
+            def on_complete(output_path):
+                progress.close()
+                QMessageBox.information(
+                    self,
+                    "QC Stacking Complete",
+                    f"Successfully created QC stack!\n\n"
+                    f"Output: {output_path}\n\n"
+                    "Use View → QC Stack Viewer to compare stacks."
+                )
+
+            def on_error(error):
+                progress.close()
+                QMessageBox.critical(
+                    self,
+                    "QC Stacking Error",
+                    f"Failed to create QC stack:\n\n{error}"
+                )
+
+            worker.progress_updated.connect(on_progress)
+            worker.finished_with_result.connect(on_complete)
+            worker.error_occurred.connect(on_error)
+            worker.start()
+
+    def _open_qc_batch_processing(self):
+        """Open QC Batch Processing dialog."""
+        # Get dataset path
+        dataset_path = None
+        if hasattr(self, 'lazy_seismic_data') and self.lazy_seismic_data:
+            dataset_path = str(self.lazy_seismic_data.zarr_path.parent)
+        elif hasattr(self, 'input_storage_dir') and self.input_storage_dir:
+            dataset_path = str(self.input_storage_dir)
+
+        if not dataset_path:
+            QMessageBox.warning(
+                self,
+                "No Dataset",
+                "Please load a dataset first.\n\n"
+                "Use File → Import SEG-Y to load seismic data."
+            )
+            return
+
+        from views.qc_batch_dialog import QCBatchDialog, QCBatchConfig
+        from processors.qc_batch_engine import QCBatchWorker, BatchProgress
+
+        dialog = QCBatchDialog(dataset_path, parent=self)
+
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            config = dialog.get_config()
+
+            # Create progress dialog
+            progress = QProgressDialog(
+                "Initializing QC batch processing...",
+                "Cancel",
+                0, 100,
+                self
+            )
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setWindowTitle("QC Batch Processing")
+            progress.setMinimumDuration(0)
+            progress.setMinimumWidth(400)
+
+            # Create and run worker
+            worker = QCBatchWorker(config)
+
+            def on_progress(prog: BatchProgress):
+                if progress.wasCanceled():
+                    worker.cancel()
+                    return
+                progress.setValue(int(prog.percent))
+                progress.setLabelText(f"{prog.phase}: {prog.message}")
+                QApplication.processEvents()
+
+            def on_complete(result):
+                progress.close()
+                stats = result.stats
+
+                msg = f"Successfully completed QC batch processing!\n\n"
+                msg += f"Processed {stats.get('n_gathers', 0)} gathers from {stats.get('n_inlines', 0)} inlines\n"
+                msg += f"Applied {stats.get('n_processors', 0)} processors\n\n"
+
+                if 'correlation' in stats:
+                    msg += f"Before/After Correlation: {stats['correlation']:.4f}\n"
+                if 'difference_rms' in stats:
+                    msg += f"Difference RMS: {stats['difference_rms']:.4f}\n"
+
+                msg += f"\nOutput directory: {result.output_dir}\n\n"
+                msg += "Use View → QC Stack Viewer to compare results."
+
+                QMessageBox.information(
+                    self,
+                    "QC Batch Processing Complete",
+                    msg
+                )
+
+            def on_error(error):
+                progress.close()
+                QMessageBox.critical(
+                    self,
+                    "QC Batch Processing Error",
+                    f"Failed to complete QC batch processing:\n\n{error}"
+                )
+
+            worker.progress_updated.connect(on_progress)
+            worker.finished_with_result.connect(on_complete)
+            worker.error_occurred.connect(on_error)
+            worker.start()
+
+    def _open_qc_stack_viewer(self):
+        """Open QC Stack Viewer window."""
+        from views.qc_stack_viewer import QCStackViewerWindow
+
+        viewer = QCStackViewerWindow(parent=self)
+        viewer.show()
+
+        self.statusBar().showMessage(
+            "QC Stack Viewer opened. Load before/after stacks to compare.",
+            3000
+        )
+
     def _batch_process_all_gathers(self):
         """
         Batch process all gathers in the dataset with current processor.
@@ -1884,6 +2109,194 @@ class MainWindow(QMainWindow):
     # Parallel Batch Processing (Multiprocess - Bypasses GIL)
     # =========================================================================
 
+    def _estimate_parallel_memory(
+        self,
+        input_storage_dir: Path,
+        n_samples: int,
+        n_workers: int,
+        output_noise: bool = False,
+        sorting_enabled: bool = False,
+        output_mode: str = 'processed'
+    ) -> dict:
+        """
+        Pre-flight memory estimation for parallel batch processing.
+
+        Args:
+            input_storage_dir: Path to input dataset directory
+            n_samples: Number of samples per trace
+            n_workers: Proposed number of worker processes
+            output_noise: Whether noise output is enabled (legacy, use output_mode)
+            sorting_enabled: Whether sorting is enabled
+            output_mode: 'processed', 'noise', or 'both'
+
+        Returns:
+            Dictionary with:
+                - max_gather_traces: Maximum traces in any gather
+                - is_safe: Whether memory usage is safe
+                - available_mb: Available system memory in MB
+                - required_mb: Estimated memory requirement in MB
+                - ratio: required/available ratio
+                - risk_level: 'low', 'medium', 'high', or 'critical'
+                - message: Human-readable status message
+                - safe_workers: Recommended safe worker count
+        """
+        import psutil
+        import pandas as pd
+        from models.app_settings import get_settings
+
+        result = {
+            'max_gather_traces': 0,
+            'is_safe': True,
+            'available_mb': 0,
+            'required_mb': 0,
+            'ratio': 0.0,
+            'risk_level': 'low',
+            'message': 'Memory check unavailable',
+            'safe_workers': n_workers
+        }
+
+        try:
+            # Load ensemble index to get max gather size
+            ensemble_path = input_storage_dir / 'ensemble_index.parquet'
+            if not ensemble_path.exists():
+                result['message'] = 'Ensemble index not found - cannot estimate memory'
+                return result
+
+            ensemble_df = pd.read_parquet(ensemble_path)
+            max_gather_traces = int(ensemble_df['n_traces'].max())
+            result['max_gather_traces'] = max_gather_traces
+
+            # Get settings
+            settings = get_settings()
+            safety_factor = settings.get_parallel_memory_safety_factor() / 100.0
+            memory_copies = settings.get_parallel_memory_copies_estimate()
+
+            # Get available memory
+            available_bytes = psutil.virtual_memory().available
+            available_mb = available_bytes / (1024**2)
+            result['available_mb'] = available_mb
+
+            # Determine effective output mode
+            effective_mode = output_mode
+            if output_mode == 'processed' and output_noise:
+                effective_mode = 'both'
+
+            # Calculate copies based on output mode
+            # Peak memory occurs DURING processor.process(), not after!
+            # DWT/SWT processors create: input + padded + denoised + coefficients
+            if effective_mode == 'noise':
+                # Peak during processor: input + padded + denoised + coefficients
+                # Post-processing uses in-place subtraction but peak is during DWT
+                effective_copies = 4  # Measured peak during DWT processing
+            elif effective_mode == 'both':
+                # Peak: input + processor_internals + separate noise array
+                effective_copies = 5
+            else:
+                # Processed only: input + processor_internals
+                effective_copies = 4
+
+            if sorting_enabled:
+                effective_copies += 1
+
+            # Per-worker memory overhead (MB) - MEASURED VALUES from actual runs
+            # Components that add up per worker:
+            #   - Fork base overhead: ~200 MB (Python pages modified, triggering COW)
+            #   - Ensemble index: ~80 MB (loaded AFTER fork, NOT shared)
+            #   - Zarr metadata/cache: ~250 MB (input + output arrays)
+            #   - Working buffers: ~150 MB (numpy temp arrays)
+            #   - DWT/SWT peak: ~100 MB additional during processing
+            # Total measured: ~780 MB per worker (without headers)
+            import sys
+            if sys.platform == 'linux':
+                WORKER_STARTUP_OVERHEAD_MB = 800  # Fork: measured ~780 MB/worker
+            else:
+                WORKER_STARTUP_OVERHEAD_MB = 2500  # Spawn: full imports
+
+            # Calculate memory per gather: n_samples × max_traces × 4 bytes × copies
+            bytes_per_gather = n_samples * max_gather_traces * 4 * effective_copies
+
+            # Total peak memory: all workers loading max-size gathers simultaneously
+            peak_bytes = n_workers * bytes_per_gather
+            gather_mb = peak_bytes / (1024**2)
+
+            # Add worker startup overhead (imports, ensemble index, zarr handles)
+            worker_overhead_mb = n_workers * WORKER_STARTUP_OVERHEAD_MB
+            required_mb = gather_mb + worker_overhead_mb
+            result['required_mb'] = required_mb
+
+            # Calculate safe worker count based on per-worker total memory
+            gather_mb_per_worker = gather_mb / n_workers if n_workers > 0 else 0
+            per_worker_total_mb = WORKER_STARTUP_OVERHEAD_MB + gather_mb_per_worker
+
+            if per_worker_total_mb > 0 and available_mb > 0:
+                safe_workers = max(1, int(available_mb * safety_factor / per_worker_total_mb))
+                safe_workers = min(safe_workers, n_workers)  # Don't exceed requested
+            else:
+                safe_workers = n_workers
+            result['safe_workers'] = safe_workers
+
+            # Calculate ratio
+            ratio = required_mb / available_mb if available_mb > 0 else float('inf')
+            result['ratio'] = ratio
+            safe_threshold = safety_factor
+
+            # Determine risk level
+            if ratio < safe_threshold * 0.5:
+                risk_level = 'low'
+                is_safe = True
+            elif ratio < safe_threshold:
+                risk_level = 'medium'
+                is_safe = True
+            elif ratio < 0.9:
+                risk_level = 'high'
+                is_safe = False
+            else:
+                risk_level = 'critical'
+                is_safe = False
+
+            result['risk_level'] = risk_level
+            result['is_safe'] = is_safe
+
+            # Build message
+            if risk_level == 'low':
+                result['message'] = (
+                    f"✅ Memory OK: {required_mb:.0f} MB estimated "
+                    f"({ratio*100:.0f}% of {available_mb:.0f} MB available)"
+                )
+            elif risk_level == 'medium':
+                result['message'] = (
+                    f"⚠️ Memory MODERATE: {required_mb:.0f} MB estimated "
+                    f"({ratio*100:.0f}% of {available_mb:.0f} MB). Monitor system."
+                )
+            elif risk_level == 'high':
+                result['message'] = (
+                    f"🔶 Memory HIGH RISK: {required_mb:.0f} MB estimated "
+                    f"({ratio*100:.0f}% of {available_mb:.0f} MB). "
+                    f"Recommend {safe_workers} workers."
+                )
+            else:  # critical
+                result['message'] = (
+                    f"🛑 Memory CRITICAL: {required_mb:.0f} MB estimated "
+                    f"({ratio*100:.0f}% of {available_mb:.0f} MB). "
+                    f"Reduce to {safe_workers} workers or less!"
+                )
+
+        except Exception as e:
+            result['message'] = f'Memory estimation error: {str(e)}'
+            logger.warning(f"Memory estimation failed: {e}")
+
+        return result
+
+    def _get_memory_status_style(self, risk_level: str) -> str:
+        """Get CSS style for memory status label based on risk level."""
+        styles = {
+            'low': "color: #2e7d32; font-weight: bold; padding: 4px;",      # Green
+            'medium': "color: #f57c00; font-weight: bold; padding: 4px;",   # Orange
+            'high': "color: #d84315; font-weight: bold; padding: 4px; background-color: #fff3e0;",  # Red-orange with bg
+            'critical': "color: #b71c1c; font-weight: bold; padding: 4px; background-color: #ffebee;"  # Red with bg
+        }
+        return styles.get(risk_level, styles['low'])
+
     def _batch_process_parallel(self):
         """
         Parallel batch processing using all CPU cores.
@@ -1965,31 +2378,178 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # Get optimal worker count
+        # Get optimal worker count and perform initial memory estimation
         from utils.parallel_processing import get_optimal_workers, SortOptions
-        n_workers = get_optimal_workers()
+        max_workers = get_optimal_workers()
 
-        # Estimate time (rough: ~200k traces/sec with parallel)
-        estimated_seconds = total_traces / (200000 * n_workers / 14)
-        estimated_minutes = max(1, estimated_seconds / 60)
+        # Initial memory estimation
+        initial_mem_estimate = self._estimate_parallel_memory(
+            input_storage_dir=input_storage_dir,
+            n_samples=n_samples,
+            n_workers=max_workers,
+            output_noise=False,
+            sorting_enabled=False
+        )
+
+        # Start with safe worker count if memory risk detected
+        if initial_mem_estimate['risk_level'] in ('high', 'critical'):
+            recommended_workers = initial_mem_estimate['safe_workers']
+        else:
+            recommended_workers = max_workers
 
         # Show processing options dialog with sorting configuration
-        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QGroupBox, QCheckBox, QComboBox, QLabel, QDialogButtonBox
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QGroupBox, QCheckBox, QComboBox, QLabel, QDialogButtonBox, QDoubleSpinBox, QSpinBox, QGridLayout, QFrame
 
         dialog = QDialog(self)
         dialog.setWindowTitle("Parallel Batch Processing Options")
-        dialog.setMinimumWidth(450)
+        dialog.setMinimumWidth(550)
 
         layout = QVBoxLayout(dialog)
 
-        # Info section
-        info_label = QLabel(
+        # Dataset info section
+        dataset_info_label = QLabel(
             f"<b>Dataset:</b> {n_gathers:,} gathers, {total_traces:,} traces<br>"
             f"<b>Processor:</b> {self.last_processor.get_description()}<br>"
-            f"<b>Workers:</b> {n_workers} CPU cores<br>"
-            f"<b>Estimated time:</b> ~{estimated_minutes:.0f} minutes"
+            f"<b>Max gather size:</b> {initial_mem_estimate['max_gather_traces']:,} traces"
         )
-        layout.addWidget(info_label)
+        layout.addWidget(dataset_info_label)
+
+        # Worker and Memory Configuration Group
+        perf_group = QGroupBox("Performance && Memory")
+        perf_layout = QGridLayout(perf_group)
+
+        # Worker count
+        perf_layout.addWidget(QLabel("Worker processes:"), 0, 0)
+        workers_spin = QSpinBox()
+        workers_spin.setRange(1, max_workers)
+        workers_spin.setValue(recommended_workers)
+        workers_spin.setToolTip(
+            f"Number of parallel worker processes (max {max_workers} based on CPU cores).\n"
+            "Reduce if memory usage is too high."
+        )
+        perf_layout.addWidget(workers_spin, 0, 1)
+
+        # Estimate time (rough: ~200k traces/sec with parallel)
+        def calc_estimated_time(n_workers):
+            estimated_seconds = total_traces / (200000 * n_workers / 14)
+            return max(1, estimated_seconds / 60)
+
+        time_label = QLabel(f"Estimated time: ~{calc_estimated_time(recommended_workers):.0f} minutes")
+        perf_layout.addWidget(time_label, 0, 2)
+
+        # Memory status - spans full width
+        memory_status_label = QLabel(initial_mem_estimate['message'])
+        memory_status_label.setWordWrap(True)
+        memory_status_label.setStyleSheet(self._get_memory_status_style(initial_mem_estimate['risk_level']))
+        perf_layout.addWidget(memory_status_label, 1, 0, 1, 3)
+
+        # Memory details (collapsible info)
+        memory_details_label = QLabel(
+            f"<small>Available: {initial_mem_estimate['available_mb']:.0f} MB | "
+            f"Estimated: {initial_mem_estimate['required_mb']:.0f} MB | "
+            f"Usage: {initial_mem_estimate['ratio']*100:.0f}%</small>"
+        )
+        memory_details_label.setStyleSheet("color: #666;")
+        perf_layout.addWidget(memory_details_label, 2, 0, 1, 3)
+
+        layout.addWidget(perf_group)
+
+        # Output options group
+        output_group = QGroupBox("Output Options")
+        output_layout = QVBoxLayout(output_group)
+
+        # Output mode selection
+        output_mode_layout = QHBoxLayout()
+        output_mode_layout.addWidget(QLabel("Output Mode:"))
+        output_mode_combo = QComboBox()
+        output_mode_combo.addItems([
+            "Processing Output Only",
+            "Noise Only (Memory Optimized)",
+            "Both Processing Output and Noise"
+        ])
+        output_mode_combo.setToolTip(
+            "Processing Output Only: Output processed traces only (default)\n"
+            "Noise Only: Output ONLY noise (Input - Processed), memory-optimized using in-place operations\n"
+            "Both: Output both processed traces and noise (highest memory usage)"
+        )
+        output_mode_layout.addWidget(output_mode_combo)
+        output_layout.addLayout(output_mode_layout)
+
+        # Keep noise_checkbox as hidden compatibility variable (maps to output_mode)
+        # This allows existing code paths to work
+        noise_checkbox = QCheckBox()  # Hidden, used for compatibility
+        noise_checkbox.setVisible(False)
+
+        # Sync output_mode_combo with noise_checkbox for memory calculations
+        def on_output_mode_changed(index):
+            # For memory calculations, treat 'Noise Only' and 'Both' as needing noise
+            noise_checkbox.setChecked(index > 0)
+
+        output_mode_combo.currentIndexChanged.connect(on_output_mode_changed)
+
+        layout.addWidget(output_group)
+
+        # Mute options group
+        mute_group = QGroupBox("Mute Options (Applied to Noise Output)")
+        mute_layout = QGridLayout(mute_group)
+
+        mute_top_check = QCheckBox("Top Mute")
+        mute_top_check.setToolTip("Zero samples before mute time: T = |offset| / velocity")
+        mute_layout.addWidget(mute_top_check, 0, 0)
+
+        mute_bottom_check = QCheckBox("Bottom Mute")
+        mute_bottom_check.setToolTip("Zero samples after mute time: T = |offset| / velocity")
+        mute_layout.addWidget(mute_bottom_check, 0, 1)
+
+        mute_layout.addWidget(QLabel("Apply mute to:"), 1, 0)
+        mute_target_combo = QComboBox()
+        mute_target_combo.addItems([
+            "Output (Noise = Input - Processed)",
+            "Input (before subtraction)",
+            "Processed (before subtraction)"
+        ])
+        mute_target_combo.setToolTip(
+            "Output: Mute applied to noise result\n"
+            "Input: Mute applied to Input before subtraction\n"
+            "Processed: Mute applied to Processed before subtraction"
+        )
+        mute_layout.addWidget(mute_target_combo, 1, 1)
+
+        mute_layout.addWidget(QLabel("Velocity (m/s):"), 2, 0)
+        mute_velocity_spin = QDoubleSpinBox()
+        mute_velocity_spin.setRange(500, 8000)
+        mute_velocity_spin.setValue(2500)
+        mute_velocity_spin.setSingleStep(100)
+        mute_velocity_spin.setDecimals(0)
+        mute_layout.addWidget(mute_velocity_spin, 2, 1)
+
+        mute_layout.addWidget(QLabel("Taper (samples):"), 3, 0)
+        mute_taper_spin = QSpinBox()
+        mute_taper_spin.setRange(0, 100)
+        mute_taper_spin.setValue(20)
+        mute_taper_spin.setToolTip("Cosine taper length at mute boundary")
+        mute_layout.addWidget(mute_taper_spin, 3, 1)
+
+        mute_info = QLabel("Linear mute formula: T_mute = |offset| / velocity")
+        mute_info.setStyleSheet("color: #666; font-size: 9pt;")
+        mute_layout.addWidget(mute_info, 4, 0, 1, 2)
+
+        # Enable/disable mute options
+        def toggle_mute_options():
+            enabled = mute_top_check.isChecked() or mute_bottom_check.isChecked()
+            mute_velocity_spin.setEnabled(enabled)
+            mute_taper_spin.setEnabled(enabled)
+            mute_target_combo.setEnabled(enabled)
+
+        mute_top_check.stateChanged.connect(toggle_mute_options)
+        mute_bottom_check.stateChanged.connect(toggle_mute_options)
+
+        # Initially disabled
+        mute_velocity_spin.setEnabled(False)
+        mute_taper_spin.setEnabled(False)
+        mute_target_combo.setEnabled(False)
+
+        layout.addWidget(mute_group)
 
         # Sorting options group
         sort_group = QGroupBox("In-Gather Sorting")
@@ -2055,16 +2615,106 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(sort_group)
 
+        # Dynamic memory recalculation function
+        def update_memory_estimate():
+            """Recalculate memory estimate when options change."""
+            current_workers = workers_spin.value()
+            sorting_enabled = sort_checkbox.isChecked()
+
+            # Get output mode from combo
+            mode_map = {0: 'processed', 1: 'noise', 2: 'both'}
+            current_output_mode = mode_map.get(output_mode_combo.currentIndex(), 'processed')
+
+            mem_estimate = self._estimate_parallel_memory(
+                input_storage_dir=input_storage_dir,
+                n_samples=n_samples,
+                n_workers=current_workers,
+                output_noise=False,  # Legacy, now using output_mode
+                sorting_enabled=sorting_enabled,
+                output_mode=current_output_mode
+            )
+
+            # Update labels
+            memory_status_label.setText(mem_estimate['message'])
+            memory_status_label.setStyleSheet(self._get_memory_status_style(mem_estimate['risk_level']))
+            memory_details_label.setText(
+                f"<small>Available: {mem_estimate['available_mb']:.0f} MB | "
+                f"Estimated: {mem_estimate['required_mb']:.0f} MB | "
+                f"Usage: {mem_estimate['ratio']*100:.0f}%</small>"
+            )
+            time_label.setText(f"Estimated time: ~{calc_estimated_time(current_workers):.0f} minutes")
+
+            # Update OK button state based on risk and settings
+            from models.app_settings import get_settings
+            settings = get_settings()
+            block_on_critical = settings.get_parallel_block_on_high_risk()
+
+            ok_button = button_box.button(QDialogButtonBox.StandardButton.Ok)
+            if mem_estimate['risk_level'] == 'critical' and block_on_critical:
+                ok_button.setEnabled(False)
+                ok_button.setToolTip(
+                    f"Memory usage too high ({mem_estimate['ratio']*100:.0f}%).\n"
+                    f"Reduce workers to {mem_estimate['safe_workers']} or less.\n"
+                    "Or disable 'Block on high risk' in Settings > Performance."
+                )
+            else:
+                ok_button.setEnabled(True)
+                ok_button.setToolTip("")
+
+        # Connect signals to trigger memory recalculation
+        workers_spin.valueChanged.connect(update_memory_estimate)
+        output_mode_combo.currentIndexChanged.connect(update_memory_estimate)
+        sort_checkbox.stateChanged.connect(update_memory_estimate)
+
         # Buttons
         button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
+
+        # Initial check for OK button state
+        update_memory_estimate()
         button_box.accepted.connect(dialog.accept)
         button_box.rejected.connect(dialog.reject)
         layout.addWidget(button_box)
 
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
+
+        # =================================================================
+        # CRASH DIAGNOSTICS - Early logging to catch instant crashes
+        # =================================================================
+        import os
+        from datetime import datetime
+        crash_log_path = Path('/tmp/seisproc_parallel_crash.log')
+
+        def _crash_log(msg: str):
+            """Write crash diagnostic with immediate flush."""
+            try:
+                with open(crash_log_path, 'a') as f:
+                    timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                    import psutil
+                    mem = psutil.virtual_memory()
+                    mem_info = f" [MEM: {mem.used/(1024**3):.2f}GB/{mem.available/(1024**3):.2f}GB avail]"
+                    f.write(f"[{timestamp}]{mem_info} {msg}\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+            except Exception:
+                pass
+
+        # Clear old log and start fresh
+        try:
+            if crash_log_path.exists():
+                crash_log_path.unlink()
+        except Exception:
+            pass
+
+        _crash_log("=" * 60)
+        _crash_log("PARALLEL BATCH PROCESSING - DIALOG ACCEPTED")
+        _crash_log(f"Output mode: {output_mode_combo.currentIndex()} -> {['processed', 'noise', 'both'][output_mode_combo.currentIndex()]}")
+        _crash_log(f"Workers: {workers_spin.value()}")
+        _crash_log(f"Sorting: {sort_checkbox.isChecked()}")
+        _crash_log(f"Dataset: {n_gathers:,} gathers, {total_traces:,} traces")
+        _crash_log("=" * 60)
 
         # Build sort options from dialog
         sort_options = None
@@ -2075,9 +2725,32 @@ class MainWindow(QMainWindow):
                 ascending=(sort_dir_combo.currentText() == "Ascending")
             )
 
+        # Get selected worker count from dialog
+        n_workers = workers_spin.value()
+
+        # Build output mode and mute options
+        output_mode_map = {0: 'processed', 1: 'noise', 2: 'both'}
+        output_mode = output_mode_map.get(output_mode_combo.currentIndex(), 'processed')
+
+        # Legacy compatibility: output_noise is True if mode is 'both'
+        output_noise = (output_mode == 'both')
+
+        mute_velocity = mute_velocity_spin.value() if (mute_top_check.isChecked() or mute_bottom_check.isChecked()) else 0.0
+        mute_top = mute_top_check.isChecked()
+        mute_bottom = mute_bottom_check.isChecked()
+        mute_taper = mute_taper_spin.value()
+        mute_target_map = {0: 'output', 1: 'input', 2: 'processed'}
+        mute_target = mute_target_map.get(mute_target_combo.currentIndex(), 'output')
+
+        # Log memory-aware worker selection
+        logger.info(f"Parallel batch processing starting with {n_workers} workers (max available: {max_workers})")
+        _crash_log(f"Step 1: Config built - output_mode={output_mode}, n_workers={n_workers}")
+
         # Create processing session
+        _crash_log("Step 2: Creating processing session...")
         dataset_name = input_storage_dir.name
         session = storage_manager.create_session(f"processed_{dataset_name}")
+        _crash_log(f"Step 2: Session created at {session.output_dir}")
 
         # Create progress dialog
         progress = QProgressDialog(
@@ -2093,27 +2766,41 @@ class MainWindow(QMainWindow):
         progress.setMinimumWidth(400)
 
         try:
+            _crash_log("Step 3: Importing parallel_processing modules...")
             from utils.parallel_processing import (
                 ParallelProcessingCoordinator,
                 ProcessingConfig,
                 ProcessingProgress
             )
+            _crash_log("Step 3: Imports complete")
 
             # Serialize processor configuration
+            _crash_log("Step 4: Serializing processor config...")
             processor_config = self.last_processor.to_dict()
+            _crash_log(f"Step 4: Processor serialized - {processor_config.get('class_name', 'unknown')}")
 
             # Create processing config
+            _crash_log("Step 5: Creating ProcessingConfig...")
             config = ProcessingConfig(
                 input_storage_dir=str(input_storage_dir),
                 output_storage_dir=str(session.output_dir),
                 processor_config=processor_config,
                 n_workers=n_workers,
-                sort_options=sort_options
+                sort_options=sort_options,
+                output_mode=output_mode,
+                output_noise=output_noise,
+                mute_velocity=mute_velocity,
+                mute_top=mute_top,
+                mute_bottom=mute_bottom,
+                mute_taper=mute_taper,
+                mute_target=mute_target
             )
+            _crash_log(f"Step 5: ProcessingConfig created - output_mode={config.output_mode}")
 
             # Progress callback
             import time
             start_time = time.time()
+            _crash_log("Step 6: Progress callback defined")
 
             def on_progress(prog: ProcessingProgress):
                 if progress.wasCanceled():
@@ -2145,8 +2832,11 @@ class MainWindow(QMainWindow):
                 QApplication.processEvents()
 
             # Run parallel processing
+            _crash_log("Step 7: Creating ParallelProcessingCoordinator...")
             coordinator = ParallelProcessingCoordinator(config)
+            _crash_log("Step 7: Coordinator created, starting run()...")
             result = coordinator.run(progress_callback=on_progress)
+            _crash_log(f"Step 8: Processing complete - success={result.success}")
 
             if progress.wasCanceled():
                 # User cancelled - cleanup
@@ -2172,6 +2862,11 @@ class MainWindow(QMainWindow):
             # Success - mark session complete
             session.mark_complete()
 
+            # Build output info
+            output_info = f"Output saved to:\n{result.output_dir}"
+            if result.noise_zarr_path:
+                output_info += f"\n\nNoise output: noise.zarr"
+
             # Show success message
             QMessageBox.information(
                 self,
@@ -2182,7 +2877,7 @@ class MainWindow(QMainWindow):
                 f"  - Time: {result.elapsed_time:.1f} seconds\n"
                 f"  - Throughput: {result.throughput_traces_per_sec:,.0f} traces/sec\n"
                 f"  - Workers used: {result.n_workers_used}\n\n"
-                f"Output saved to:\n{result.output_dir}\n\n"
+                f"{output_info}\n\n"
                 f"Would you like to load the processed data?"
             )
 
@@ -2205,6 +2900,9 @@ class MainWindow(QMainWindow):
             )
 
         except Exception as e:
+            _crash_log(f"EXCEPTION: {type(e).__name__}: {str(e)}")
+            import traceback
+            _crash_log(f"TRACEBACK:\n{traceback.format_exc()}")
             progress.close()
             session.cleanup_all()
             QMessageBox.critical(
@@ -2212,11 +2910,11 @@ class MainWindow(QMainWindow):
                 "Processing Error",
                 f"Failed to run parallel processing:\n\n{str(e)}"
             )
-            import traceback
             traceback.print_exc()
 
         finally:
             progress.close()
+            _crash_log("=== PARALLEL PROCESSING ENDED ===")
 
     # =========================================================================
     # Parallel SEG-Y Export (Multiprocess - Bypasses GIL)
@@ -2235,7 +2933,8 @@ class MainWindow(QMainWindow):
         from utils.parallel_export import (
             ParallelExportCoordinator,
             ExportConfig,
-            ExportProgress
+            ExportProgress,
+            ExportStageResult
         )
 
         # Check if we have processed data in lazy storage
@@ -2267,16 +2966,23 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # Get the processed Zarr path
-        # First check if there's a parallel-processed output available
+        # ═══════════════════════════════════════════════════════════════════════
+        # Show Export Options Dialog
+        # ═══════════════════════════════════════════════════════════════════════
+        from views.export_options_dialog import ExportOptionsDialog
+
+        # Get initial paths
+        input_path = None
+        processed_path = None
+
+        # Input: from lazy data
+        lazy_data = self.gather_navigator.lazy_data
+        if lazy_data is not None and hasattr(lazy_data, 'zarr_path'):
+            input_path = lazy_data.zarr_path.parent
+
+        # Processed: from most recent completed session
         storage_manager = ProcessingStorageManager()
         sessions = storage_manager.list_sessions()
-
-        # Look for the most recent completed session with matching data
-        processed_zarr_path = None
-        processed_output_dir = None
-        is_processed_data = False  # Track if we're exporting processed or input data
-
         for session in sessions:
             info_path = session.session_dir / 'session_info.json'
             if info_path.exists():
@@ -2284,93 +2990,83 @@ class MainWindow(QMainWindow):
                 with open(info_path, 'r') as f:
                     info = json.load(f)
                 if info.get('status') == 'complete':
-                    zarr_path = session.session_dir / 'output' / 'traces.zarr'
-                    if zarr_path.exists():
-                        processed_zarr_path = str(zarr_path)
-                        processed_output_dir = str(session.session_dir / 'output')
-                        is_processed_data = True
-                        print(f"  Found processed data: {processed_output_dir}")
+                    output_dir = session.session_dir / 'output'
+                    if (output_dir / 'traces.zarr').exists():
+                        processed_path = output_dir
                         break
 
-        if processed_zarr_path is None:
-            # No processed session found - ask user if they want to export input data
-            lazy_data = self.gather_navigator.lazy_data
-            if lazy_data is not None and hasattr(lazy_data, 'zarr_path'):
-                storage_dir = lazy_data.zarr_path.parent
-                zarr_path = storage_dir / 'traces.zarr'
-                if zarr_path.exists():
-                    # Ask user if they want to export unprocessed data
-                    reply = QMessageBox.question(
-                        self,
-                        "No Processed Data Found",
-                        "No parallel-processed data was found.\n\n"
-                        "Would you like to export the ORIGINAL (unprocessed) data instead?\n\n"
-                        f"Source: {storage_dir}\n\n"
-                        "Note: To export processed data, first run 'Parallel Batch Process...'",
-                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-                    )
-                    if reply != QMessageBox.StandardButton.Yes:
-                        return
-                    processed_zarr_path = str(zarr_path)
-                    processed_output_dir = str(storage_dir)
-                    is_processed_data = False
-                    print(f"  Using input data (unprocessed): {processed_output_dir}")
-                else:
-                    QMessageBox.warning(
-                        self,
-                        "No Data Found",
-                        "No Zarr data found to export.\n\n"
-                        "Please load SEG-Y data first using 'Import SEG-Y (Optimized)'."
-                    )
-                    return
-            else:
-                QMessageBox.warning(
-                    self,
-                    "No Data Loaded",
-                    "No data available for export.\n\n"
-                    "Please load SEG-Y data first using 'Import SEG-Y (Optimized)'."
-                )
-                return
+        # If no processed data, use input as processed (for input-only export)
+        if processed_path is None:
+            processed_path = input_path
 
-        # Get headers path - prefer from processed output, fall back to input
-        headers_path = Path(processed_output_dir) / 'headers.parquet'
-        if not headers_path.exists():
-            # Fall back to lazy data headers
-            lazy_data = self.gather_navigator.lazy_data
-            if lazy_data is not None and hasattr(lazy_data, 'zarr_path'):
-                headers_path = lazy_data.zarr_path.parent / 'headers.parquet'
+        # Show comprehensive export options dialog
+        dialog = ExportOptionsDialog(
+            input_path=input_path,
+            processed_path=processed_path,
+            mute_config=self.mute_config,
+            parent=self
+        )
 
-        if not headers_path.exists():
-            QMessageBox.warning(
-                self,
-                "No Headers File",
-                "Headers parquet file not found.\n\n"
-                "Cannot export without trace headers."
-            )
+        if dialog.exec() != ExportOptionsDialog.DialogCode.Accepted:
+            return
+
+        # Get options from dialog
+        options = dialog.get_options()
+        if options is None:
+            return
+
+        input_info, processed_info = dialog.get_dataset_info()
+
+        # Extract values from options
+        input_zarr_path = str(Path(options.input_path) / 'traces.zarr') if options.input_path else None
+        processed_zarr_path = str(Path(options.processed_path) / 'traces.zarr')
+        processed_output_dir = options.processed_path
+        headers_path = Path(options.headers_path)
+        export_type = options.export_type
+        mute_velocity = options.mute_velocity if options.mute_enabled else None
+        mute_top = options.mute_top
+        mute_bottom = options.mute_bottom
+        mute_taper = options.mute_taper
+        mute_target = options.mute_target
+
+        # Get dimensions from dialog info
+        n_traces = processed_info.n_traces if processed_info else 0
+        n_samples = processed_info.n_samples if processed_info else 0
+
+        if n_traces == 0:
+            QMessageBox.warning(self, "No Data", "No valid dataset selected.")
             return
 
         # Get number of workers
         n_workers = os.cpu_count() or 4
         n_workers = max(2, n_workers - 2)  # Leave 2 cores for system
 
-        # Get trace count from Zarr
-        import zarr
-        z = zarr.open(processed_zarr_path, mode='r')
-        n_samples, n_traces = z.shape
-
         # Estimate file size
         estimated_size_gb = (n_traces * (240 + n_samples * 4) + 3600) / (1024 ** 3)
 
-        # Show confirmation dialog with data type indicator
-        data_type_str = "PROCESSED" if is_processed_data else "ORIGINAL (unprocessed)"
+        # Build description
+        export_type_str = "NOISE (Input - Processed)" if export_type == 'noise' else "PROCESSED"
+        mute_str = ""
+        if mute_velocity:
+            mute_types = []
+            if mute_top:
+                mute_types.append("top")
+            if mute_bottom:
+                mute_types.append("bottom")
+            target_names = {'output': 'Output', 'input': 'Input', 'processed': 'Processed'}
+            target_name = target_names.get(mute_target, 'Output')
+            mute_str = f"\nMute: {'+'.join(mute_types)} @ {mute_velocity:.0f} m/s (applied to {target_name})"
+
+        # Show final confirmation dialog
         reply = QMessageBox.question(
             self,
-            "Parallel SEG-Y Export",
-            f"Export {data_type_str} data to SEG-Y using {n_workers} CPU cores?\n\n"
-            f"Source: {processed_output_dir}\n"
+            "Confirm Parallel SEG-Y Export",
+            f"Export {export_type_str} data to SEG-Y using {n_workers} CPU cores?\n\n"
+            f"Source: {Path(processed_output_dir).name}\n"
             f"Traces: {n_traces:,}\n"
             f"Samples: {n_samples}\n"
-            f"Estimated file size: {estimated_size_gb:.2f} GB\n\n"
+            f"Estimated file size: {estimated_size_gb:.2f} GB"
+            f"{mute_str}\n\n"
             f"This will be approximately 6-10x faster than standard export.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
@@ -2393,6 +3089,19 @@ class MainWindow(QMainWindow):
         temp_dir = Path(processed_output_dir) / 'export_temp'
         temp_dir.mkdir(parents=True, exist_ok=True)
 
+        # Convert header mapping from dialog format to config format
+        from utils.parallel_export.config import ExportHeaderMapping
+        header_mapping_config = None
+        if options.header_mapping:
+            header_mapping_config = {
+                col: ExportHeaderMapping(
+                    parquet_column=field.parquet_column,
+                    segy_byte_pos=field.segy_byte_pos,
+                    format=field.format
+                )
+                for col, field in options.header_mapping.items()
+            }
+
         # Create export config
         config = ExportConfig(
             original_segy_path=self.original_segy_path,
@@ -2400,66 +3109,152 @@ class MainWindow(QMainWindow):
             headers_parquet_path=str(headers_path),
             output_path=output_file,
             temp_dir=str(temp_dir),
-            n_workers=n_workers
+            n_workers=n_workers,
+            # Export type and noise calculation
+            export_type=export_type,
+            input_zarr_path=input_zarr_path,
+            # Mute configuration
+            mute_velocity=mute_velocity,
+            mute_top=mute_top,
+            mute_bottom=mute_bottom,
+            mute_taper=mute_taper,
+            mute_target=mute_target,
+            # Header mapping
+            header_mapping=header_mapping_config
         )
 
-        # Create progress dialog
-        progress = QProgressDialog(
-            "Initializing parallel export...",
-            "Cancel",
-            0, n_traces,
-            self
-        )
-        progress.setWindowModality(Qt.WindowModality.WindowModal)
-        progress.setWindowTitle("Parallel SEG-Y Export")
-        progress.setMinimumDuration(0)
-        progress.setMinimumWidth(400)
+        # Create coordinator
+        coordinator = ParallelExportCoordinator(config)
 
-        def update_progress(prog: ExportProgress):
-            """Update progress dialog."""
-            if progress.wasCanceled():
-                coordinator.cancel()
-                return
-
-            progress.setValue(prog.current_traces)
-
-            if prog.phase == 'vectorizing':
-                progress.setLabelText("Vectorizing headers for fast access...")
-            elif prog.phase == 'exporting':
-                rate = prog.current_traces / prog.elapsed_time if prog.elapsed_time > 0 else 0
-                eta_min = prog.eta_seconds / 60 if prog.eta_seconds > 0 else 0
-                progress.setLabelText(
-                    f"Exporting traces ({prog.active_workers} workers)...\n"
-                    f"{prog.current_traces:,} / {prog.total_traces:,} traces\n"
-                    f"Rate: {rate:,.0f} traces/sec | ETA: {eta_min:.1f} min"
-                )
-            elif prog.phase == 'merging':
-                progress.setLabelText("Merging segment files...")
-            elif prog.phase == 'finalizing':
-                progress.setLabelText("Finalizing export...")
-
-            QApplication.processEvents()
-
-        # Run export
+        # Run export in stages with separate progress dialogs
         try:
             self.statusBar().showMessage(f"Exporting to SEG-Y with {n_workers} workers...")
 
-            coordinator = ParallelExportCoordinator(config)
+            # ═══════════════════════════════════════════════════════════════════
+            # STAGE 1: Parallel Export (traces progress)
+            # ═══════════════════════════════════════════════════════════════════
+            export_progress = QProgressDialog(
+                "Initializing parallel export...",
+                "Cancel",
+                0, n_traces,
+                self
+            )
+            export_progress.setWindowModality(Qt.WindowModality.WindowModal)
+            export_progress.setWindowTitle("Parallel SEG-Y Export - Stage 1/3")
+            export_progress.setMinimumDuration(0)
+            export_progress.setMinimumWidth(400)
 
-            # Track cancellation state before running (wasCanceled can be unreliable after close)
-            was_canceled = False
+            def on_export_progress(prog: ExportProgress):
+                """Update export stage progress dialog."""
+                if export_progress.wasCanceled():
+                    coordinator.cancel()
+                    return
 
-            result = coordinator.run(progress_callback=update_progress)
+                export_progress.setValue(prog.current_traces)
 
-            # Check cancellation BEFORE closing dialog
-            was_canceled = progress.wasCanceled()
-            progress.close()
+                if prog.phase == 'vectorizing':
+                    export_progress.setLabelText("Vectorizing headers for fast access...")
+                elif prog.phase == 'exporting':
+                    rate = prog.current_traces / prog.elapsed_time if prog.elapsed_time > 0 else 0
+                    eta_min = prog.eta_seconds / 60 if prog.eta_seconds > 0 else 0
+                    export_progress.setLabelText(
+                        f"Exporting traces ({prog.active_workers} workers)...\n"
+                        f"{prog.current_traces:,} / {prog.total_traces:,} traces\n"
+                        f"Rate: {rate:,.0f} traces/sec | ETA: {eta_min:.1f} min"
+                    )
 
-            if was_canceled and not result.success:
-                # Only treat as canceled if export actually failed
-                # (successful export should not be deleted even if dialog shows canceled)
+                QApplication.processEvents()
+
+            # Run parallel export stage
+            stage_result = coordinator.run_parallel_export(progress_callback=on_export_progress)
+
+            was_canceled = export_progress.wasCanceled()
+            export_progress.close()
+
+            if was_canceled or coordinator.was_cancelled:
                 self.statusBar().showMessage("Export canceled.")
                 return
+
+            if not stage_result.success:
+                QMessageBox.critical(
+                    self,
+                    "Export Failed",
+                    f"Parallel export failed:\n\n{stage_result.error}"
+                )
+                return
+
+            # ═══════════════════════════════════════════════════════════════════
+            # STAGE 2: Merge Segments (bytes progress)
+            # ═══════════════════════════════════════════════════════════════════
+            merge_stats = coordinator.get_merge_stats(stage_result)
+            total_bytes = merge_stats['output_size_bytes']
+
+            # Use MB for progress to avoid 32-bit integer overflow on large files
+            # QProgressDialog max is 2^31-1, so files >2GB would overflow with bytes
+            total_mb = max(1, total_bytes // (1024 * 1024))
+
+            merge_progress = QProgressDialog(
+                "Merging segment files...",
+                "Cancel",
+                0, total_mb,
+                self
+            )
+            merge_progress.setWindowModality(Qt.WindowModality.WindowModal)
+            merge_progress.setWindowTitle("Parallel SEG-Y Export - Stage 2/3")
+            merge_progress.setMinimumDuration(0)
+            merge_progress.setMinimumWidth(400)
+
+            def on_merge_progress(bytes_written: int, total: int):
+                """Update merge stage progress dialog."""
+                if merge_progress.wasCanceled():
+                    return False
+                # Convert bytes to MB for progress bar (avoid overflow)
+                mb_written = bytes_written // (1024 * 1024)
+                merge_progress.setValue(mb_written)
+                gb_written = bytes_written / (1024 ** 3)
+                gb_total = total / (1024 ** 3)
+                merge_progress.setLabelText(
+                    f"Merging segment files...\n"
+                    f"{gb_written:.2f} / {gb_total:.2f} GB"
+                )
+                QApplication.processEvents()
+                return True
+
+            # Run merge stage
+            coordinator.run_merge(stage_result, progress_callback=on_merge_progress)
+            merge_progress.close()
+
+            # ═══════════════════════════════════════════════════════════════════
+            # STAGE 3: Cleanup (files progress)
+            # ═══════════════════════════════════════════════════════════════════
+            total_files = len(stage_result.segment_paths) + len(stage_result.segments)
+
+            cleanup_progress = QProgressDialog(
+                "Cleaning up temporary files...",
+                None,  # No cancel button for cleanup
+                0, total_files,
+                self
+            )
+            cleanup_progress.setWindowModality(Qt.WindowModality.WindowModal)
+            cleanup_progress.setWindowTitle("Parallel SEG-Y Export - Stage 3/3")
+            cleanup_progress.setMinimumDuration(0)
+            cleanup_progress.setMinimumWidth(400)
+            cleanup_progress.setCancelButton(None)
+
+            def on_cleanup_progress(files_done: int, total: int):
+                """Update cleanup stage progress dialog."""
+                cleanup_progress.setValue(files_done)
+                cleanup_progress.setLabelText(f"Cleaning up... {files_done}/{total} files")
+                QApplication.processEvents()
+
+            # Run cleanup stage
+            coordinator.run_cleanup(stage_result, progress_callback=on_cleanup_progress)
+            cleanup_progress.close()
+
+            # ═══════════════════════════════════════════════════════════════════
+            # Get Final Result
+            # ═══════════════════════════════════════════════════════════════════
+            result = coordinator.get_final_result(stage_result)
 
             if not result.success:
                 QMessageBox.critical(
@@ -2471,12 +3266,12 @@ class MainWindow(QMainWindow):
 
             # Success
             file_size_mb = result.file_size_bytes / (1024 ** 2)
-            data_status = "processed" if is_processed_data else "unprocessed (original)"
+            data_type_str = "Noise (Input - Processed)" if export_type == 'noise' else "Processed"
             QMessageBox.information(
                 self,
                 "Export Complete",
                 f"Successfully exported {result.n_traces:,} traces!\n\n"
-                f"Data type: {data_status}\n\n"
+                f"Data type: {data_type_str}\n\n"
                 f"Statistics:\n"
                 f"  - File size: {file_size_mb:.1f} MB\n"
                 f"  - Time: {result.elapsed_time:.1f} seconds\n"
@@ -2493,7 +3288,6 @@ class MainWindow(QMainWindow):
             )
 
         except Exception as e:
-            progress.close()
             QMessageBox.critical(
                 self,
                 "Export Error",
@@ -2503,7 +3297,6 @@ class MainWindow(QMainWindow):
             traceback.print_exc()
 
         finally:
-            progress.close()
             # Cleanup temp directory
             try:
                 import shutil
@@ -3138,6 +3931,34 @@ class MainWindow(QMainWindow):
                 f"Migration failed:\n\n{str(e)}"
             )
             self.statusBar().showMessage("PSTM migration failed")
+
+    def _on_mute_apply_requested(self, mute_config):
+        """
+        Handle mute apply request from control panel.
+
+        Applies mute to the current display and stores config for export.
+
+        Args:
+            mute_config: MuteConfig object or None to clear mute
+        """
+        self.mute_config = mute_config
+
+        if mute_config is None:
+            self.statusBar().showMessage("Mute cleared")
+            # Refresh display without mute
+            self._update_all_viewers()
+            return
+
+        # Apply mute to current display
+        self.statusBar().showMessage(
+            f"Mute applied: V={mute_config.velocity:.0f} m/s, "
+            f"{'top' if mute_config.top_mute else ''}"
+            f"{'+' if mute_config.top_mute and mute_config.bottom_mute else ''}"
+            f"{'bottom' if mute_config.bottom_mute else ''}"
+        )
+
+        # Refresh display with mute applied
+        self._update_all_viewers()
 
     def _on_pstm_wizard_requested(self):
         """Handle request to open PSTM wizard dialog."""

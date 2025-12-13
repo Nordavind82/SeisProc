@@ -2,22 +2,22 @@
 3D FKK Filter Designer Dialog
 
 Interactive dialog for designing 3D FKK (Frequency-Wavenumber-Wavenumber) filters.
-Shows slice-based visualization of input data, filtered output, and FKK spectrum.
-
-UI Layout:
-- Input Data: Time slice (X-Y) + Inline slice (T-X)
-- Filtered Output: Same slices + difference view
-- FKK Spectrum: Kx-Ky slice + F-Kx slice with velocity cone overlay
-- Controls: Velocity range, azimuth, taper, mode
+Redesigned layout with:
+- Narrow left panel: Filter controls
+- Large right area: 4 quadrant display (XX, TX slices + KK, FK spectra)
+- Toggle buttons to show filtered/unfiltered data
+- Colormap selection and dB mode for spectrum
 """
 import numpy as np
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QGroupBox, QSlider, QDoubleSpinBox, QComboBox, QSpinBox,
     QRadioButton, QButtonGroup, QWidget, QSplitter, QCheckBox,
-    QStatusBar, QProgressBar, QMessageBox, QScrollArea
+    QStatusBar, QMessageBox, QScrollArea, QFrame, QGridLayout,
+    QSizePolicy, QToolButton
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
+from PyQt6.QtGui import QFont
 from typing import Optional, Tuple, Dict
 import pyqtgraph as pg
 import logging
@@ -29,41 +29,224 @@ from processors.fkk_filter_gpu import FKKFilterGPU, get_fkk_filter
 logger = logging.getLogger(__name__)
 
 
+# ============================================================================
+# Colormap definitions
+# ============================================================================
+
+def get_colormap_by_name(name: str):
+    """Get colormap by name."""
+    from pyqtgraph import ColorMap
+
+    colormaps = {
+        'seismic_bwr': {  # Blue-White-Red (classic seismic)
+            'positions': [0.0, 0.5, 1.0],
+            'colors': [(0, 0, 255), (255, 255, 255), (255, 0, 0)]
+        },
+        'seismic_gray': {  # Black-White-Black (variable density)
+            'positions': [0.0, 0.5, 1.0],
+            'colors': [(0, 0, 0), (255, 255, 255), (0, 0, 0)]
+        },
+        'seismic_rwb': {  # Red-White-Blue (inverted)
+            'positions': [0.0, 0.5, 1.0],
+            'colors': [(255, 0, 0), (255, 255, 255), (0, 0, 255)]
+        },
+        'viridis': {  # Perceptually uniform
+            'positions': [0.0, 0.25, 0.5, 0.75, 1.0],
+            'colors': [(68, 1, 84), (59, 82, 139), (33, 145, 140), (94, 201, 98), (253, 231, 37)]
+        },
+        'plasma': {  # High contrast
+            'positions': [0.0, 0.25, 0.5, 0.75, 1.0],
+            'colors': [(13, 8, 135), (126, 3, 168), (204, 71, 120), (248, 149, 64), (240, 249, 33)]
+        },
+        'inferno': {  # Good for spectrum
+            'positions': [0.0, 0.25, 0.5, 0.75, 1.0],
+            'colors': [(0, 0, 4), (87, 16, 110), (188, 55, 84), (249, 142, 9), (252, 255, 164)]
+        },
+        'hot': {  # Black-Red-Yellow-White
+            'positions': [0.0, 0.33, 0.66, 1.0],
+            'colors': [(0, 0, 0), (230, 0, 0), (255, 210, 0), (255, 255, 255)]
+        },
+        'jet': {  # Rainbow (traditional)
+            'positions': [0.0, 0.25, 0.5, 0.75, 1.0],
+            'colors': [(0, 0, 128), (0, 255, 255), (255, 255, 0), (255, 0, 0), (128, 0, 0)]
+        },
+    }
+
+    if name not in colormaps:
+        name = 'seismic_bwr'
+
+    cm = colormaps[name]
+    return ColorMap(cm['positions'], cm['colors'])
+
+
+def get_seismic_colormap():
+    """Create seismic colormap (blue-white-red)."""
+    return get_colormap_by_name('seismic_bwr')
+
+
+def get_spectrum_colormap():
+    """Create spectrum colormap (inferno - good for dB display)."""
+    return get_colormap_by_name('inferno')
+
+
+# Available colormaps for UI
+SEISMIC_COLORMAPS = ['seismic_bwr', 'seismic_gray', 'seismic_rwb', 'viridis']
+SPECTRUM_COLORMAPS = ['inferno', 'hot', 'plasma', 'viridis', 'jet']
+
+
+class SeismicImageView(pg.PlotWidget):
+    """Custom seismic display widget with proper colormap and aspect ratio."""
+
+    def __init__(self, title: str = "", parent=None):
+        super().__init__(parent)
+
+        self.setBackground('k')  # Black background
+        self.setTitle(title, color='w', size='10pt')
+
+        # Create image item
+        self.img_item = pg.ImageItem()
+        self.addItem(self.img_item)
+
+        # Current colormap names
+        self._seismic_cmap_name = 'seismic_bwr'
+        self._spectrum_cmap_name = 'inferno'
+
+        # Set seismic colormap
+        self.seismic_cmap = get_seismic_colormap()
+        self.spectrum_cmap = get_spectrum_colormap()
+        self.img_item.setLookupTable(self.seismic_cmap.getLookupTable())
+
+        # Axis labels
+        self.setLabel('left', '', color='w')
+        self.setLabel('bottom', '', color='w')
+
+        # Invert Y axis for seismic (time increases downward)
+        self.invertY(True)
+
+        self._data = None
+        self._raw_data = None  # Store raw data before dB conversion
+        self._is_spectrum = False
+        self._use_db = True  # Use dB scale for spectrum by default
+        self._db_range = 60  # dB dynamic range
+
+    def setColormap(self, name: str, is_spectrum: bool = False):
+        """Change colormap by name."""
+        cmap = get_colormap_by_name(name)
+        if is_spectrum:
+            self._spectrum_cmap_name = name
+            self.spectrum_cmap = cmap
+        else:
+            self._seismic_cmap_name = name
+            self.seismic_cmap = cmap
+
+        # Update current display if data exists
+        if self._data is not None:
+            if self._is_spectrum:
+                self.img_item.setLookupTable(self.spectrum_cmap.getLookupTable())
+            else:
+                self.img_item.setLookupTable(self.seismic_cmap.getLookupTable())
+
+    def setDbMode(self, use_db: bool, db_range: float = 60):
+        """Set dB mode for spectrum display."""
+        self._use_db = use_db
+        self._db_range = db_range
+        # Refresh if spectrum data exists
+        if self._is_spectrum and self._raw_data is not None:
+            self._update_spectrum_display()
+
+    def _update_spectrum_display(self):
+        """Update spectrum display with current dB settings."""
+        if self._raw_data is None:
+            return
+
+        if self._use_db:
+            # Convert to dB: 20*log10(amplitude)
+            # Avoid log of zero
+            data_safe = np.maximum(self._raw_data, 1e-20)
+            data_db = 20 * np.log10(data_safe)
+            # Normalize to dB range from max
+            vmax = np.nanmax(data_db)
+            vmin = vmax - self._db_range
+            self._data = np.clip(data_db, vmin, vmax)
+            self.img_item.setImage(self._data.T)
+            self.img_item.setLevels([vmin, vmax])
+        else:
+            # Linear scale
+            self._data = self._raw_data
+            self.img_item.setImage(self._data.T)
+            vmax = np.nanmax(self._data)
+            vmin = 0
+            self.img_item.setLevels([vmin, vmax])
+
+    def setData(self, data: np.ndarray, is_spectrum: bool = False,
+                autoLevels: bool = True, xlabel: str = '', ylabel: str = ''):
+        """Set image data with proper scaling."""
+        if data is None:
+            return
+
+        self._is_spectrum = is_spectrum
+
+        # Choose colormap
+        if is_spectrum:
+            self.img_item.setLookupTable(self.spectrum_cmap.getLookupTable())
+            self.invertY(False)
+            # Store raw data for dB conversion
+            self._raw_data = data.copy()
+            self._update_spectrum_display()
+        else:
+            self.img_item.setLookupTable(self.seismic_cmap.getLookupTable())
+            self.invertY(True)
+            self._data = data
+            self._raw_data = None
+            self.img_item.setImage(data.T)
+
+            if autoLevels:
+                # Symmetric around zero for seismic
+                vmax = np.nanpercentile(np.abs(data), 99)
+                vmin = -vmax
+                self.img_item.setLevels([vmin, vmax])
+
+        # Set labels
+        self.setLabel('bottom', xlabel, color='w')
+        self.setLabel('left', ylabel, color='w')
+
+    def getData(self) -> Optional[np.ndarray]:
+        """Get current data."""
+        return self._data
+
+    def getRawData(self) -> Optional[np.ndarray]:
+        """Get raw data (before dB conversion)."""
+        return self._raw_data if self._raw_data is not None else self._data
+
+
 class FKKDesignerDialog(QDialog):
     """
-    3D FKK Filter Designer with slice-based visualization.
+    3D FKK Filter Designer with improved layout.
 
-    Provides:
-    - Synchronized slice viewers for input/output volumes
-    - FKK spectrum visualization with filter overlay
-    - Interactive parameter adjustment
-    - Real-time preview with debouncing
+    Layout:
+    - Left: Narrow controls panel (scrollable)
+    - Right: 4 large quadrants (XX, TX, KK, FK views)
+    - Toggle buttons above each quadrant pair
     """
 
     filter_applied = pyqtSignal(object, object)  # (filtered_volume, config)
 
     def __init__(self, volume: SeismicVolume, parent=None):
-        """
-        Initialize FKK Designer dialog.
-
-        Args:
-            volume: SeismicVolume to design filter on
-            parent: Parent widget
-        """
         super().__init__(parent)
         self.setWindowTitle("3D FKK Filter Designer")
-        self.resize(1400, 900)
+        self.resize(1600, 1000)
 
         self.volume = volume
         self.filtered_volume: Optional[SeismicVolume] = None
         self.spectrum: Optional[np.ndarray] = None
+        self.filtered_spectrum: Optional[np.ndarray] = None
         self.spectrum_axes: Optional[Dict] = None
 
         # Current slice indices
         self.t_idx = volume.nt // 2
         self.y_idx = volume.ny // 2
-        self.f_idx = 10  # Frequency slice index
-        self.ky_idx = volume.ny // 2  # ky slice index (center = 0)
+        self.f_idx = min(10, volume.nt // 4)
+        self.ky_idx = volume.ny // 2
 
         # Filter processor
         self.processor = get_fkk_filter(prefer_gpu=True)
@@ -76,8 +259,9 @@ class FKKDesignerDialog(QDialog):
         self._preview_timer.setSingleShot(True)
         self._preview_timer.timeout.connect(self._do_apply_filter)
 
-        # View mode
-        self._show_difference = False
+        # View state
+        self._show_filtered_data = True
+        self._show_filtered_spectrum = True
 
         self._init_ui()
         self._connect_signals()
@@ -86,445 +270,255 @@ class FKKDesignerDialog(QDialog):
 
     def _init_ui(self):
         """Initialize user interface."""
-        layout = QVBoxLayout(self)
+        layout = QHBoxLayout(self)
         layout.setContentsMargins(5, 5, 5, 5)
+        layout.setSpacing(5)
 
-        # Header
-        header = self._create_header()
-        layout.addWidget(header)
+        # Left: Controls panel (narrow, scrollable)
+        controls_scroll = QScrollArea()
+        controls_scroll.setWidgetResizable(True)
+        controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        controls_scroll.setMinimumWidth(280)
+        controls_scroll.setMaximumWidth(320)
 
-        # Main content splitter
-        main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        controls_widget = self._create_controls_panel()
+        controls_scroll.setWidget(controls_widget)
+        layout.addWidget(controls_scroll)
 
-        # Left: Data views (Input + Output)
-        left_panel = self._create_data_panel()
-        main_splitter.addWidget(left_panel)
+        # Right: Display area (4 quadrants)
+        display_widget = self._create_display_panel()
+        layout.addWidget(display_widget, stretch=1)
 
-        # Right: Spectrum + Controls
-        right_panel = self._create_spectrum_panel()
-        main_splitter.addWidget(right_panel)
-
-        main_splitter.setStretchFactor(0, 1)
-        main_splitter.setStretchFactor(1, 1)
-
-        layout.addWidget(main_splitter, stretch=1)
-
-        # Status bar
-        self.status_bar = QStatusBar()
-        self._update_status()
-        layout.addWidget(self.status_bar)
-
-        # Bottom buttons
-        button_layout = self._create_buttons()
-        layout.addLayout(button_layout)
-
-    def _create_header(self) -> QWidget:
-        """Create header with volume info."""
-        widget = QWidget()
-        layout = QHBoxLayout(widget)
-        layout.setContentsMargins(5, 5, 5, 5)
-
-        nt, nx, ny = self.volume.shape
-        info_text = (
-            f"Volume: {nx}×{ny}×{nt} samples | "
-            f"dt={self.volume.dt*1000:.1f}ms, dx={self.volume.dx:.1f}m, dy={self.volume.dy:.1f}m | "
-            f"Size: {self.volume.memory_mb():.1f} MB"
-        )
-
-        label = QLabel(info_text)
-        label.setStyleSheet("font-weight: bold;")
-        layout.addWidget(label)
-        layout.addStretch()
-
-        return widget
-
-    def _create_data_panel(self) -> QWidget:
-        """Create left panel with input and output slice views."""
+    def _create_controls_panel(self) -> QWidget:
+        """Create narrow controls panel."""
         widget = QWidget()
         layout = QVBoxLayout(widget)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(5, 5, 5, 5)
+        layout.setSpacing(8)
 
-        # Vertical splitter for input/output
-        splitter = QSplitter(Qt.Orientation.Vertical)
+        # Header info
+        info_label = QLabel(
+            f"<b>Volume:</b> {self.volume.nx}x{self.volume.ny}x{self.volume.nt}<br>"
+            f"<b>dt:</b> {self.volume.dt*1000:.1f}ms | "
+            f"<b>dx:</b> {self.volume.dx:.1f}m | "
+            f"<b>dy:</b> {self.volume.dy:.1f}m"
+        )
+        info_label.setStyleSheet("font-size: 9pt; color: #888;")
+        layout.addWidget(info_label)
 
-        # Input data group
-        input_group = QGroupBox("Input Data")
-        input_layout = QVBoxLayout(input_group)
+        # Slice navigation
+        nav_group = QGroupBox("Navigation")
+        nav_layout = QVBoxLayout(nav_group)
 
-        # Time slice view (X-Y at fixed T)
-        input_layout.addWidget(QLabel("Time Slice (X-Y)"))
-        self.input_time_view = pg.ImageView()
-        self.input_time_view.ui.roiBtn.hide()
-        self.input_time_view.ui.menuBtn.hide()
-        input_layout.addWidget(self.input_time_view, stretch=1)
-
-        # Time slice slider
-        time_slider_layout = QHBoxLayout()
-        time_slider_layout.addWidget(QLabel("t:"))
+        # Time slice
+        t_layout = QHBoxLayout()
+        t_layout.addWidget(QLabel("Time:"))
         self.time_slider = QSlider(Qt.Orientation.Horizontal)
         self.time_slider.setRange(0, self.volume.nt - 1)
         self.time_slider.setValue(self.t_idx)
-        time_slider_layout.addWidget(self.time_slider)
-        self.time_label = QLabel(f"{self.t_idx * self.volume.dt * 1000:.0f} ms")
-        self.time_label.setMinimumWidth(60)
-        time_slider_layout.addWidget(self.time_label)
-        input_layout.addLayout(time_slider_layout)
+        t_layout.addWidget(self.time_slider)
+        self.time_label = QLabel(f"{self.t_idx * self.volume.dt * 1000:.0f}ms")
+        self.time_label.setMinimumWidth(50)
+        t_layout.addWidget(self.time_label)
+        nav_layout.addLayout(t_layout)
 
-        # Inline slice view (T-X at fixed Y)
-        input_layout.addWidget(QLabel("Inline (T-X)"))
-        self.input_inline_view = pg.ImageView()
-        self.input_inline_view.ui.roiBtn.hide()
-        self.input_inline_view.ui.menuBtn.hide()
-        input_layout.addWidget(self.input_inline_view, stretch=1)
-
-        # Inline slider
-        inline_slider_layout = QHBoxLayout()
-        inline_slider_layout.addWidget(QLabel("Y:"))
+        # Y (inline) slice
+        y_layout = QHBoxLayout()
+        y_layout.addWidget(QLabel("Y:"))
         self.inline_slider = QSlider(Qt.Orientation.Horizontal)
         self.inline_slider.setRange(0, self.volume.ny - 1)
         self.inline_slider.setValue(self.y_idx)
-        inline_slider_layout.addWidget(self.inline_slider)
+        y_layout.addWidget(self.inline_slider)
         self.inline_label = QLabel(f"{self.y_idx}")
-        self.inline_label.setMinimumWidth(40)
-        inline_slider_layout.addWidget(self.inline_label)
-        input_layout.addLayout(inline_slider_layout)
+        self.inline_label.setMinimumWidth(30)
+        y_layout.addWidget(self.inline_label)
+        nav_layout.addLayout(y_layout)
 
-        splitter.addWidget(input_group)
-
-        # Output data group
-        output_group = QGroupBox("Filtered Output")
-        output_layout = QVBoxLayout(output_group)
-
-        # Output time slice
-        self.output_time_view = pg.ImageView()
-        self.output_time_view.ui.roiBtn.hide()
-        self.output_time_view.ui.menuBtn.hide()
-        output_layout.addWidget(self.output_time_view, stretch=1)
-
-        # Output inline slice
-        self.output_inline_view = pg.ImageView()
-        self.output_inline_view.ui.roiBtn.hide()
-        self.output_inline_view.ui.menuBtn.hide()
-        output_layout.addWidget(self.output_inline_view, stretch=1)
-
-        # View mode toggle
-        view_mode_layout = QHBoxLayout()
-        view_mode_layout.addWidget(QLabel("View:"))
-        self.view_mode_group = QButtonGroup()
-
-        self.view_filtered_btn = QRadioButton("Filtered")
-        self.view_filtered_btn.setChecked(True)
-        self.view_mode_group.addButton(self.view_filtered_btn, 0)
-        view_mode_layout.addWidget(self.view_filtered_btn)
-
-        self.view_diff_btn = QRadioButton("Difference")
-        self.view_mode_group.addButton(self.view_diff_btn, 1)
-        view_mode_layout.addWidget(self.view_diff_btn)
-
-        view_mode_layout.addStretch()
-        output_layout.addLayout(view_mode_layout)
-
-        splitter.addWidget(output_group)
-
-        layout.addWidget(splitter)
-        return widget
-
-    def _create_spectrum_panel(self) -> QWidget:
-        """Create right panel with spectrum views and controls."""
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        layout.setContentsMargins(0, 0, 0, 0)
-
-        # Vertical splitter for spectrum/controls
-        splitter = QSplitter(Qt.Orientation.Vertical)
-
-        # Spectrum views group
-        spectrum_group = QGroupBox("FKK Spectrum")
-        spectrum_layout = QVBoxLayout(spectrum_group)
-
-        # Kx-Ky slice at frequency f
-        spectrum_layout.addWidget(QLabel("Kx-Ky @ frequency"))
-        self.kxky_view = pg.ImageView()
-        self.kxky_view.ui.roiBtn.hide()
-        self.kxky_view.ui.menuBtn.hide()
-        spectrum_layout.addWidget(self.kxky_view, stretch=1)
-
-        # Frequency slider
-        freq_slider_layout = QHBoxLayout()
-        freq_slider_layout.addWidget(QLabel("f:"))
+        # Frequency slice
+        f_layout = QHBoxLayout()
+        f_layout.addWidget(QLabel("Freq:"))
         self.freq_slider = QSlider(Qt.Orientation.Horizontal)
         self.freq_slider.setRange(1, self.volume.nt // 2)
         self.freq_slider.setValue(self.f_idx)
-        freq_slider_layout.addWidget(self.freq_slider)
+        f_layout.addWidget(self.freq_slider)
         self.freq_label = QLabel("-- Hz")
-        self.freq_label.setMinimumWidth(60)
-        freq_slider_layout.addWidget(self.freq_label)
-        spectrum_layout.addLayout(freq_slider_layout)
+        self.freq_label.setMinimumWidth(50)
+        f_layout.addWidget(self.freq_label)
+        nav_layout.addLayout(f_layout)
 
-        # F-Kx slice at ky
-        spectrum_layout.addWidget(QLabel("F-Kx @ ky"))
-        self.fkx_view = pg.ImageView()
-        self.fkx_view.ui.roiBtn.hide()
-        self.fkx_view.ui.menuBtn.hide()
-        spectrum_layout.addWidget(self.fkx_view, stretch=1)
-
-        # ky slider
-        ky_slider_layout = QHBoxLayout()
-        ky_slider_layout.addWidget(QLabel("ky:"))
+        # ky slice
+        ky_layout = QHBoxLayout()
+        ky_layout.addWidget(QLabel("ky:"))
         self.ky_slider = QSlider(Qt.Orientation.Horizontal)
         self.ky_slider.setRange(0, self.volume.ny - 1)
         self.ky_slider.setValue(self.ky_idx)
-        ky_slider_layout.addWidget(self.ky_slider)
+        ky_layout.addWidget(self.ky_slider)
         self.ky_label = QLabel("0")
-        self.ky_label.setMinimumWidth(60)
-        ky_slider_layout.addWidget(self.ky_label)
-        spectrum_layout.addLayout(ky_slider_layout)
+        self.ky_label.setMinimumWidth(50)
+        ky_layout.addWidget(self.ky_label)
+        nav_layout.addLayout(ky_layout)
 
-        splitter.addWidget(spectrum_group)
+        layout.addWidget(nav_group)
 
-        # Filter controls group
-        controls_group = QGroupBox("Filter Controls")
-        controls_layout = QVBoxLayout(controls_group)
+        # Filter parameters
+        filter_group = QGroupBox("Velocity Cone")
+        filter_layout = QVBoxLayout(filter_group)
 
-        # Mode selection
+        # Mode
         mode_layout = QHBoxLayout()
-        mode_layout.addWidget(QLabel("Mode:"))
-        self.mode_group = QButtonGroup()
-
         self.mode_reject = QRadioButton("Reject")
         self.mode_reject.setChecked(True)
-        self.mode_group.addButton(self.mode_reject, 0)
-        mode_layout.addWidget(self.mode_reject)
-
         self.mode_pass = QRadioButton("Pass")
+        self.mode_group = QButtonGroup()
+        self.mode_group.addButton(self.mode_reject, 0)
         self.mode_group.addButton(self.mode_pass, 1)
+        mode_layout.addWidget(self.mode_reject)
         mode_layout.addWidget(self.mode_pass)
-
         mode_layout.addStretch()
-        controls_layout.addLayout(mode_layout)
+        filter_layout.addLayout(mode_layout)
 
-        # V_min
+        # V min
         vmin_layout = QHBoxLayout()
         vmin_layout.addWidget(QLabel("V min:"))
-        self.v_min_slider = QSlider(Qt.Orientation.Horizontal)
-        self.v_min_slider.setRange(50, 5000)
-        self.v_min_slider.setValue(int(self.config.v_min))
-        vmin_layout.addWidget(self.v_min_slider)
-        self.v_min_spin = QDoubleSpinBox()
+        self.v_min_spin = QSpinBox()
         self.v_min_spin.setRange(50, 5000)
-        self.v_min_spin.setValue(self.config.v_min)
+        self.v_min_spin.setValue(int(self.config.v_min))
         self.v_min_spin.setSuffix(" m/s")
-        self.v_min_spin.setMinimumWidth(100)
         vmin_layout.addWidget(self.v_min_spin)
-        controls_layout.addLayout(vmin_layout)
+        filter_layout.addLayout(vmin_layout)
 
-        # V_max
+        # V max
         vmax_layout = QHBoxLayout()
         vmax_layout.addWidget(QLabel("V max:"))
-        self.v_max_slider = QSlider(Qt.Orientation.Horizontal)
-        self.v_max_slider.setRange(100, 10000)
-        self.v_max_slider.setValue(int(self.config.v_max))
-        vmax_layout.addWidget(self.v_max_slider)
-        self.v_max_spin = QDoubleSpinBox()
+        self.v_max_spin = QSpinBox()
         self.v_max_spin.setRange(100, 10000)
-        self.v_max_spin.setValue(self.config.v_max)
+        self.v_max_spin.setValue(int(self.config.v_max))
         self.v_max_spin.setSuffix(" m/s")
-        self.v_max_spin.setMinimumWidth(100)
         vmax_layout.addWidget(self.v_max_spin)
-        controls_layout.addLayout(vmax_layout)
+        filter_layout.addLayout(vmax_layout)
 
-        # Azimuth range
+        # Taper
+        taper_layout = QHBoxLayout()
+        taper_layout.addWidget(QLabel("Taper:"))
+        self.taper_spin = QDoubleSpinBox()
+        self.taper_spin.setRange(0.01, 0.50)
+        self.taper_spin.setValue(self.config.taper_width)
+        self.taper_spin.setSingleStep(0.05)
+        taper_layout.addWidget(self.taper_spin)
+        filter_layout.addLayout(taper_layout)
+
+        # Azimuth
         az_layout = QHBoxLayout()
-        az_layout.addWidget(QLabel("Azimuth:"))
-        self.az_min_spin = QDoubleSpinBox()
+        az_layout.addWidget(QLabel("Az:"))
+        self.az_min_spin = QSpinBox()
         self.az_min_spin.setRange(0, 360)
         self.az_min_spin.setValue(0)
         self.az_min_spin.setSuffix("°")
         az_layout.addWidget(self.az_min_spin)
-        az_layout.addWidget(QLabel("to"))
-        self.az_max_spin = QDoubleSpinBox()
+        az_layout.addWidget(QLabel("-"))
+        self.az_max_spin = QSpinBox()
         self.az_max_spin.setRange(0, 360)
         self.az_max_spin.setValue(360)
         self.az_max_spin.setSuffix("°")
         az_layout.addWidget(self.az_max_spin)
-        az_layout.addStretch()
-        controls_layout.addLayout(az_layout)
+        filter_layout.addLayout(az_layout)
 
-        # Taper width
-        taper_layout = QHBoxLayout()
-        taper_layout.addWidget(QLabel("Taper:"))
-        self.taper_slider = QSlider(Qt.Orientation.Horizontal)
-        self.taper_slider.setRange(1, 50)  # 0.01 to 0.50
-        self.taper_slider.setValue(int(self.config.taper_width * 100))
-        taper_layout.addWidget(self.taper_slider)
-        self.taper_spin = QDoubleSpinBox()
-        self.taper_spin.setRange(0.01, 0.50)
-        self.taper_spin.setValue(self.config.taper_width)
-        self.taper_spin.setSingleStep(0.01)
-        self.taper_spin.setMinimumWidth(80)
-        taper_layout.addWidget(self.taper_spin)
-        controls_layout.addLayout(taper_layout)
+        layout.addWidget(filter_group)
 
-        # === Quality Improvements Section (v2.0) ===
-        controls_layout.addWidget(QLabel(""))  # Spacer
+        # Advanced options (collapsible)
+        adv_group = QGroupBox("Advanced")
+        adv_layout = QVBoxLayout(adv_group)
 
-        # AGC controls
+        # AGC
         agc_layout = QHBoxLayout()
-        self.agc_checkbox = QCheckBox("Apply AGC")
+        self.agc_checkbox = QCheckBox("AGC")
         self.agc_checkbox.setChecked(self.config.apply_agc)
-        self.agc_checkbox.setToolTip("Apply AGC before filtering and remove after using same scalars")
         agc_layout.addWidget(self.agc_checkbox)
-        agc_layout.addWidget(QLabel("Window:"))
-        self.agc_window_spin = QDoubleSpinBox()
+        self.agc_window_spin = QSpinBox()
         self.agc_window_spin.setRange(50, 5000)
-        self.agc_window_spin.setValue(self.config.agc_window_ms)
-        self.agc_window_spin.setSuffix(" ms")
-        self.agc_window_spin.setMinimumWidth(80)
+        self.agc_window_spin.setValue(int(self.config.agc_window_ms))
+        self.agc_window_spin.setSuffix("ms")
         agc_layout.addWidget(self.agc_window_spin)
-        agc_layout.addWidget(QLabel("Max Gain:"))
-        self.agc_gain_spin = QDoubleSpinBox()
-        self.agc_gain_spin.setRange(1, 100)
-        self.agc_gain_spin.setValue(self.config.agc_max_gain)
-        self.agc_gain_spin.setMinimumWidth(60)
-        agc_layout.addWidget(self.agc_gain_spin)
-        controls_layout.addLayout(agc_layout)
+        adv_layout.addLayout(agc_layout)
 
-        # Frequency band selection
-        freq_band_layout = QHBoxLayout()
-        freq_band_layout.addWidget(QLabel("Freq Band:"))
-        self.f_min_spin = QDoubleSpinBox()
+        # Freq band
+        freq_layout = QHBoxLayout()
+        freq_layout.addWidget(QLabel("f:"))
+        self.f_min_spin = QSpinBox()
         self.f_min_spin.setRange(0, 500)
-        self.f_min_spin.setValue(self.config.f_min if self.config.f_min is not None else 0)
-        self.f_min_spin.setSuffix(" Hz")
-        self.f_min_spin.setSpecialValueText("0 Hz")
-        self.f_min_spin.setToolTip("Minimum frequency for filter action (0 = DC)")
-        freq_band_layout.addWidget(self.f_min_spin)
-        freq_band_layout.addWidget(QLabel("to"))
-        nyquist = 0.5 / self.volume.dt
-        self.f_max_spin = QDoubleSpinBox()
+        self.f_min_spin.setValue(0)
+        self.f_min_spin.setSuffix("Hz")
+        freq_layout.addWidget(self.f_min_spin)
+        freq_layout.addWidget(QLabel("-"))
+        nyquist = int(0.5 / self.volume.dt)
+        self.f_max_spin = QSpinBox()
         self.f_max_spin.setRange(1, nyquist)
-        self.f_max_spin.setValue(self.config.f_max if self.config.f_max is not None else nyquist)
-        self.f_max_spin.setSuffix(" Hz")
-        self.f_max_spin.setToolTip("Maximum frequency for filter action (Nyquist = {:.0f} Hz)".format(nyquist))
-        freq_band_layout.addWidget(self.f_max_spin)
-        freq_band_layout.addStretch()
-        controls_layout.addLayout(freq_band_layout)
+        self.f_max_spin.setValue(nyquist)
+        self.f_max_spin.setSuffix("Hz")
+        freq_layout.addWidget(self.f_max_spin)
+        adv_layout.addLayout(freq_layout)
 
-        # Temporal tapering (ms on top/bottom)
-        temporal_taper_layout = QHBoxLayout()
-        temporal_taper_layout.addWidget(QLabel("Temporal Taper:"))
-        temporal_taper_layout.addWidget(QLabel("Top:"))
-        self.taper_top_spin = QDoubleSpinBox()
-        self.taper_top_spin.setRange(0, 1000)
-        self.taper_top_spin.setValue(self.config.taper_ms_top)
-        self.taper_top_spin.setSuffix(" ms")
-        self.taper_top_spin.setToolTip("Taper length at top of traces")
-        temporal_taper_layout.addWidget(self.taper_top_spin)
-        temporal_taper_layout.addWidget(QLabel("Bottom:"))
-        self.taper_bottom_spin = QDoubleSpinBox()
-        self.taper_bottom_spin.setRange(0, 1000)
-        self.taper_bottom_spin.setValue(self.config.taper_ms_bottom)
-        self.taper_bottom_spin.setSuffix(" ms")
-        self.taper_bottom_spin.setToolTip("Taper length at bottom of traces")
-        temporal_taper_layout.addWidget(self.taper_bottom_spin)
-        temporal_taper_layout.addStretch()
-        controls_layout.addLayout(temporal_taper_layout)
+        # Temporal taper
+        ttaper_layout = QHBoxLayout()
+        ttaper_layout.addWidget(QLabel("T-taper:"))
+        self.taper_top_spin = QSpinBox()
+        self.taper_top_spin.setRange(0, 500)
+        self.taper_top_spin.setValue(int(self.config.taper_ms_top))
+        self.taper_top_spin.setSuffix("ms")
+        ttaper_layout.addWidget(self.taper_top_spin)
+        adv_layout.addLayout(ttaper_layout)
 
-        # Temporal pad-copy controls (for high-amplitude top/bottom edges)
-        temporal_pad_label = QLabel("<b>Temporal Pad-Copy</b> (reduces top/bottom edge artifacts):")
-        temporal_pad_label.setToolTip(
-            "Pad top/bottom with copies of edge samples, taper only padded zone.\n"
-            "Use when high-amplitude events at trace start cause artifacts.\n"
-            "Try 50-200ms at top if first breaks cause ringing."
-        )
-        controls_layout.addWidget(temporal_pad_label)
+        # Edge padding
+        edge_layout = QHBoxLayout()
+        edge_layout.addWidget(QLabel("Edge pad:"))
+        self.pad_traces_spin = QSpinBox()
+        self.pad_traces_spin.setRange(0, 50)
+        self.pad_traces_spin.setValue(self.config.pad_traces_x)
+        edge_layout.addWidget(self.pad_traces_spin)
+        adv_layout.addLayout(edge_layout)
 
-        temporal_pad_layout = QHBoxLayout()
-        temporal_pad_layout.addWidget(QLabel("Top:"))
-        self.pad_time_top_spin = QDoubleSpinBox()
-        self.pad_time_top_spin.setRange(0, 500)
-        self.pad_time_top_spin.setValue(self.config.pad_time_top_ms)
-        self.pad_time_top_spin.setSuffix(" ms")
-        self.pad_time_top_spin.setToolTip("Time to pad at top (0=disabled). Try 50-200ms.")
-        temporal_pad_layout.addWidget(self.pad_time_top_spin)
-        temporal_pad_layout.addWidget(QLabel("Bottom:"))
-        self.pad_time_bottom_spin = QDoubleSpinBox()
-        self.pad_time_bottom_spin.setRange(0, 500)
-        self.pad_time_bottom_spin.setValue(self.config.pad_time_bottom_ms)
-        self.pad_time_bottom_spin.setSuffix(" ms")
-        self.pad_time_bottom_spin.setToolTip("Time to pad at bottom (0=disabled)")
-        temporal_pad_layout.addWidget(self.pad_time_bottom_spin)
-        temporal_pad_layout.addStretch()
-        controls_layout.addLayout(temporal_pad_layout)
+        layout.addWidget(adv_group)
 
-        # === Spatial Edge Handling Section ===
-        controls_layout.addWidget(QLabel(""))  # Spacer
+        # Display options
+        display_group = QGroupBox("Display")
+        display_layout = QVBoxLayout(display_group)
 
-        # Edge method selection
-        edge_method_layout = QHBoxLayout()
-        edge_method_layout.addWidget(QLabel("Edge Method:"))
-        self.edge_method_combo = QComboBox()
-        self.edge_method_combo.addItem("None", "none")
-        self.edge_method_combo.addItem("Pad Copy", "pad_copy")
-        self.edge_method_combo.setCurrentIndex(1)  # Default to pad_copy
-        self.edge_method_combo.setToolTip(
-            "Method to reduce edge artifacts:\n"
-            "None: No treatment (may have edge artifacts)\n"
-            "Pad Copy: Pad with copies of edge traces, taper only padded zone"
-        )
-        edge_method_layout.addWidget(self.edge_method_combo)
-        edge_method_layout.addStretch()
-        controls_layout.addLayout(edge_method_layout)
+        # Seismic colormap
+        seis_cmap_layout = QHBoxLayout()
+        seis_cmap_layout.addWidget(QLabel("Seismic:"))
+        self.seismic_cmap_combo = QComboBox()
+        for cmap in SEISMIC_COLORMAPS:
+            self.seismic_cmap_combo.addItem(cmap.replace('_', ' ').title(), cmap)
+        seis_cmap_layout.addWidget(self.seismic_cmap_combo)
+        display_layout.addLayout(seis_cmap_layout)
 
-        # Pad traces parameters - prominent controls for edge artifact reduction
-        pad_label = QLabel("<b>Edge Pad Traces</b> (increase if edge artifacts persist):")
-        pad_label.setToolTip(
-            "Number of traces to pad on each side before filtering.\n"
-            "Larger values = better edge artifact suppression.\n"
-            "Try 5-10 for small volumes, 10-30 for larger ones."
-        )
-        controls_layout.addWidget(pad_label)
+        # Spectrum colormap
+        spec_cmap_layout = QHBoxLayout()
+        spec_cmap_layout.addWidget(QLabel("Spectrum:"))
+        self.spectrum_cmap_combo = QComboBox()
+        for cmap in SPECTRUM_COLORMAPS:
+            self.spectrum_cmap_combo.addItem(cmap.replace('_', ' ').title(), cmap)
+        spec_cmap_layout.addWidget(self.spectrum_cmap_combo)
+        display_layout.addLayout(spec_cmap_layout)
 
-        pad_traces_layout = QHBoxLayout()
-        pad_traces_layout.addWidget(QLabel("X (lines):"))
-        self.pad_traces_x_spin = QSpinBox()
-        self.pad_traces_x_spin.setRange(0, 100)
-        self.pad_traces_x_spin.setValue(self.config.pad_traces_x)
-        self.pad_traces_x_spin.setSpecialValueText("Auto")
-        self.pad_traces_x_spin.setToolTip(
-            "Traces to pad in X (inline) direction.\n"
-            "0 = Auto (~10% of dimension, min 3, max 20)\n"
-            "Try larger values (20-50) if edge artifacts persist."
-        )
-        pad_traces_layout.addWidget(self.pad_traces_x_spin)
-        pad_traces_layout.addWidget(QLabel("Y (receivers):"))
-        self.pad_traces_y_spin = QSpinBox()
-        self.pad_traces_y_spin.setRange(0, 100)
-        self.pad_traces_y_spin.setValue(self.config.pad_traces_y)
-        self.pad_traces_y_spin.setSpecialValueText("Auto")
-        self.pad_traces_y_spin.setToolTip(
-            "Traces to pad in Y (crossline) direction.\n"
-            "0 = Auto (~10% of dimension, min 3, max 20)\n"
-            "Try larger values (20-50) if edge artifacts persist."
-        )
-        pad_traces_layout.addWidget(self.pad_traces_y_spin)
-        pad_traces_layout.addStretch()
-        controls_layout.addLayout(pad_traces_layout)
+        # dB mode for spectrum
+        db_layout = QHBoxLayout()
+        self.db_checkbox = QCheckBox("dB scale")
+        self.db_checkbox.setChecked(True)
+        self.db_checkbox.setToolTip("Display spectrum in dB (20*log10)")
+        db_layout.addWidget(self.db_checkbox)
+        db_layout.addWidget(QLabel("Range:"))
+        self.db_range_spin = QSpinBox()
+        self.db_range_spin.setRange(20, 120)
+        self.db_range_spin.setValue(60)
+        self.db_range_spin.setSuffix(" dB")
+        self.db_range_spin.setToolTip("Dynamic range for dB display")
+        db_layout.addWidget(self.db_range_spin)
+        display_layout.addLayout(db_layout)
 
-        # Padding factor (FFT padding)
-        padding_layout = QHBoxLayout()
-        padding_layout.addWidget(QLabel("FFT Padding:"))
-        self.padding_factor_spin = QDoubleSpinBox()
-        self.padding_factor_spin.setRange(1.0, 4.0)
-        self.padding_factor_spin.setSingleStep(0.5)
-        self.padding_factor_spin.setValue(self.config.padding_factor)
-        self.padding_factor_spin.setSuffix("x")
-        self.padding_factor_spin.setToolTip("Extra FFT padding multiplier (1.0=standard, 2.0=double)")
-        padding_layout.addWidget(self.padding_factor_spin)
-        padding_layout.addStretch()
-        controls_layout.addLayout(padding_layout)
+        layout.addWidget(display_group)
 
-        # Preset selection
+        # Preset
         preset_layout = QHBoxLayout()
         preset_layout.addWidget(QLabel("Preset:"))
         self.preset_combo = QComboBox()
@@ -532,344 +526,338 @@ class FKKDesignerDialog(QDialog):
         for name in FKK_PRESETS.keys():
             self.preset_combo.addItem(name, name)
         preset_layout.addWidget(self.preset_combo)
-        controls_layout.addLayout(preset_layout)
+        layout.addLayout(preset_layout)
 
         # Action buttons
-        action_layout = QHBoxLayout()
-        self.compute_btn = QPushButton("Compute Spectrum")
-        action_layout.addWidget(self.compute_btn)
         self.apply_btn = QPushButton("Apply Filter")
-        self.apply_btn.setStyleSheet("font-weight: bold;")
-        action_layout.addWidget(self.apply_btn)
-        controls_layout.addLayout(action_layout)
+        self.apply_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                font-weight: bold;
+                padding: 8px;
+            }
+            QPushButton:hover { background-color: #45a049; }
+        """)
+        layout.addWidget(self.apply_btn)
 
-        splitter.addWidget(controls_group)
+        # Separator
+        layout.addWidget(self._create_separator())
 
-        # Set splitter proportions
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 1)
-
-        layout.addWidget(splitter)
-        return widget
-
-    def _create_buttons(self) -> QHBoxLayout:
-        """Create bottom button row."""
-        layout = QHBoxLayout()
-
-        self.export_btn = QPushButton("Export Result")
-        layout.addWidget(self.export_btn)
-
-        layout.addStretch()
-
+        # Accept/Cancel
+        btn_layout = QHBoxLayout()
         self.cancel_btn = QPushButton("Cancel")
-        layout.addWidget(self.cancel_btn)
-
+        btn_layout.addWidget(self.cancel_btn)
         self.accept_btn = QPushButton("Accept")
         self.accept_btn.setStyleSheet("font-weight: bold;")
-        layout.addWidget(self.accept_btn)
+        btn_layout.addWidget(self.accept_btn)
+        layout.addLayout(btn_layout)
 
-        return layout
+        # Status
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: #888; font-size: 9pt;")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        layout.addStretch()
+        return widget
+
+    def _create_separator(self) -> QFrame:
+        """Create horizontal separator line."""
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setFrameShadow(QFrame.Shadow.Sunken)
+        return line
+
+    def _create_display_panel(self) -> QWidget:
+        """Create the 4-quadrant display panel."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(5)
+
+        # Top row: Data views with toggle
+        data_header = QWidget()
+        data_header_layout = QHBoxLayout(data_header)
+        data_header_layout.setContentsMargins(0, 0, 0, 0)
+
+        data_label = QLabel("<b>SEISMIC DATA</b>")
+        data_label.setStyleSheet("color: #fff; font-size: 11pt;")
+        data_header_layout.addWidget(data_label)
+        data_header_layout.addStretch()
+
+        self.data_toggle_btn = QPushButton("Show: Filtered")
+        self.data_toggle_btn.setCheckable(True)
+        self.data_toggle_btn.setChecked(True)
+        self.data_toggle_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2196F3;
+                color: white;
+                padding: 5px 15px;
+                border-radius: 3px;
+            }
+            QPushButton:checked {
+                background-color: #4CAF50;
+            }
+        """)
+        data_header_layout.addWidget(self.data_toggle_btn)
+
+        self.diff_btn = QPushButton("Difference")
+        self.diff_btn.setCheckable(True)
+        self.diff_btn.setStyleSheet("""
+            QPushButton {
+                padding: 5px 15px;
+                border-radius: 3px;
+            }
+            QPushButton:checked {
+                background-color: #FF9800;
+                color: white;
+            }
+        """)
+        data_header_layout.addWidget(self.diff_btn)
+        layout.addWidget(data_header)
+
+        # Data views row (XX and TX)
+        data_splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # XX view (time slice X-Y)
+        self.xx_view = SeismicImageView("Time Slice (X-Y)")
+        data_splitter.addWidget(self.xx_view)
+
+        # TX view (inline T-X)
+        self.tx_view = SeismicImageView("Inline (T-X)")
+        data_splitter.addWidget(self.tx_view)
+
+        data_splitter.setStretchFactor(0, 1)
+        data_splitter.setStretchFactor(1, 1)
+        layout.addWidget(data_splitter, stretch=1)
+
+        # Bottom row: Spectrum views with toggle
+        spec_header = QWidget()
+        spec_header_layout = QHBoxLayout(spec_header)
+        spec_header_layout.setContentsMargins(0, 0, 0, 0)
+
+        spec_label = QLabel("<b>FKK SPECTRUM</b>")
+        spec_label.setStyleSheet("color: #fff; font-size: 11pt;")
+        spec_header_layout.addWidget(spec_label)
+        spec_header_layout.addStretch()
+
+        self.spec_toggle_btn = QPushButton("Show: Filtered")
+        self.spec_toggle_btn.setCheckable(True)
+        self.spec_toggle_btn.setChecked(True)
+        self.spec_toggle_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2196F3;
+                color: white;
+                padding: 5px 15px;
+                border-radius: 3px;
+            }
+            QPushButton:checked {
+                background-color: #4CAF50;
+            }
+        """)
+        spec_header_layout.addWidget(self.spec_toggle_btn)
+
+        self.show_mask_btn = QPushButton("Show Mask")
+        self.show_mask_btn.setCheckable(True)
+        self.show_mask_btn.setStyleSheet("""
+            QPushButton {
+                padding: 5px 15px;
+                border-radius: 3px;
+            }
+            QPushButton:checked {
+                background-color: #9C27B0;
+                color: white;
+            }
+        """)
+        spec_header_layout.addWidget(self.show_mask_btn)
+        layout.addWidget(spec_header)
+
+        # Spectrum views row (KK and FK)
+        spec_splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # KK view (Kx-Ky at frequency)
+        self.kk_view = SeismicImageView("Kx-Ky @ frequency")
+        spec_splitter.addWidget(self.kk_view)
+
+        # FK view (F-Kx at ky)
+        self.fk_view = SeismicImageView("F-Kx @ ky")
+        spec_splitter.addWidget(self.fk_view)
+
+        spec_splitter.setStretchFactor(0, 1)
+        spec_splitter.setStretchFactor(1, 1)
+        layout.addWidget(spec_splitter, stretch=1)
+
+        return widget
 
     def _connect_signals(self):
-        """Connect UI signals to slots."""
-        # Slice navigation
+        """Connect UI signals."""
+        # Navigation
         self.time_slider.valueChanged.connect(self._on_time_changed)
         self.inline_slider.valueChanged.connect(self._on_inline_changed)
         self.freq_slider.valueChanged.connect(self._on_freq_changed)
         self.ky_slider.valueChanged.connect(self._on_ky_changed)
 
-        # View mode
-        self.view_mode_group.buttonClicked.connect(self._on_view_mode_changed)
-
         # Filter parameters
-        self.mode_group.buttonClicked.connect(self._on_mode_changed)
-        self.v_min_slider.valueChanged.connect(self._on_v_min_slider_changed)
-        self.v_min_spin.valueChanged.connect(self._on_v_min_spin_changed)
-        self.v_max_slider.valueChanged.connect(self._on_v_max_slider_changed)
-        self.v_max_spin.valueChanged.connect(self._on_v_max_spin_changed)
-        self.az_min_spin.valueChanged.connect(self._on_az_changed)
-        self.az_max_spin.valueChanged.connect(self._on_az_changed)
-        self.taper_slider.valueChanged.connect(self._on_taper_slider_changed)
-        self.taper_spin.valueChanged.connect(self._on_taper_spin_changed)
+        self.mode_group.buttonClicked.connect(self._on_param_changed)
+        self.v_min_spin.valueChanged.connect(self._on_param_changed)
+        self.v_max_spin.valueChanged.connect(self._on_param_changed)
+        self.taper_spin.valueChanged.connect(self._on_param_changed)
+        self.az_min_spin.valueChanged.connect(self._on_param_changed)
+        self.az_max_spin.valueChanged.connect(self._on_param_changed)
+        self.agc_checkbox.stateChanged.connect(self._on_param_changed)
+        self.agc_window_spin.valueChanged.connect(self._on_param_changed)
+        self.f_min_spin.valueChanged.connect(self._on_param_changed)
+        self.f_max_spin.valueChanged.connect(self._on_param_changed)
+        self.taper_top_spin.valueChanged.connect(self._on_param_changed)
+        self.pad_traces_spin.valueChanged.connect(self._on_param_changed)
         self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)
 
-        # Quality improvement controls (v2.0)
-        self.agc_checkbox.stateChanged.connect(self._on_agc_changed)
-        self.agc_window_spin.valueChanged.connect(self._on_agc_window_changed)
-        self.agc_gain_spin.valueChanged.connect(self._on_agc_gain_changed)
-        self.f_min_spin.valueChanged.connect(self._on_freq_band_changed)
-        self.f_max_spin.valueChanged.connect(self._on_freq_band_changed)
-        self.taper_top_spin.valueChanged.connect(self._on_temporal_taper_changed)
-        self.taper_bottom_spin.valueChanged.connect(self._on_temporal_taper_changed)
+        # Toggle buttons
+        self.data_toggle_btn.clicked.connect(self._on_data_toggle)
+        self.diff_btn.clicked.connect(self._on_diff_toggle)
+        self.spec_toggle_btn.clicked.connect(self._on_spec_toggle)
+        self.show_mask_btn.clicked.connect(self._on_mask_toggle)
 
-        # Temporal pad-copy controls
-        self.pad_time_top_spin.valueChanged.connect(self._on_temporal_pad_changed)
-        self.pad_time_bottom_spin.valueChanged.connect(self._on_temporal_pad_changed)
-
-        # Spatial edge handling controls
-        self.edge_method_combo.currentIndexChanged.connect(self._on_edge_method_changed)
-        self.pad_traces_x_spin.valueChanged.connect(self._on_pad_traces_changed)
-        self.pad_traces_y_spin.valueChanged.connect(self._on_pad_traces_changed)
-        self.padding_factor_spin.valueChanged.connect(self._on_padding_changed)
+        # Display options
+        self.seismic_cmap_combo.currentIndexChanged.connect(self._on_seismic_cmap_changed)
+        self.spectrum_cmap_combo.currentIndexChanged.connect(self._on_spectrum_cmap_changed)
+        self.db_checkbox.stateChanged.connect(self._on_db_mode_changed)
+        self.db_range_spin.valueChanged.connect(self._on_db_range_changed)
 
         # Actions
-        self.compute_btn.clicked.connect(self._compute_spectrum)
         self.apply_btn.clicked.connect(self._request_apply_filter)
-        self.export_btn.clicked.connect(self._export_result)
         self.cancel_btn.clicked.connect(self.reject)
         self.accept_btn.clicked.connect(self._accept_result)
 
     # =========================================================================
-    # Slice Navigation
+    # Event Handlers
     # =========================================================================
 
     def _on_time_changed(self, value: int):
-        """Handle time slice slider change."""
         self.t_idx = value
-        self.time_label.setText(f"{value * self.volume.dt * 1000:.0f} ms")
+        self.time_label.setText(f"{value * self.volume.dt * 1000:.0f}ms")
         self._update_data_views()
 
     def _on_inline_changed(self, value: int):
-        """Handle inline slider change."""
         self.y_idx = value
         self.inline_label.setText(f"{value}")
         self._update_data_views()
 
     def _on_freq_changed(self, value: int):
-        """Handle frequency slider change."""
         self.f_idx = value
         if self.spectrum_axes:
-            freq = self.spectrum_axes['f_axis'][value]
-            self.freq_label.setText(f"{freq:.1f} Hz")
+            freq = self.spectrum_axes['f_axis'][value] if value < len(self.spectrum_axes['f_axis']) else 0
+            self.freq_label.setText(f"{freq:.1f}Hz")
         self._update_spectrum_views()
 
     def _on_ky_changed(self, value: int):
-        """Handle ky slider change."""
         self.ky_idx = value
         if self.spectrum_axes:
-            ky = self.spectrum_axes['ky_axis'][value]
-            self.ky_label.setText(f"{ky:.4f}")
+            ky = self.spectrum_axes['ky_axis'][value] if value < len(self.spectrum_axes['ky_axis']) else 0
+            self.ky_label.setText(f"{ky:.3f}")
         self._update_spectrum_views()
 
-    def _on_view_mode_changed(self, button):
-        """Handle view mode toggle."""
-        self._show_difference = (button == self.view_diff_btn)
-        self._update_output_views()
-
-    # =========================================================================
-    # Filter Parameter Changes
-    # =========================================================================
-
-    def _on_mode_changed(self, button):
-        """Handle mode change."""
-        self.config.mode = 'reject' if button == self.mode_reject else 'pass'
+    def _on_param_changed(self, *args):
+        """Update config from UI and request filter."""
+        self._update_config_from_ui()
         self._request_apply_filter()
 
-    def _on_v_min_slider_changed(self, value: int):
-        """Handle v_min slider change."""
-        self.v_min_spin.blockSignals(True)
-        self.v_min_spin.setValue(value)
-        self.v_min_spin.blockSignals(False)
-        self.config.v_min = float(value)
-        self._request_apply_filter()
-
-    def _on_v_min_spin_changed(self, value: float):
-        """Handle v_min spin change."""
-        self.v_min_slider.blockSignals(True)
-        self.v_min_slider.setValue(int(value))
-        self.v_min_slider.blockSignals(False)
-        self.config.v_min = value
-        self._request_apply_filter()
-
-    def _on_v_max_slider_changed(self, value: int):
-        """Handle v_max slider change."""
-        self.v_max_spin.blockSignals(True)
-        self.v_max_spin.setValue(value)
-        self.v_max_spin.blockSignals(False)
-        self.config.v_max = float(value)
-        self._request_apply_filter()
-
-    def _on_v_max_spin_changed(self, value: float):
-        """Handle v_max spin change."""
-        self.v_max_slider.blockSignals(True)
-        self.v_max_slider.setValue(int(value))
-        self.v_max_slider.blockSignals(False)
-        self.config.v_max = value
-        self._request_apply_filter()
-
-    def _on_az_changed(self, value: float):
-        """Handle azimuth change."""
-        self.config.azimuth_min = self.az_min_spin.value()
-        self.config.azimuth_max = self.az_max_spin.value()
-        self._request_apply_filter()
-
-    def _on_taper_slider_changed(self, value: int):
-        """Handle taper slider change."""
-        taper = value / 100.0
-        self.taper_spin.blockSignals(True)
-        self.taper_spin.setValue(taper)
-        self.taper_spin.blockSignals(False)
-        self.config.taper_width = taper
-        self._request_apply_filter()
-
-    def _on_taper_spin_changed(self, value: float):
-        """Handle taper spin change."""
-        self.taper_slider.blockSignals(True)
-        self.taper_slider.setValue(int(value * 100))
-        self.taper_slider.blockSignals(False)
-        self.config.taper_width = value
-        self._request_apply_filter()
-
-    def _on_agc_changed(self, state: int):
-        """Handle AGC checkbox change."""
-        self.config.apply_agc = (state == Qt.CheckState.Checked.value)
-        self._request_apply_filter()
-
-    def _on_agc_window_changed(self, value: float):
-        """Handle AGC window change."""
-        self.config.agc_window_ms = value
-        if self.config.apply_agc:
-            self._request_apply_filter()
-
-    def _on_agc_gain_changed(self, value: float):
-        """Handle AGC max gain change."""
-        self.config.agc_max_gain = value
-        if self.config.apply_agc:
-            self._request_apply_filter()
-
-    def _on_freq_band_changed(self, value: float):
-        """Handle frequency band change."""
-        f_min = self.f_min_spin.value()
-        f_max = self.f_max_spin.value()
-        self.config.f_min = f_min if f_min > 0 else None
-        self.config.f_max = f_max if f_max < (0.5 / self.volume.dt) else None
-        self._request_apply_filter()
-
-    def _on_temporal_taper_changed(self, value: float):
-        """Handle temporal taper change."""
-        self.config.taper_ms_top = self.taper_top_spin.value()
-        self.config.taper_ms_bottom = self.taper_bottom_spin.value()
-        self._request_apply_filter()
-
-    def _on_temporal_pad_changed(self, value: float):
-        """Handle temporal pad-copy change."""
-        self.config.pad_time_top_ms = self.pad_time_top_spin.value()
-        self.config.pad_time_bottom_ms = self.pad_time_bottom_spin.value()
-        self._request_apply_filter()
-
-    def _on_edge_method_changed(self, index: int):
-        """Handle edge method selection change."""
-        self.config.edge_method = self.edge_method_combo.currentData()
-        self._request_apply_filter()
-
-    def _on_pad_traces_changed(self, value: int):
-        """Handle pad traces parameter change."""
-        self.config.pad_traces_x = self.pad_traces_x_spin.value()
-        self.config.pad_traces_y = self.pad_traces_y_spin.value()
-        if self.config.edge_method == 'pad_copy':
-            self._request_apply_filter()
-
-    def _on_padding_changed(self, value: float):
-        """Handle padding factor change."""
-        self.config.padding_factor = value
-        self._request_apply_filter()
+    def _update_config_from_ui(self):
+        """Update config from current UI values."""
+        self.config.mode = 'reject' if self.mode_reject.isChecked() else 'pass'
+        self.config.v_min = float(self.v_min_spin.value())
+        self.config.v_max = float(self.v_max_spin.value())
+        self.config.taper_width = self.taper_spin.value()
+        self.config.azimuth_min = float(self.az_min_spin.value())
+        self.config.azimuth_max = float(self.az_max_spin.value())
+        self.config.apply_agc = self.agc_checkbox.isChecked()
+        self.config.agc_window_ms = float(self.agc_window_spin.value())
+        self.config.f_min = float(self.f_min_spin.value()) if self.f_min_spin.value() > 0 else None
+        self.config.f_max = float(self.f_max_spin.value()) if self.f_max_spin.value() < int(0.5/self.volume.dt) else None
+        self.config.taper_ms_top = float(self.taper_top_spin.value())
+        self.config.taper_ms_bottom = float(self.taper_top_spin.value())
+        self.config.pad_traces_x = self.pad_traces_spin.value()
+        self.config.pad_traces_y = self.pad_traces_spin.value()
 
     def _on_preset_changed(self, index: int):
-        """Handle preset selection."""
         name = self.preset_combo.currentData()
         if name and name in FKK_PRESETS:
             preset = FKK_PRESETS[name]
-            self._set_config(preset)
+            self._set_ui_from_config(preset)
             self._request_apply_filter()
 
-    def _set_config(self, config: FKKConfig):
-        """Set all UI elements from config."""
-        self.config = config.copy()
-
-        # Block signals during update
-        self.v_min_slider.blockSignals(True)
+    def _set_ui_from_config(self, config: FKKConfig):
+        """Update UI from config."""
         self.v_min_spin.blockSignals(True)
-        self.v_max_slider.blockSignals(True)
         self.v_max_spin.blockSignals(True)
-        self.taper_slider.blockSignals(True)
         self.taper_spin.blockSignals(True)
-        self.az_min_spin.blockSignals(True)
-        self.az_max_spin.blockSignals(True)
-        self.agc_checkbox.blockSignals(True)
-        self.agc_window_spin.blockSignals(True)
-        self.agc_gain_spin.blockSignals(True)
-        self.f_min_spin.blockSignals(True)
-        self.f_max_spin.blockSignals(True)
-        self.taper_top_spin.blockSignals(True)
-        self.taper_bottom_spin.blockSignals(True)
-        self.pad_time_top_spin.blockSignals(True)
-        self.pad_time_bottom_spin.blockSignals(True)
-        self.edge_method_combo.blockSignals(True)
-        self.pad_traces_x_spin.blockSignals(True)
-        self.pad_traces_y_spin.blockSignals(True)
-        self.padding_factor_spin.blockSignals(True)
 
-        # Core parameters
-        self.v_min_slider.setValue(int(config.v_min))
-        self.v_min_spin.setValue(config.v_min)
-        self.v_max_slider.setValue(int(config.v_max))
-        self.v_max_spin.setValue(config.v_max)
-        self.taper_slider.setValue(int(config.taper_width * 100))
+        self.v_min_spin.setValue(int(config.v_min))
+        self.v_max_spin.setValue(int(config.v_max))
         self.taper_spin.setValue(config.taper_width)
-        self.az_min_spin.setValue(config.azimuth_min)
-        self.az_max_spin.setValue(config.azimuth_max)
 
         if config.mode == 'reject':
             self.mode_reject.setChecked(True)
         else:
             self.mode_pass.setChecked(True)
 
-        # Quality improvement parameters (v2.0)
-        self.agc_checkbox.setChecked(config.apply_agc)
-        self.agc_window_spin.setValue(config.agc_window_ms)
-        self.agc_gain_spin.setValue(config.agc_max_gain)
-
-        nyquist = 0.5 / self.volume.dt
-        self.f_min_spin.setValue(config.f_min if config.f_min is not None else 0)
-        self.f_max_spin.setValue(config.f_max if config.f_max is not None else nyquist)
-
-        self.taper_top_spin.setValue(config.taper_ms_top)
-        self.taper_bottom_spin.setValue(config.taper_ms_bottom)
-
-        # Temporal pad-copy parameters
-        self.pad_time_top_spin.setValue(config.pad_time_top_ms)
-        self.pad_time_bottom_spin.setValue(config.pad_time_bottom_ms)
-
-        # Spatial edge handling parameters
-        edge_method_index = self.edge_method_combo.findData(config.edge_method)
-        if edge_method_index >= 0:
-            self.edge_method_combo.setCurrentIndex(edge_method_index)
-        self.pad_traces_x_spin.setValue(config.pad_traces_x)
-        self.pad_traces_y_spin.setValue(config.pad_traces_y)
-        self.padding_factor_spin.setValue(config.padding_factor)
-
-        # Unblock signals
-        self.v_min_slider.blockSignals(False)
         self.v_min_spin.blockSignals(False)
-        self.v_max_slider.blockSignals(False)
         self.v_max_spin.blockSignals(False)
-        self.taper_slider.blockSignals(False)
         self.taper_spin.blockSignals(False)
-        self.az_min_spin.blockSignals(False)
-        self.az_max_spin.blockSignals(False)
-        self.agc_checkbox.blockSignals(False)
-        self.agc_window_spin.blockSignals(False)
-        self.agc_gain_spin.blockSignals(False)
-        self.f_min_spin.blockSignals(False)
-        self.f_max_spin.blockSignals(False)
-        self.taper_top_spin.blockSignals(False)
-        self.taper_bottom_spin.blockSignals(False)
-        self.pad_time_top_spin.blockSignals(False)
-        self.pad_time_bottom_spin.blockSignals(False)
-        self.edge_method_combo.blockSignals(False)
-        self.pad_traces_x_spin.blockSignals(False)
-        self.pad_traces_y_spin.blockSignals(False)
-        self.padding_factor_spin.blockSignals(False)
+
+        self.config = config.copy()
+
+    def _on_data_toggle(self):
+        """Toggle between filtered and original data."""
+        self._show_filtered_data = self.data_toggle_btn.isChecked()
+        self.data_toggle_btn.setText("Show: Filtered" if self._show_filtered_data else "Show: Original")
+        self._update_data_views()
+
+    def _on_diff_toggle(self):
+        """Toggle difference view."""
+        self._update_data_views()
+
+    def _on_spec_toggle(self):
+        """Toggle between filtered and original spectrum."""
+        self._show_filtered_spectrum = self.spec_toggle_btn.isChecked()
+        self.spec_toggle_btn.setText("Show: Filtered" if self._show_filtered_spectrum else "Show: Original")
+        self._update_spectrum_views()
+
+    def _on_mask_toggle(self):
+        """Toggle mask overlay."""
+        self._update_spectrum_views()
+
+    def _on_seismic_cmap_changed(self, index: int):
+        """Change seismic colormap."""
+        cmap_name = self.seismic_cmap_combo.currentData()
+        if cmap_name:
+            self.xx_view.setColormap(cmap_name, is_spectrum=False)
+            self.tx_view.setColormap(cmap_name, is_spectrum=False)
+            self._update_data_views()
+
+    def _on_spectrum_cmap_changed(self, index: int):
+        """Change spectrum colormap."""
+        cmap_name = self.spectrum_cmap_combo.currentData()
+        if cmap_name:
+            self.kk_view.setColormap(cmap_name, is_spectrum=True)
+            self.fk_view.setColormap(cmap_name, is_spectrum=True)
+            self._update_spectrum_views()
+
+    def _on_db_mode_changed(self, state: int):
+        """Toggle dB mode for spectrum display."""
+        use_db = state == Qt.CheckState.Checked.value
+        db_range = self.db_range_spin.value()
+        self.kk_view.setDbMode(use_db, db_range)
+        self.fk_view.setDbMode(use_db, db_range)
+        self._update_spectrum_views()
+
+    def _on_db_range_changed(self, value: int):
+        """Change dB dynamic range."""
+        if self.db_checkbox.isChecked():
+            self.kk_view.setDbMode(True, value)
+            self.fk_view.setDbMode(True, value)
+            self._update_spectrum_views()
 
     # =========================================================================
     # Processing
@@ -877,133 +865,108 @@ class FKKDesignerDialog(QDialog):
 
     def _compute_spectrum(self):
         """Compute FKK spectrum."""
-        self.status_bar.showMessage("Computing FKK spectrum...")
+        self.status_label.setText("Computing spectrum...")
         try:
             self.spectrum = self.processor.compute_spectrum(self.volume)
             self.spectrum_axes = self.processor._compute_axes(self.volume)
 
             # Update frequency label
-            if self.spectrum_axes:
+            if self.spectrum_axes and self.f_idx < len(self.spectrum_axes['f_axis']):
                 freq = self.spectrum_axes['f_axis'][self.f_idx]
-                self.freq_label.setText(f"{freq:.1f} Hz")
-                ky = self.spectrum_axes['ky_axis'][self.ky_idx]
-                self.ky_label.setText(f"{ky:.4f}")
+                self.freq_label.setText(f"{freq:.1f}Hz")
 
             self._update_spectrum_views()
-            self.status_bar.showMessage("Spectrum computed", 3000)
+            self.status_label.setText("Spectrum ready")
         except Exception as e:
             logger.error(f"Spectrum computation failed: {e}")
-            QMessageBox.warning(self, "Error", f"Spectrum computation failed:\n{e}")
-            self.status_bar.showMessage("Spectrum computation failed")
+            self.status_label.setText(f"Error: {e}")
 
     def _request_apply_filter(self):
-        """Request filter application with debouncing."""
-        self._preview_timer.start(150)  # 150ms debounce
+        """Request filter with debouncing."""
+        self._preview_timer.start(200)
 
     def _do_apply_filter(self):
-        """Apply filter to volume."""
-        self.status_bar.showMessage("Applying filter...")
+        """Apply filter."""
+        self.status_label.setText("Applying filter...")
         try:
-            self.filtered_volume = self.processor.apply_filter(
-                self.volume, self.config
-            )
-            self._update_output_views()
-            self._update_spectrum_views()
-            self.status_bar.showMessage(f"Filter applied: {self.config.get_summary()}", 3000)
+            self.filtered_volume = self.processor.apply_filter(self.volume, self.config)
+
+            # Compute filtered spectrum
+            if self.filtered_volume is not None:
+                self.filtered_spectrum = self.processor.compute_spectrum(self.filtered_volume)
+
+            self._update_all_views()
+            self.status_label.setText(f"Filter: {self.config.get_summary()}")
         except Exception as e:
-            logger.error(f"Filter application failed: {e}")
-            self.status_bar.showMessage(f"Filter failed: {e}")
+            logger.error(f"Filter failed: {e}")
+            self.status_label.setText(f"Filter error: {e}")
 
     # =========================================================================
     # View Updates
     # =========================================================================
 
     def _update_all_views(self):
-        """Update all views."""
         self._update_data_views()
         self._update_spectrum_views()
 
     def _update_data_views(self):
-        """Update input and output data views."""
-        # Input views
-        time_slice = self.volume.time_slice(self.t_idx)
-        inline_slice = self.volume.inline_slice(self.y_idx)
+        """Update XX and TX data views."""
+        show_diff = self.diff_btn.isChecked()
 
-        self.input_time_view.setImage(time_slice.T, autoLevels=True)
-        self.input_inline_view.setImage(inline_slice.T, autoLevels=True)
+        # Get slices
+        input_xx = self.volume.time_slice(self.t_idx)
+        input_tx = self.volume.inline_slice(self.y_idx)
 
-        self._update_output_views()
+        if self.filtered_volume is not None and (self._show_filtered_data or show_diff):
+            filt_xx = self.filtered_volume.time_slice(self.t_idx)
+            filt_tx = self.filtered_volume.inline_slice(self.y_idx)
 
-    def _update_output_views(self):
-        """Update output data views."""
-        if self.filtered_volume is None:
-            return
-
-        time_slice_filt = self.filtered_volume.time_slice(self.t_idx)
-        inline_slice_filt = self.filtered_volume.inline_slice(self.y_idx)
-
-        if self._show_difference:
-            # Show difference (input - filtered = rejected noise)
-            time_slice_in = self.volume.time_slice(self.t_idx)
-            inline_slice_in = self.volume.inline_slice(self.y_idx)
-            time_slice_show = time_slice_in - time_slice_filt
-            inline_slice_show = inline_slice_in - inline_slice_filt
+            if show_diff:
+                # Show difference (rejected noise)
+                display_xx = input_xx - filt_xx
+                display_tx = input_tx - filt_tx
+            elif self._show_filtered_data:
+                display_xx = filt_xx
+                display_tx = filt_tx
+            else:
+                display_xx = input_xx
+                display_tx = input_tx
         else:
-            time_slice_show = time_slice_filt
-            inline_slice_show = inline_slice_filt
+            display_xx = input_xx
+            display_tx = input_tx
 
-        self.output_time_view.setImage(time_slice_show.T, autoLevels=True)
-        self.output_inline_view.setImage(inline_slice_show.T, autoLevels=True)
+        # Update views
+        self.xx_view.setData(display_xx, is_spectrum=False, xlabel='X', ylabel='Y')
+        self.tx_view.setData(display_tx, is_spectrum=False, xlabel='X', ylabel='Time')
 
     def _update_spectrum_views(self):
-        """Update FKK spectrum views with filter overlay."""
+        """Update KK and FK spectrum views."""
         if self.spectrum is None:
             return
 
-        # Kx-Ky slice at frequency f_idx
-        kxky_slice = self.spectrum[self.f_idx, :, :]
-        # Use log scale for display
-        kxky_log = np.log10(kxky_slice + 1e-10)
-        self.kxky_view.setImage(kxky_log.T, autoLevels=True)
-
-        # F-Kx slice at ky_idx
-        fkx_slice = self.spectrum[:, :, self.ky_idx]
-        fkx_log = np.log10(fkx_slice + 1e-10)
-        self.fkx_view.setImage(fkx_log.T, autoLevels=True)
-
-        # TODO: Add velocity cone overlay
-
-    def _update_status(self):
-        """Update status bar."""
-        status = self.processor.get_status() if hasattr(self.processor, 'get_status') else {}
-        gpu_name = status.get('device_name', 'Unknown')
-        mem_alloc = status.get('memory_allocated_mb')
-        mem_total = status.get('memory_total_mb')
-
-        if mem_alloc and mem_total:
-            status_text = f"GPU: {gpu_name} | Memory: {mem_alloc:.0f}/{mem_total:.0f} MB"
+        # Choose which spectrum to show
+        if self._show_filtered_spectrum and self.filtered_spectrum is not None:
+            spec = self.filtered_spectrum
         else:
-            status_text = f"Device: {gpu_name}"
+            spec = self.spectrum
 
-        self.status_bar.showMessage(status_text)
+        # Safe index bounds
+        f_idx = min(self.f_idx, spec.shape[0] - 1)
+        ky_idx = min(self.ky_idx, spec.shape[2] - 1)
+
+        # KK view (Kx-Ky at frequency) - pass raw amplitude, dB conversion in view
+        kk_slice = spec[f_idx, :, :]
+
+        # FK view (F-Kx at ky) - pass raw amplitude, dB conversion in view
+        fk_slice = spec[:, :, ky_idx]
+
+        # Pass raw amplitude data - SeismicImageView handles dB conversion
+        self.kk_view.setData(kk_slice, is_spectrum=True, xlabel='Kx', ylabel='Ky')
+        self.fk_view.setData(fk_slice, is_spectrum=True, xlabel='Kx', ylabel='Freq')
 
     # =========================================================================
     # Actions
     # =========================================================================
-
-    def _export_result(self):
-        """Export filtered result."""
-        if self.filtered_volume is None:
-            QMessageBox.warning(self, "No Result", "Apply filter first before exporting.")
-            return
-
-        from PyQt6.QtWidgets import QFileDialog
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export Filtered Volume", "", "NumPy (*.npy);;All Files (*)"
-        )
-        if path:
-            np.save(path, self.filtered_volume.data)
-            self.status_bar.showMessage(f"Exported to {path}", 5000)
 
     def _accept_result(self):
         """Accept and emit result."""
@@ -1017,15 +980,12 @@ class FKKDesignerDialog(QDialog):
             QMessageBox.warning(self, "No Result", "Failed to apply filter.")
 
     def get_filtered_volume(self) -> Optional[SeismicVolume]:
-        """Get the filtered volume result."""
         return self.filtered_volume
 
     def get_config(self) -> FKKConfig:
-        """Get current filter configuration."""
         return self.config.copy()
 
     def closeEvent(self, event):
-        """Clean up on close."""
         self._preview_timer.stop()
         if hasattr(self.processor, 'clear_cache'):
             self.processor.clear_cache()

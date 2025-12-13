@@ -96,6 +96,11 @@ class AppSettings:
             'gpu_memory_limit_percent': 70,   # Max GPU memory to use (%)
             'cpu_workers_auto': True,         # Auto-calculate CPU workers
             'cpu_workers': 4,                 # Manual CPU worker count
+            # Parallel processing memory settings
+            'parallel_memory_safety_factor': 70,    # % of available RAM considered safe
+            'parallel_memory_copies_estimate': 4,   # Estimated copies per gather (input + processed + noise + sort)
+            'parallel_warn_on_memory_risk': True,   # Show warning dialog if memory risk detected
+            'parallel_block_on_high_risk': True,    # Block execution if memory risk is critical (>90%)
         }
 
         # Current settings (loaded from file or defaults)
@@ -647,6 +652,61 @@ class AppSettings:
         """Get recommended CPU worker count based on system."""
         import multiprocessing
         return max(1, multiprocessing.cpu_count() - 1)
+
+    # =========================================================================
+    # Parallel Processing Memory Settings
+    # =========================================================================
+
+    def get_parallel_memory_safety_factor(self) -> int:
+        """Get memory safety factor (percentage of available RAM to use)."""
+        value = self._get('parallel_memory_safety_factor', 70)
+        try:
+            return max(30, min(90, int(value)))
+        except (TypeError, ValueError):
+            return 70
+
+    def set_parallel_memory_safety_factor(self, percent: int) -> None:
+        """Set memory safety factor (30-90%)."""
+        self._set('parallel_memory_safety_factor', max(30, min(90, percent)))
+
+    def get_parallel_memory_copies_estimate(self) -> int:
+        """
+        Get estimated number of data copies per gather during processing.
+
+        This accounts for:
+        - Input traces (1 copy)
+        - Processed traces (1 copy)
+        - Noise traces if enabled (1 copy)
+        - Sort buffer if sorting (1 copy)
+        - Processor internal copies (variable)
+        """
+        value = self._get('parallel_memory_copies_estimate', 4)
+        try:
+            return max(2, min(8, int(value)))
+        except (TypeError, ValueError):
+            return 4
+
+    def set_parallel_memory_copies_estimate(self, copies: int) -> None:
+        """Set estimated copies per gather (2-8)."""
+        self._set('parallel_memory_copies_estimate', max(2, min(8, copies)))
+
+    def get_parallel_warn_on_memory_risk(self) -> bool:
+        """Check if warning should be shown when memory risk is detected."""
+        value = self._get('parallel_warn_on_memory_risk', True)
+        return bool(value) if isinstance(value, bool) else str(value).lower() in ('true', '1', 'yes')
+
+    def set_parallel_warn_on_memory_risk(self, enabled: bool) -> None:
+        """Set whether to warn on memory risk."""
+        self._set('parallel_warn_on_memory_risk', enabled)
+
+    def get_parallel_block_on_high_risk(self) -> bool:
+        """Check if execution should be blocked when memory risk is high."""
+        value = self._get('parallel_block_on_high_risk', False)
+        return bool(value) if isinstance(value, bool) else str(value).lower() in ('true', '1', 'yes')
+
+    def set_parallel_block_on_high_risk(self, enabled: bool) -> None:
+        """Set whether to block execution on high memory risk."""
+        self._set('parallel_block_on_high_risk', enabled)
 
     def __repr__(self) -> str:
         datasets = self.get_loaded_datasets()

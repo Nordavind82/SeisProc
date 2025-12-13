@@ -8,7 +8,13 @@ Only header parquet files need merging after workers complete.
 
 from .partitioner import SmartPartitioner, Segment, PartitionConfig
 from .worker import import_segment, WorkerTask, WorkerResult
-from .coordinator import ParallelImportCoordinator, ImportConfig, ImportProgress, ImportResult
+from .coordinator import (
+    ParallelImportCoordinator,
+    ImportConfig,
+    ImportProgress,
+    ImportResult,
+    ImportStageResult
+)
 
 __all__ = [
     # Partitioner
@@ -24,4 +30,5 @@ __all__ = [
     'ImportConfig',
     'ImportProgress',
     'ImportResult',
+    'ImportStageResult',
 ]

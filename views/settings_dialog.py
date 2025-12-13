@@ -318,6 +318,77 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(workers_group)
 
+        # Parallel Processing Memory Group
+        memory_group = QGroupBox("Parallel Processing Memory Protection")
+        memory_layout = QVBoxLayout(memory_group)
+
+        # Info label
+        memory_info = QLabel(
+            "Memory protection prevents crashes when processing large gathers.\n"
+            "The system checks: workers × max_gather_size × copies < available_memory"
+        )
+        memory_info.setStyleSheet("color: gray; font-size: 10px;")
+        memory_layout.addWidget(memory_info)
+
+        memory_form = QFormLayout()
+
+        # Memory safety factor slider
+        safety_layout = QHBoxLayout()
+        self.memory_safety_slider = QSlider(Qt.Orientation.Horizontal)
+        self.memory_safety_slider.setRange(30, 90)
+        self.memory_safety_slider.setValue(70)
+        self.memory_safety_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.memory_safety_slider.setTickInterval(10)
+        self.memory_safety_slider.valueChanged.connect(self._on_memory_safety_changed)
+        self.memory_safety_slider.setToolTip(
+            "Percentage of available RAM considered safe for parallel processing.\n"
+            "Lower values are more conservative and less likely to cause crashes."
+        )
+        safety_layout.addWidget(self.memory_safety_slider)
+
+        self.memory_safety_label = QLabel("70%")
+        self.memory_safety_label.setMinimumWidth(40)
+        safety_layout.addWidget(self.memory_safety_label)
+
+        memory_form.addRow("Memory Safety Factor:", safety_layout)
+
+        # Copies estimate spinbox
+        self.copies_estimate_spin = QSpinBox()
+        self.copies_estimate_spin.setRange(2, 8)
+        self.copies_estimate_spin.setValue(4)
+        self.copies_estimate_spin.setToolTip(
+            "Estimated number of data copies per gather during processing:\n"
+            "• 2: Minimal (input + output only)\n"
+            "• 4: Standard (input + processed + noise + sort buffer)\n"
+            "• 6-8: Complex processors with multiple internal buffers"
+        )
+        memory_form.addRow("Memory Copies Estimate:", self.copies_estimate_spin)
+
+        memory_layout.addLayout(memory_form)
+
+        # Separator
+        separator = QFrame()
+        separator.setFrameShape(QFrame.Shape.HLine)
+        separator.setFrameShadow(QFrame.Shadow.Sunken)
+        memory_layout.addWidget(separator)
+
+        # Warning checkboxes
+        self.warn_memory_checkbox = QCheckBox("Warn before processing if memory risk detected")
+        self.warn_memory_checkbox.setToolTip(
+            "Show a warning dialog before starting parallel processing\n"
+            "if the estimated memory usage exceeds safe limits."
+        )
+        memory_layout.addWidget(self.warn_memory_checkbox)
+
+        self.block_high_risk_checkbox = QCheckBox("Block execution if memory risk is high (>90% estimated)")
+        self.block_high_risk_checkbox.setToolTip(
+            "Prevent parallel processing from starting if the estimated\n"
+            "memory usage would exceed 90% of available RAM."
+        )
+        memory_layout.addWidget(self.block_high_risk_checkbox)
+
+        layout.addWidget(memory_group)
+
         # Update recommended labels
         self._update_recommended_labels()
 
@@ -366,6 +437,10 @@ class SettingsDialog(QDialog):
     def _on_memory_slider_changed(self, value):
         """Update memory limit label."""
         self.gpu_memory_label.setText(f"{value}%")
+
+    def _on_memory_safety_changed(self, value):
+        """Update memory safety factor label."""
+        self.memory_safety_label.setText(f"{value}%")
 
     def _on_gpu_workers_auto_changed(self, state):
         """Handle GPU workers auto checkbox change."""
@@ -497,6 +572,13 @@ class SettingsDialog(QDialog):
         self.gpu_memory_slider.setEnabled(gpu_enabled)
         self.gpu_workers_auto_checkbox.setEnabled(gpu_enabled)
 
+        # Parallel processing memory settings
+        self.memory_safety_slider.setValue(self.app_settings.get_parallel_memory_safety_factor())
+        self.memory_safety_label.setText(f"{self.memory_safety_slider.value()}%")
+        self.copies_estimate_spin.setValue(self.app_settings.get_parallel_memory_copies_estimate())
+        self.warn_memory_checkbox.setChecked(self.app_settings.get_parallel_warn_on_memory_risk())
+        self.block_high_risk_checkbox.setChecked(self.app_settings.get_parallel_block_on_high_risk())
+
         # Session settings
         self.auto_load_checkbox.setChecked(self.app_settings.get_auto_load_last_dataset())
         self.remember_window_checkbox.setChecked(self.app_settings.get_remember_window_geometry())
@@ -553,6 +635,12 @@ class SettingsDialog(QDialog):
 
         self.app_settings.set_cpu_workers_auto(self.cpu_workers_auto_checkbox.isChecked())
         self.app_settings.set_cpu_workers(self.cpu_workers_spin.value())
+
+        # Parallel processing memory settings
+        self.app_settings.set_parallel_memory_safety_factor(self.memory_safety_slider.value())
+        self.app_settings.set_parallel_memory_copies_estimate(self.copies_estimate_spin.value())
+        self.app_settings.set_parallel_warn_on_memory_risk(self.warn_memory_checkbox.isChecked())
+        self.app_settings.set_parallel_block_on_high_risk(self.block_high_risk_checkbox.isChecked())
 
         # Session settings
         self.app_settings.set_auto_load_last_dataset(self.auto_load_checkbox.isChecked())
