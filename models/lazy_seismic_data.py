@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 import json
 
+from utils.parquet_io import read_parquet
+
 
 class LazySeismicData:
     """
@@ -59,9 +61,10 @@ class LazySeismicData:
         self._zarr_array = zarr.open_array(str(self.zarr_path), mode='r')
 
         # Cache ensemble index if available (small, can keep in memory)
+        # Using Polars for faster loading when available
         self._ensemble_index = None
         if ensemble_index_path and ensemble_index_path.exists():
-            self._ensemble_index = pd.read_parquet(ensemble_index_path)
+            self._ensemble_index = read_parquet(ensemble_index_path)
 
         # Store metadata for quick access
         self._n_samples = int(metadata.get('n_samples', self._zarr_array.shape[0]))
@@ -315,7 +318,7 @@ class LazySeismicData:
         if self.headers_path is None:
             raise ValueError("Headers not available for this dataset")
 
-        # Load headers from Parquet with filtering
+        # Load headers from Parquet with filtering (using Polars for speed)
         if trace_indices is not None and len(trace_indices) > 0:
             # Convert to list for filtering
             trace_list = trace_indices.tolist() if isinstance(trace_indices, np.ndarray) else list(trace_indices)
@@ -323,18 +326,18 @@ class LazySeismicData:
             try:
                 # Try Parquet filtering for efficiency
                 # This loads only relevant row groups instead of entire file
-                df = pd.read_parquet(
+                df = read_parquet(
                     self.headers_path,
                     filters=[('trace_index', 'in', trace_list)]
                 )
             except (ValueError, KeyError):
                 # Fallback: load all and filter (if trace_index column doesn't exist or filtering fails)
-                df = pd.read_parquet(self.headers_path)
+                df = read_parquet(self.headers_path)
                 if 'trace_index' in df.columns:
                     df = df[df['trace_index'].isin(trace_list)]
         else:
             # Load all headers (use with caution)
-            df = pd.read_parquet(self.headers_path)
+            df = read_parquet(self.headers_path)
 
         return df
 

@@ -23,6 +23,7 @@ import multiprocessing as mp
 
 from .partitioner import SmartPartitioner, PartitionConfig, Segment, get_ensemble_byte_location
 from .worker import WorkerTask, WorkerResult, import_segment
+from utils.parquet_io import read_parquet, read_parquet_schema
 
 
 @dataclass
@@ -360,7 +361,7 @@ class ParallelImportCoordinator:
         all_dfs = []
         for i, result in enumerate(sorted_results):
             if result.headers_path and Path(result.headers_path).exists():
-                df = pd.read_parquet(result.headers_path)
+                df = read_parquet(result.headers_path)
                 all_dfs.append(df)
                 print(f"      Segment {result.segment_id}: {len(df):,} headers")
 
@@ -413,16 +414,16 @@ class ParallelImportCoordinator:
         output_dir = stage_result.output_dir
         n_traces = stage_result.n_traces
 
-        # Only load the columns we need
+        # Only load the columns we need (using Polars for speed)
         if self.config.ensemble_key:
             try:
-                headers_df = pd.read_parquet(headers_path, columns=[self.config.ensemble_key])
+                headers_df = read_parquet(headers_path, columns=[self.config.ensemble_key])
                 has_key = self.config.ensemble_key in headers_df.columns
             except Exception:
-                headers_df = pd.read_parquet(headers_path)
+                headers_df = read_parquet(headers_path)
                 has_key = self.config.ensemble_key in headers_df.columns
         else:
-            headers_df = pd.read_parquet(headers_path, columns=[])
+            headers_df = read_parquet(headers_path, columns=[])
             has_key = False
 
         # If no ensemble key, create single-ensemble index
@@ -813,7 +814,7 @@ class ParallelImportCoordinator:
         all_dfs = []
         for result in sorted_results:
             if result.headers_path and Path(result.headers_path).exists():
-                df = pd.read_parquet(result.headers_path)
+                df = read_parquet(result.headers_path)
                 all_dfs.append(df)
                 print(f"      Segment {result.segment_id}: {len(df):,} headers")
 
@@ -870,21 +871,21 @@ class ParallelImportCoordinator:
         and parallel processing. Always creates an index even if no key is specified
         (treats entire dataset as single ensemble).
         """
-        # Only load the columns we need to minimize memory usage
+        # Only load the columns we need to minimize memory usage (using Polars for speed)
         if self.config.ensemble_key:
             # Try to load only the ensemble key column
             try:
-                headers_df = pd.read_parquet(headers_path, columns=[self.config.ensemble_key])
+                headers_df = read_parquet(headers_path, columns=[self.config.ensemble_key])
                 n_traces = len(headers_df)
                 has_key = self.config.ensemble_key in headers_df.columns
             except Exception:
                 # Fall back to loading full file if column doesn't exist
-                headers_df = pd.read_parquet(headers_path)
+                headers_df = read_parquet(headers_path)
                 n_traces = len(headers_df)
                 has_key = self.config.ensemble_key in headers_df.columns
         else:
             # Just need count, load minimal data
-            headers_df = pd.read_parquet(headers_path, columns=[])
+            headers_df = read_parquet(headers_path, columns=[])
             n_traces = len(headers_df)
             has_key = False
 

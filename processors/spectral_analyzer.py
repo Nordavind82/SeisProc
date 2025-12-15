@@ -69,8 +69,8 @@ class SpectralAnalyzer:
         # Compute spectrum for first trace to get frequency array
         frequencies = rfftfreq(n_samples, d=self.sample_rate_ms / 1000.0)
 
-        # Accumulate amplitudes
-        sum_amplitudes = np.zeros(len(frequencies))
+        # Accumulate amplitudes (float32 for memory efficiency)
+        sum_amplitudes = np.zeros(len(frequencies), dtype=np.float32)
 
         for i in range(n_traces):
             spectrum = rfft(traces[:, i])
@@ -129,8 +129,8 @@ class SpectralAnalyzer:
         # Compute spectrum for first trace to get frequency array
         frequencies = rfftfreq(n_samples, d=self.sample_rate_ms / 1000.0)
 
-        # Accumulate complex spectra for proper phase averaging
-        sum_spectrum = np.zeros(len(frequencies), dtype=complex)
+        # Accumulate complex spectra for proper phase averaging (complex64 for memory efficiency)
+        sum_spectrum = np.zeros(len(frequencies), dtype=np.complex64)
 
         for i in range(n_traces):
             spectrum = rfft(traces[:, i])

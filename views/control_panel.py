@@ -64,23 +64,62 @@ class ControlPanel(QWidget):
         super().__init__(parent)
         self.nyquist_freq = nyquist_freq
 
-        # Initialize GPU device manager if available
+        # Initialize GPU availability check
+        # CRITICAL: Do NOT fully initialize CUDA here until user requests it!
+        # get_device_manager() creates a CUDA context. If this happens before
+        # multiprocessing fork, workers inherit a broken CUDA context.
+        #
+        # Strategy: Use lightweight check initially (torch.cuda.is_available),
+        # then lazily initialize full DeviceManager only when user starts
+        # interactive GPU processing (single-trace preview).
+        # For batch processing, workers create their own DeviceManager after fork.
+        self._device_manager = None  # Lazy initialization
+        self._cuda_initialized_for_interactive = False
+        self.gpu_available = False
         if GPU_AVAILABLE:
             try:
-                self.device_manager = get_device_manager()
-                self.gpu_available = self.device_manager.is_gpu_available()
+                import torch
+                # Lightweight check - just queries CUDA driver, doesn't create full context
+                self.gpu_available = torch.cuda.is_available()
             except Exception as e:
-                print(f"Warning: GPU initialization failed: {e}")
-                self.device_manager = None
+                print(f"Warning: GPU check failed: {e}")
                 self.gpu_available = False
-        else:
-            self.device_manager = None
-            self.gpu_available = False
 
         # Initialize FK config manager
         self.fk_config_manager = FKConfigManager()
 
         self._init_ui()
+
+    @property
+    def device_manager(self):
+        """
+        Lazily initialize and return the DeviceManager.
+
+        WARNING: This initializes CUDA! Only call this when you need to actually
+        use GPU for processing. Don't call before batch processing that uses fork.
+        """
+        if self._device_manager is None and self.gpu_available:
+            try:
+                self._device_manager = get_device_manager()
+                self._cuda_initialized_for_interactive = True
+            except Exception as e:
+                print(f"Warning: GPU initialization failed: {e}")
+                self.gpu_available = False
+        return self._device_manager
+
+    def _get_gpu_name_for_ui(self) -> str:
+        """
+        Get GPU name for UI display without initializing full CUDA context.
+
+        Uses cached name if available, otherwise returns generic text.
+        """
+        if self._device_manager is not None:
+            return self._device_manager.get_device_name()
+        elif self.gpu_available:
+            # GPU available but not yet initialized - use generic text
+            return "CUDA GPU"
+        else:
+            return "CPU"
 
     def _init_ui(self):
         """Initialize user interface."""
@@ -201,9 +240,9 @@ class ControlPanel(QWidget):
             self.gpu_checkbox.stateChanged.connect(self._on_gpu_checkbox_changed)
             gpu_layout.addWidget(self.gpu_checkbox)
 
-            # GPU status label
+            # GPU status label (use safe method that doesn't initialize CUDA)
             if self.gpu_available:
-                gpu_name = self.device_manager.get_device_name()
+                gpu_name = self._get_gpu_name_for_ui()
                 status_text = f"🟢 {gpu_name}"
             else:
                 status_text = "🟡 GPU not available"
@@ -2411,7 +2450,7 @@ class ControlPanel(QWidget):
         """Handle GPU checkbox state change."""
         if self.gpu_status_label is not None:
             if state == Qt.CheckState.Checked.value:
-                gpu_name = self.device_manager.get_device_name()
+                gpu_name = self._get_gpu_name_for_ui()
                 self.gpu_status_label.setText(f"🟢 {gpu_name} (Enabled)")
             else:
                 self.gpu_status_label.setText(f"🟡 GPU Disabled (Using CPU)")
@@ -2523,7 +2562,7 @@ class ControlPanel(QWidget):
                         low_amp_protection=low_amp_protection,
                         device_manager=self.device_manager
                     )
-                    print(f"✓ Using GPU Stockwell (S-Transform): {self.device_manager.get_device_name()}")
+                    print(f"✓ Using GPU Stockwell (S-Transform): {self._get_gpu_name_for_ui()}")
                 else:
                     # Use CPU Stockwell processor
                     processor = StockwellDenoise(
@@ -2573,7 +2612,7 @@ class ControlPanel(QWidget):
                         low_amp_protection=low_amp_protection,
                         device_manager=self.device_manager
                     )
-                    print(f"✓ Using GPU STFT Denoise: {self.device_manager.get_device_name()}")
+                    print(f"✓ Using GPU STFT Denoise: {self._get_gpu_name_for_ui()}")
                 else:
                     # Use CPU STFT processor
                     processor = STFTDenoise(

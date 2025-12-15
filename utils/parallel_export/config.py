@@ -27,11 +27,12 @@ class ExportHeaderMapping:
 @dataclass
 class ExportConfig:
     """Configuration for parallel SEG-Y export."""
-    original_segy_path: str      # Original SEG-Y file (for spec/template)
     processed_zarr_path: str     # Processed traces.zarr path
     headers_parquet_path: str    # Headers parquet path
     output_path: str             # Final output SEG-Y path
     temp_dir: str               # Directory for segment files
+    # Optional original SEG-Y (for text/binary header template only)
+    original_segy_path: Optional[str] = None
     n_workers: Optional[int] = None  # Auto-detect if None
     chunk_size: int = 10000     # Traces per write operation
     # Export type: 'processed' or 'noise' (input - processed)
@@ -52,7 +53,6 @@ class ExportConfig:
 class ExportTask:
     """Task definition for an export worker process."""
     segment_id: int
-    original_segy_path: str       # Original SEG-Y for spec
     processed_zarr_path: str      # Source trace data
     output_segment_path: str      # Output file for this segment
     header_arrays_path: str       # Path to pickled header arrays
@@ -62,6 +62,8 @@ class ExportTask:
     sample_interval: int          # Sample interval in microseconds
     data_format: int              # SEG-Y data format code
     is_first_segment: bool = False  # First segment includes text/binary headers
+    # Optional original SEG-Y (for text/binary header template)
+    original_segy_path: Optional[str] = None
     # Export type and noise calculation
     export_type: str = 'processed'         # 'processed' or 'noise'
     input_zarr_path: Optional[str] = None  # Required for noise export

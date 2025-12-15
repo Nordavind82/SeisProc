@@ -58,7 +58,16 @@ class DeviceManager:
         # If specific device requested, try to use it
         if self.prefer_device != 'auto':
             if self.prefer_device == 'cuda' and torch.cuda.is_available():
-                return torch.device('cuda')
+                # Verify CUDA actually works (may fail in forked subprocess)
+                try:
+                    torch.cuda.current_device()
+                    return torch.device('cuda')
+                except RuntimeError as e:
+                    warnings.warn(
+                        f"CUDA requested but initialization failed "
+                        f"(forked process?): {e}. Falling back to CPU."
+                    )
+                    return torch.device('cpu')
             elif self.prefer_device == 'mps' and torch.backends.mps.is_available():
                 return torch.device('mps')
             elif self.prefer_device == 'cpu':
@@ -71,7 +80,16 @@ class DeviceManager:
 
         # Auto-detect: CUDA > MPS > CPU
         if torch.cuda.is_available():
-            return torch.device('cuda')
+            # Verify CUDA actually works (may fail in forked subprocess)
+            try:
+                torch.cuda.current_device()  # This will fail if CUDA context is broken
+                return torch.device('cuda')
+            except RuntimeError as e:
+                warnings.warn(
+                    f"CUDA reported available but initialization failed "
+                    f"(forked process?): {e}. Falling back to CPU."
+                )
+                return torch.device('cpu')
         elif torch.backends.mps.is_available():
             return torch.device('mps')
         else:
@@ -94,13 +112,22 @@ class DeviceManager:
         }
 
         if self.device.type == 'cuda':
-            info['name'] = torch.cuda.get_device_name(0)
-            info['memory_total'] = torch.cuda.get_device_properties(0).total_memory
-            info['memory_available'] = (
-                info['memory_total'] - torch.cuda.memory_allocated(0)
-            )
-            info['compute_capability'] = torch.cuda.get_device_capability(0)
-            info['cuda_version'] = torch.version.cuda
+            try:
+                info['name'] = torch.cuda.get_device_name(0)
+                info['memory_total'] = torch.cuda.get_device_properties(0).total_memory
+                info['memory_available'] = (
+                    info['memory_total'] - torch.cuda.memory_allocated(0)
+                )
+                info['compute_capability'] = torch.cuda.get_device_capability(0)
+                info['cuda_version'] = torch.version.cuda
+            except RuntimeError as e:
+                # CUDA context broken (e.g., in forked subprocess)
+                # Fall back to CPU-like info
+                logging.getLogger(__name__).warning(
+                    f"CUDA info unavailable (forked process?): {e}"
+                )
+                info['name'] = 'CUDA (unavailable in subprocess)'
+                info['cuda_error'] = str(e)
 
         elif self.device.type == 'mps':
             info['name'] = 'Apple Silicon (Metal Performance Shaders)'
@@ -130,14 +157,23 @@ class DeviceManager:
             Dictionary with memory statistics (bytes)
         """
         if self.device.type == 'cuda':
-            return {
-                'allocated': torch.cuda.memory_allocated(0),
-                'reserved': torch.cuda.memory_reserved(0),
-                'total': self.device_info['memory_total'],
-                'available': (
-                    self.device_info['memory_total'] - torch.cuda.memory_allocated(0)
-                ),
-            }
+            try:
+                return {
+                    'allocated': torch.cuda.memory_allocated(0),
+                    'reserved': torch.cuda.memory_reserved(0),
+                    'total': self.device_info['memory_total'],
+                    'available': (
+                        self.device_info['memory_total'] - torch.cuda.memory_allocated(0)
+                    ),
+                }
+            except RuntimeError:
+                # CUDA context broken - return empty info
+                return {
+                    'allocated': None,
+                    'reserved': None,
+                    'total': None,
+                    'available': None,
+                }
         elif self.device.type == 'mps':
             # MPS doesn't provide detailed memory stats
             return {
@@ -218,8 +254,12 @@ class DeviceManager:
     def clear_cache(self):
         """Clear GPU memory cache."""
         if self.device.type == 'cuda':
-            torch.cuda.empty_cache()
-            self.logger.debug("CUDA cache cleared")
+            try:
+                torch.cuda.empty_cache()
+                self.logger.debug("CUDA cache cleared")
+            except RuntimeError:
+                # CUDA context broken - skip cache clearing
+                pass
         elif self.device.type == 'mps':
             # MPS doesn't have explicit cache clearing
             # But we can trigger garbage collection
@@ -230,7 +270,11 @@ class DeviceManager:
     def synchronize(self):
         """Synchronize GPU operations (wait for all kernels to complete)."""
         if self.device.type == 'cuda':
-            torch.cuda.synchronize()
+            try:
+                torch.cuda.synchronize()
+            except RuntimeError:
+                # CUDA context broken - skip synchronization
+                pass
         elif self.device.type == 'mps':
             # MPS synchronization
             torch.mps.synchronize()
@@ -275,12 +319,15 @@ class DeviceManager:
         """
         if self.device.type == 'cuda':
             mem_info = self.get_memory_info()
-            mem_used_gb = mem_info['allocated'] / (1024**3)
-            mem_total_gb = mem_info['total'] / (1024**3)
-            return (
-                f"🟢 GPU Active: {self.get_device_name()} "
-                f"({mem_used_gb:.1f} / {mem_total_gb:.1f} GB)"
-            )
+            if mem_info['allocated'] is not None and mem_info['total'] is not None:
+                mem_used_gb = mem_info['allocated'] / (1024**3)
+                mem_total_gb = mem_info['total'] / (1024**3)
+                return (
+                    f"🟢 GPU Active: {self.get_device_name()} "
+                    f"({mem_used_gb:.1f} / {mem_total_gb:.1f} GB)"
+                )
+            else:
+                return f"🟡 GPU: {self.get_device_name()} (memory info unavailable)"
         elif self.device.type == 'mps':
             return f"🟢 GPU Active: {self.get_device_name()}"
         else:
@@ -337,3 +384,21 @@ def get_device_manager(
         )
 
     return _global_device_manager
+
+
+def reset_device_manager():
+    """
+    Reset the global device manager singleton.
+
+    IMPORTANT: Call this before forking worker processes!
+
+    When using multiprocessing with 'fork' context, the global _global_device_manager
+    is inherited by child processes. If CUDA was initialized in the parent (e.g., by
+    the UI checking GPU availability), the inherited DeviceManager has a broken CUDA
+    context. Resetting it before fork ensures child processes create their own fresh
+    DeviceManager with valid CUDA context.
+
+    This is not needed with 'spawn' context since spawn creates fresh processes.
+    """
+    global _global_device_manager
+    _global_device_manager = None

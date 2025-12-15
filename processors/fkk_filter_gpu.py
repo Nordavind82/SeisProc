@@ -756,11 +756,276 @@ class FKKFilterCPU:
 
 def get_fkk_filter(prefer_gpu: bool = True):
     """Get appropriate FKK filter based on hardware availability."""
+    import os
+    pid = os.getpid()
+
     if prefer_gpu:
         try:
+            # In forked workers, CUDA runtime may be in invalid state
+            # Try to reset/reinitialize CUDA before checking availability
+            cuda_available_pre = torch.cuda.is_available()
+            logger.info(f"[PID {pid}] get_fkk_filter: torch.cuda.is_available() = {cuda_available_pre}")
+
+            if cuda_available_pre:
+                # Try a simple CUDA operation to verify the context is valid
+                try:
+                    test_tensor = torch.zeros(1, device='cuda')
+                    del test_tensor
+                    torch.cuda.empty_cache()
+                    logger.info(f"[PID {pid}] get_fkk_filter: CUDA context test PASSED")
+                except Exception as cuda_test_e:
+                    logger.warning(f"[PID {pid}] get_fkk_filter: CUDA context test FAILED: {cuda_test_e}")
+                    # CUDA context is broken, force CPU fallback
+                    return FKKFilterCPU()
+
             device_manager = get_device_manager()
+            logger.info(f"[PID {pid}] get_fkk_filter: device_manager.device = {device_manager.device}")
+
             if device_manager.is_gpu_available():
+                logger.info(f"[PID {pid}] get_fkk_filter: Creating FKKFilterGPU")
                 return FKKFilterGPU(device_manager)
+            else:
+                logger.info(f"[PID {pid}] get_fkk_filter: GPU not available, using CPU")
         except Exception as e:
-            logger.warning(f"GPU init failed, using CPU: {e}")
+            logger.warning(f"[PID {pid}] get_fkk_filter: GPU init failed, using CPU: {e}")
+
+    logger.info(f"[PID {pid}] get_fkk_filter: Creating FKKFilterCPU")
     return FKKFilterCPU()
+
+
+# =============================================================================
+# BaseProcessor Wrapper for Parallel Batch Processing
+# =============================================================================
+
+from processors.base_processor import BaseProcessor
+from models.seismic_data import SeismicData
+from utils.volume_builder import build_volume_from_gathers, extract_traces_from_volume
+
+
+class FKKProcessor(BaseProcessor):
+    """
+    FKK Filter as BaseProcessor for parallel batch processing.
+
+    Wraps FKKFilterGPU/CPU to work with the standard processor interface:
+    - Takes SeismicData (2D gather) as input
+    - Builds 3D volume internally using stored geometry params
+    - Applies FKK filter
+    - Extracts traces back to 2D
+    - Returns SeismicData
+
+    Requires headers_df to be attached to input SeismicData metadata.
+    """
+
+    def __init__(
+        self,
+        # FKK config params
+        v_min: float = 50.0,
+        v_max: float = 1000.0,
+        filter_mode: str = 'reject',  # Called filter_mode here, maps to 'mode' in FKKConfig
+        apply_agc: bool = True,
+        agc_window_ms: float = 500.0,
+        edge_method: str = 'pad_copy',
+        pad_traces_x: int = 0,
+        pad_traces_y: int = 0,
+        padding_factor: float = 1.0,
+        # Volume build params
+        inline_key: str = 'crossline',
+        xline_key: str = 'inline',
+        dx: float = 12.5,
+        dy: float = 25.0,
+        coordinate_units: str = 'meters',
+        coord_scalar: float = 1.0,
+        # GPU preference
+        prefer_gpu: bool = True
+    ):
+        """
+        Initialize FKK processor for batch processing.
+
+        Args:
+            v_min: Minimum velocity (m/s) for filter cone
+            v_max: Maximum velocity (m/s) for filter cone
+            filter_mode: 'reject' or 'pass' (maps to 'mode' in FKKConfig)
+            apply_agc: Apply AGC before filtering
+            agc_window_ms: AGC window in milliseconds
+            edge_method: Edge handling ('pad_copy', 'taper', 'none')
+            pad_traces_x: Manual X padding (0=auto)
+            pad_traces_y: Manual Y padding (0=auto)
+            padding_factor: FFT padding factor
+            inline_key: Header key for inline axis
+            xline_key: Header key for crossline axis
+            dx: Inline spacing in meters
+            dy: Crossline spacing in meters
+            coordinate_units: 'meters' or 'feet'
+            coord_scalar: Coordinate scalar from SEG-Y
+            prefer_gpu: Use GPU if available
+        """
+        # Store all params (use 'mode' internally to match FKKConfig)
+        self.v_min = v_min
+        self.v_max = v_max
+        self.mode = filter_mode  # Store as 'mode' to match FKKConfig
+        self.apply_agc = apply_agc
+        self.agc_window_ms = agc_window_ms
+        self.edge_method = edge_method
+        self.pad_traces_x = pad_traces_x
+        self.pad_traces_y = pad_traces_y
+        self.padding_factor = padding_factor
+        self.inline_key = inline_key
+        self.xline_key = xline_key
+        self.dx = dx
+        self.dy = dy
+        self.coordinate_units = coordinate_units
+        self.coord_scalar = coord_scalar
+        self.prefer_gpu = prefer_gpu
+
+        # Initialize parent with all params for serialization
+        super().__init__(
+            v_min=v_min, v_max=v_max, filter_mode=filter_mode,
+            apply_agc=apply_agc, agc_window_ms=agc_window_ms,
+            edge_method=edge_method, pad_traces_x=pad_traces_x,
+            pad_traces_y=pad_traces_y, padding_factor=padding_factor,
+            inline_key=inline_key, xline_key=xline_key,
+            dx=dx, dy=dy, coordinate_units=coordinate_units,
+            coord_scalar=coord_scalar, prefer_gpu=prefer_gpu
+        )
+
+        # Create filter instance (lazy - will be created in worker)
+        self._filter = None
+
+    def _validate_params(self):
+        """Validate processor parameters."""
+        if self.v_min <= 0:
+            raise ValueError("v_min must be positive")
+        if self.v_max <= self.v_min:
+            raise ValueError("v_max must be greater than v_min")
+        if self.dx <= 0 or self.dy <= 0:
+            raise ValueError("dx and dy must be positive")
+
+    def _get_filter(self):
+        """Get or create FKK filter instance."""
+        if self._filter is None:
+            self._filter = get_fkk_filter(prefer_gpu=self.prefer_gpu)
+        return self._filter
+
+    def _get_cpu_filter(self):
+        """Get CPU filter for fallback."""
+        return FKKFilterCPU()
+
+    def _get_fkk_config(self) -> FKKConfig:
+        """Create FKKConfig from stored parameters."""
+        return FKKConfig(
+            v_min=self.v_min,
+            v_max=self.v_max,
+            mode=self.mode,  # FKKConfig uses 'mode'
+            apply_agc=self.apply_agc,
+            agc_window_ms=self.agc_window_ms,
+            edge_method=self.edge_method,
+            pad_traces_x=self.pad_traces_x,
+            pad_traces_y=self.pad_traces_y,
+            padding_factor=self.padding_factor
+        )
+
+    def process(self, data: SeismicData) -> SeismicData:
+        """
+        Process gather with FKK filter.
+
+        Args:
+            data: Input SeismicData with traces and headers in metadata
+
+        Returns:
+            Filtered SeismicData
+        """
+        import pandas as pd
+
+        # Get headers from metadata (must be set by caller)
+        headers_df = data.metadata.get('headers_df')
+        if headers_df is None:
+            # Try to process without volume (fallback - just return input)
+            logger.warning("FKKProcessor: No headers_df in metadata, cannot build volume")
+            return data
+
+        if isinstance(headers_df, dict):
+            headers_df = pd.DataFrame(headers_df)
+
+        traces = data.traces
+        n_traces = traces.shape[1]
+
+        # Ensure headers match traces
+        if len(headers_df) != n_traces:
+            logger.warning(f"FKKProcessor: Header count ({len(headers_df)}) != trace count ({n_traces})")
+            if len(headers_df) > n_traces:
+                headers_df = headers_df.iloc[:n_traces]
+
+        # Build 3D volume from gather
+        try:
+            volume, geometry = build_volume_from_gathers(
+                traces_data=traces,
+                headers_df=headers_df,
+                inline_key=self.inline_key,
+                xline_key=self.xline_key,
+                sample_rate_ms=data.sample_rate,
+                coordinate_units=self.coordinate_units,
+                dx=self.dx,
+                dy=self.dy,
+                coord_scalar=self.coord_scalar
+            )
+        except Exception as e:
+            logger.error(f"FKKProcessor: Failed to build volume: {e}")
+            return data
+
+        # Apply FKK filter with CUDA error recovery
+        fkk_filter = self._get_filter()
+        config = self._get_fkk_config()
+
+        try:
+            filtered_volume = fkk_filter.apply_filter(volume, config)
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+            # Handle CUDA errors - fall back to CPU
+            error_msg = str(e).lower()
+            is_cuda_error = (
+                isinstance(e, torch.cuda.OutOfMemoryError) or
+                'cuda' in error_msg or
+                'out of memory' in error_msg or
+                'device' in error_msg
+            )
+            if is_cuda_error:
+                logger.warning(f"FKKProcessor: GPU failed ({e}), falling back to CPU")
+                try:
+                    # Clear GPU cache and use CPU filter
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    cpu_filter = self._get_cpu_filter()
+                    filtered_volume = cpu_filter.apply_filter(volume, config)
+                except Exception as cpu_e:
+                    logger.error(f"FKKProcessor: CPU fallback also failed: {cpu_e}")
+                    return data
+            else:
+                logger.error(f"FKKProcessor: Filter failed: {e}")
+                return data
+        except Exception as e:
+            logger.error(f"FKKProcessor: Filter failed: {e}")
+            return data
+
+        # Extract traces back to 2D
+        try:
+            filtered_traces = extract_traces_from_volume(
+                filtered_volume,
+                headers_df,
+                self.inline_key,
+                self.xline_key
+            )
+        except Exception as e:
+            logger.error(f"FKKProcessor: Failed to extract traces: {e}")
+            return data
+
+        # Return filtered data
+        return SeismicData(
+            traces=filtered_traces,
+            sample_rate=data.sample_rate,
+            metadata={**data.metadata, 'fkk_filtered': True}
+        )
+
+    def get_description(self) -> str:
+        """Get human-readable description."""
+        mode_str = "Reject" if self.mode == 'reject' else "Pass"
+        agc = f", AGC({self.agc_window_ms:.0f}ms)" if self.apply_agc else ""
+        return f"FKK Filter: {mode_str} {self.v_min:.0f}-{self.v_max:.0f} m/s{agc}"

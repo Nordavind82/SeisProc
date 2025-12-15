@@ -126,6 +126,81 @@ def get_adaptive_chunk_size(n_samples: int, n_workers: int = 4) -> int:
     return max(100, min(5000, chunk_size))
 
 
+def _create_default_text_header(n_samples: int, sample_interval: int) -> bytes:
+    """
+    Create a default EBCDIC text header for SEG-Y export.
+
+    Args:
+        n_samples: Number of samples per trace
+        sample_interval: Sample interval in microseconds
+
+    Returns:
+        3200-byte EBCDIC text header
+    """
+    from datetime import datetime
+
+    sample_rate_ms = sample_interval / 1000.0
+    record_length_ms = (n_samples - 1) * sample_rate_ms
+
+    lines = [
+        "C 1 CLIENT: SEISPROC PROCESSED DATA",
+        "C 2 LINE:",
+        "C 3 AREA:",
+        f"C 4 PROCESSED: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "C 5",
+        f"C 6 RECORD LENGTH: {record_length_ms:.0f} MS",
+        f"C 7 SAMPLE INTERVAL: {sample_rate_ms:.2f} MS",
+        f"C 8 SAMPLES PER TRACE: {n_samples}",
+        "C 9 DATA FORMAT: IEEE FLOAT",
+        "C10",
+        "C11 PROCESSING HISTORY:",
+        "C12 - EXPORTED FROM SEISPROC INTERNAL FORMAT",
+        "C13",
+        "C14",
+        "C15",
+        "C16",
+        "C17",
+        "C18",
+        "C19",
+        "C20",
+        "C21",
+        "C22",
+        "C23",
+        "C24",
+        "C25",
+        "C26",
+        "C27",
+        "C28",
+        "C29",
+        "C30",
+        "C31",
+        "C32",
+        "C33",
+        "C34",
+        "C35",
+        "C36",
+        "C37",
+        "C38",
+        "C39",
+        "C40 END EBCDIC HEADER",
+    ]
+
+    # Pad each line to 80 characters
+    text = ""
+    for line in lines:
+        text += line.ljust(80)[:80]
+
+    # Convert to EBCDIC
+    # segyio expects bytes in EBCDIC encoding
+    try:
+        ebcdic_text = text.encode('cp500')  # EBCDIC encoding
+    except Exception:
+        # Fallback: just use ASCII bytes (some readers handle it)
+        ebcdic_text = text.encode('ascii')
+
+    return ebcdic_text
+
+
 def export_trace_range(
     task: ExportTask,
     progress_queue: Optional[Queue] = None
@@ -189,18 +264,44 @@ def export_trace_range(
         spec.format = task.data_format
         spec.tracecount = n_traces
 
+        # Build byte position to TraceField lookup table (once per worker)
+        # segyio.TraceField is a class with attributes, not an iterable enum
+        byte_pos_to_field = {}
+        for attr_name in dir(segyio.TraceField):
+            if not attr_name.startswith('_'):
+                try:
+                    byte_pos = getattr(segyio.TraceField, attr_name)
+                    if isinstance(byte_pos, int):
+                        byte_pos_to_field[byte_pos] = attr_name
+                except Exception:
+                    pass
+
         # Create segment file
         with segyio.create(task.output_segment_path, spec) as dst:
-            # For first segment only: copy text/binary headers from original
+            # For first segment only: set up text/binary headers
             if task.is_first_segment:
-                with segyio.open(task.original_segy_path, 'r', ignore_geometry=True) as src:
-                    # Copy text header
-                    dst.text[0] = src.text[0]
-                    # Copy binary header
-                    dst.bin = src.bin
-                    # Update sample count in case it differs
-                    dst.bin[segyio.BinField.Samples] = task.n_samples
-                    dst.bin[segyio.BinField.Interval] = task.sample_interval
+                if task.original_segy_path and Path(task.original_segy_path).exists():
+                    # Copy headers from original SEG-Y if available
+                    with segyio.open(task.original_segy_path, 'r', ignore_geometry=True) as src:
+                        dst.text[0] = src.text[0]
+                        dst.bin = src.bin
+                else:
+                    # Generate default EBCDIC text header
+                    text_header = _create_default_text_header(task.n_samples, task.sample_interval)
+                    dst.text[0] = text_header
+                    # Set binary header fields
+                    dst.bin[segyio.BinField.JobID] = 1
+                    dst.bin[segyio.BinField.LineNumber] = 1
+                    dst.bin[segyio.BinField.ReelNumber] = 1
+                    dst.bin[segyio.BinField.Traces] = 1
+                    dst.bin[segyio.BinField.AuxTraces] = 0
+                    dst.bin[segyio.BinField.Format] = task.data_format
+                    dst.bin[segyio.BinField.SortingCode] = 1
+                    dst.bin[segyio.BinField.MeasurementSystem] = 1  # Meters
+
+                # Update sample count and interval in binary header
+                dst.bin[segyio.BinField.Samples] = task.n_samples
+                dst.bin[segyio.BinField.Interval] = task.sample_interval
             else:
                 # Non-first segments: set minimal binary header
                 dst.bin[segyio.BinField.Samples] = task.n_samples
@@ -282,24 +383,37 @@ def export_trace_range(
 
                     # Write headers using custom mapping if provided, otherwise use auto-detection
                     if task.header_mapping_list:
-                        # Use custom header mapping
+                        # Custom header mapping: parquet_column -> byte_position
+                        # Simple and direct: read value, write to byte position
                         for mapping in task.header_mapping_list:
                             parquet_col = mapping['parquet_column']
                             byte_pos = mapping['segy_byte_pos']
+
+                            # Get value from header arrays (now uses original parquet names)
                             if parquet_col in header_arrays:
-                                # Find the segyio TraceField for this byte position
-                                field = None
-                                for tf in segyio.TraceField:
-                                    if tf.value == byte_pos:
-                                        field = tf
-                                        break
-                                if field:
-                                    dst.header[local_idx][field] = int(header_arrays[parquet_col][local_header_idx])
+                                header_value = int(header_arrays[parquet_col][local_header_idx])
+
+                                # Find segyio TraceField for this byte position
+                                field_name = byte_pos_to_field.get(byte_pos)
+                                if field_name:
+                                    field = getattr(segyio.TraceField, field_name)
+                                    dst.header[local_idx][field] = header_value
+                                # If byte position not in segyio's standard fields, skip
+                                # (segyio doesn't support arbitrary byte positions directly)
                     else:
-                        # Auto-detect: write headers using standard field name mapping
+                        # Auto-detect: header_arrays uses segyio field names
+                        # Write headers using standard field name mapping
                         for field_name, arr in header_arrays.items():
+                            # Try exact match first
                             if hasattr(segyio.TraceField, field_name):
                                 field = getattr(segyio.TraceField, field_name)
+                                dst.header[local_idx][field] = int(arr[local_header_idx])
+                            # Try common variations (lowercase, uppercase)
+                            elif hasattr(segyio.TraceField, field_name.lower()):
+                                field = getattr(segyio.TraceField, field_name.lower())
+                                dst.header[local_idx][field] = int(arr[local_header_idx])
+                            elif hasattr(segyio.TraceField, field_name.upper()):
+                                field = getattr(segyio.TraceField, field_name.upper())
                                 dst.header[local_idx][field] = int(arr[local_header_idx])
 
                     local_idx += 1

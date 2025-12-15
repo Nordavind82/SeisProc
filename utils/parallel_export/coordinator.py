@@ -12,6 +12,7 @@ Orchestrates the full export pipeline:
 import os
 import time
 import shutil
+import json
 import numpy as np
 import zarr
 import pandas as pd
@@ -84,6 +85,52 @@ def get_optimal_workers(n_traces: int = 0, n_header_fields: int = 50) -> int:
     return min(cpu_based, memory_based)
 
 
+def get_metadata_from_zarr(zarr_path: str) -> Dict[str, Any]:
+    """
+    Get export metadata from Zarr array and its metadata.json.
+
+    Reads n_samples and n_traces from Zarr shape, sample_rate from metadata.json.
+    Returns dict with n_samples, n_traces, sample_interval (microseconds), data_format.
+
+    Args:
+        zarr_path: Path to traces.zarr or similar Zarr array
+
+    Returns:
+        Dict with keys: n_samples, n_traces, sample_interval, data_format
+    """
+    zarr_path = Path(zarr_path)
+
+    # Open Zarr to get shape
+    zarr_array = zarr.open(str(zarr_path), mode='r')
+    n_samples, n_traces = zarr_array.shape
+
+    # Look for metadata.json in parent directory (standard storage layout)
+    metadata_path = zarr_path.parent / 'metadata.json'
+    sample_rate_ms = 2.0  # Default 2ms if not found
+
+    if metadata_path.exists():
+        with open(metadata_path, 'r') as f:
+            metadata = json.load(f)
+        sample_rate_ms = metadata.get('sample_rate', 2.0)
+    else:
+        # Try Zarr attrs
+        if hasattr(zarr_array, 'attrs') and 'sample_rate' in zarr_array.attrs:
+            sample_rate_ms = zarr_array.attrs['sample_rate']
+
+    # Convert sample_rate (ms) to sample_interval (microseconds)
+    sample_interval = int(sample_rate_ms * 1000)
+
+    # Default to IEEE float format (5) for processed data
+    data_format = 5
+
+    return {
+        'n_samples': n_samples,
+        'n_traces': n_traces,
+        'sample_interval': sample_interval,
+        'data_format': data_format
+    }
+
+
 class ParallelExportCoordinator:
     """
     Orchestrates parallel SEG-Y export.
@@ -153,22 +200,14 @@ class ParallelExportCoordinator:
                     active_workers=0
                 ))
 
-            # Get info from original SEG-Y
-            with segyio.open(self.config.original_segy_path, 'r', ignore_geometry=True) as f:
-                n_traces = f.tracecount
-                n_samples = len(f.samples)
-                sample_interval = int(segyio.tools.dt(f))  # microseconds
-                data_format = int(f.bin[segyio.BinField.Format])
+            # Get info from Zarr/metadata.json (no longer requires original SEG-Y)
+            metadata = get_metadata_from_zarr(self.config.processed_zarr_path)
+            n_traces = metadata['n_traces']
+            n_samples = metadata['n_samples']
+            sample_interval = metadata['sample_interval']
+            data_format = metadata['data_format']
 
             print(f"  Exporting {n_traces:,} traces, {n_samples} samples")
-
-            # Validate Zarr matches
-            processed_zarr = zarr.open(self.config.processed_zarr_path, mode='r')
-            if processed_zarr.shape != (n_samples, n_traces):
-                raise ValueError(
-                    f"Zarr shape {processed_zarr.shape} doesn't match "
-                    f"SEG-Y ({n_samples}, {n_traces})"
-                )
 
             # Phase 2: Vectorize headers
             if progress_callback:
@@ -182,10 +221,14 @@ class ParallelExportCoordinator:
             print("  Vectorizing headers...")
             headers_df = pd.read_parquet(self.config.headers_parquet_path)
             vectorizer = HeaderVectorizer(headers_df)
-            vectorizer.vectorize()
+            # Use original parquet column names when custom mapping is provided
+            use_original_names = self.config.header_mapping is not None
+            vectorizer.vectorize(keep_original_names=use_original_names)
 
             stats = vectorizer.get_stats()
             print(f"    {stats['n_fields']} fields, {stats['memory_mb']:.1f} MB total")
+            if use_original_names:
+                print(f"    Using original parquet column names for custom mapping")
 
             # Phase 3: Partition traces BEFORE saving headers
             # so we can save per-segment slices to reduce worker memory
@@ -357,22 +400,14 @@ class ParallelExportCoordinator:
                     active_workers=0
                 ))
 
-            # Get info from original SEG-Y
-            with segyio.open(self.config.original_segy_path, 'r', ignore_geometry=True) as f:
-                n_traces = f.tracecount
-                n_samples = len(f.samples)
-                sample_interval = int(segyio.tools.dt(f))
-                data_format = int(f.bin[segyio.BinField.Format])
+            # Get info from Zarr/metadata.json (no longer requires original SEG-Y)
+            metadata = get_metadata_from_zarr(self.config.processed_zarr_path)
+            n_traces = metadata['n_traces']
+            n_samples = metadata['n_samples']
+            sample_interval = metadata['sample_interval']
+            data_format = metadata['data_format']
 
             print(f"  Exporting {n_traces:,} traces, {n_samples} samples")
-
-            # Validate Zarr matches
-            processed_zarr = zarr.open(self.config.processed_zarr_path, mode='r')
-            if processed_zarr.shape != (n_samples, n_traces):
-                raise ValueError(
-                    f"Zarr shape {processed_zarr.shape} doesn't match "
-                    f"SEG-Y ({n_samples}, {n_traces})"
-                )
 
             # Phase 2: Vectorize headers
             if progress_callback:
@@ -386,10 +421,15 @@ class ParallelExportCoordinator:
             print("  Vectorizing headers...")
             headers_df = pd.read_parquet(self.config.headers_parquet_path)
             vectorizer = HeaderVectorizer(headers_df)
-            vectorizer.vectorize()
+            # Use original parquet column names when custom mapping is provided
+            # This ensures the worker can find columns by their parquet names
+            use_original_names = self.config.header_mapping is not None
+            vectorizer.vectorize(keep_original_names=use_original_names)
 
             stats = vectorizer.get_stats()
             print(f"    {stats['n_fields']} fields, {stats['memory_mb']:.1f} MB total")
+            if use_original_names:
+                print(f"    Using original parquet column names for custom mapping")
 
             # Phase 3: Partition traces
             segments = self._partition_traces(n_traces)
@@ -683,7 +723,6 @@ class ParallelExportCoordinator:
 
             task = ExportTask(
                 segment_id=segment.segment_id,
-                original_segy_path=self.config.original_segy_path,
                 processed_zarr_path=self.config.processed_zarr_path,
                 output_segment_path=segment_path,
                 header_arrays_path=segment_header_path,
@@ -693,6 +732,8 @@ class ParallelExportCoordinator:
                 sample_interval=sample_interval,
                 data_format=data_format,
                 is_first_segment=(segment.segment_id == 0),
+                # Optional original SEG-Y for text/binary header template
+                original_segy_path=self.config.original_segy_path,
                 # Export type and mute configuration
                 export_type=self.config.export_type,
                 input_zarr_path=self.config.input_zarr_path,

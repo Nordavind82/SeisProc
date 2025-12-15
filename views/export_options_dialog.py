@@ -204,6 +204,7 @@ class ExportOptionsDialog(QDialog):
         # Header mapping storage
         self.header_mapping: Dict[str, ExportHeaderField] = {}
         self.available_columns: list = []
+        self.headers_df: Optional[pd.DataFrame] = None  # For preview values
 
         self._init_ui()
 
@@ -357,9 +358,9 @@ class ExportOptionsDialog(QDialog):
 
         # Header mapping table
         self.header_table = QTableWidget()
-        self.header_table.setColumnCount(5)
+        self.header_table.setColumnCount(6)
         self.header_table.setHorizontalHeaderLabels([
-            "Enable", "Parquet Column", "SEG-Y Field", "Byte Position", "Format"
+            "Enable", "Parquet Column", "SEG-Y Field", "Byte Pos", "Fmt", "Preview (first 5 traces)"
         ])
 
         # Set column widths
@@ -369,9 +370,10 @@ class ExportOptionsDialog(QDialog):
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         self.header_table.setColumnWidth(0, 50)
-        self.header_table.setColumnWidth(3, 80)
-        self.header_table.setColumnWidth(4, 60)
+        self.header_table.setColumnWidth(3, 60)
+        self.header_table.setColumnWidth(4, 40)
 
         layout.addWidget(self.header_table)
 
@@ -480,11 +482,17 @@ class ExportOptionsDialog(QDialog):
         enable_cb.setChecked(enabled)
         self.header_table.setCellWidget(row, 0, enable_cb)
 
-        # Parquet column combo
+        # Parquet column combo (editable to allow custom column names)
         parquet_combo = QComboBox()
         parquet_combo.setEditable(True)
-        parquet_combo.addItems(self.available_columns)
+        # Add available columns first
+        if self.available_columns:
+            parquet_combo.addItems(self.available_columns)
+        # Ensure the specified column is in the list and selected
         if parquet_col:
+            # Add to combo if not already present
+            if parquet_col not in [parquet_combo.itemText(i) for i in range(parquet_combo.count())]:
+                parquet_combo.addItem(parquet_col)
             parquet_combo.setCurrentText(parquet_col)
         self.header_table.setCellWidget(row, 1, parquet_combo)
 
@@ -493,12 +501,14 @@ class ExportOptionsDialog(QDialog):
         segy_combo.setEditable(True)
         segy_fields = list(self.SEGY_HEADER_DEFS.keys())
         segy_combo.addItems(segy_fields)
+        # Add custom field if not in standard list
+        if segy_field and segy_field not in segy_fields:
+            segy_combo.addItem(segy_field)
         if segy_field:
             segy_combo.setCurrentText(segy_field)
-        segy_combo.currentTextChanged.connect(lambda text: self._on_segy_field_changed(row, text))
         self.header_table.setCellWidget(row, 2, segy_combo)
 
-        # Byte position
+        # Byte position - create item BEFORE connecting signal
         byte_item = QTableWidgetItem(str(byte_pos) if byte_pos > 0 else "")
         self.header_table.setItem(row, 3, byte_item)
 
@@ -507,6 +517,43 @@ class ExportOptionsDialog(QDialog):
         fmt_combo.addItems(["i", "h"])  # i=int32, h=int16
         fmt_combo.setCurrentText(fmt)
         self.header_table.setCellWidget(row, 4, fmt_combo)
+
+        # Preview column - show first 5 values from headers
+        preview_text = self._get_column_preview(parquet_col)
+        preview_item = QTableWidgetItem(preview_text)
+        preview_item.setFlags(preview_item.flags() & ~Qt.ItemFlag.ItemIsEditable)  # Read-only
+        preview_item.setToolTip(f"First 5 trace values for '{parquet_col}'")
+        self.header_table.setItem(row, 5, preview_item)
+
+        # Connect signals AFTER setting initial values
+        segy_combo.currentTextChanged.connect(lambda text: self._on_segy_field_changed(row, text))
+        parquet_combo.currentTextChanged.connect(lambda text: self._on_parquet_col_changed(row, text))
+
+    def _get_column_preview(self, col_name: str) -> str:
+        """Get preview of first 5 values for a column."""
+        if not col_name or self.headers_df is None:
+            return "-"
+
+        # Try exact match first
+        if col_name in self.headers_df.columns:
+            values = self.headers_df[col_name].iloc[:5].tolist()
+            return ", ".join(str(int(v)) if pd.notna(v) else "0" for v in values)
+
+        # Try case-insensitive match
+        for c in self.headers_df.columns:
+            if c.lower() == col_name.lower():
+                values = self.headers_df[c].iloc[:5].tolist()
+                return ", ".join(str(int(v)) if pd.notna(v) else "0" for v in values)
+
+        return "(not found)"
+
+    def _on_parquet_col_changed(self, row: int, col_name: str):
+        """Update preview when parquet column selection changes."""
+        preview_item = self.header_table.item(row, 5)
+        if preview_item:
+            preview_text = self._get_column_preview(col_name)
+            preview_item.setText(preview_text)
+            preview_item.setToolTip(f"First 5 trace values for '{col_name}'")
 
     def _on_segy_field_changed(self, row: int, field_name: str):
         """Update byte position and format when SEG-Y field is selected."""
@@ -569,7 +616,12 @@ class ExportOptionsDialog(QDialog):
                 break
 
     def _load_header_config(self):
-        """Load header configuration from JSON file."""
+        """Load header configuration from JSON file.
+
+        Supports two formats:
+        1. Export format: {"header_mapping": [{"parquet_column": ..., "byte_position": ...}, ...]}
+        2. Import/remap format: {"fields": {"column_name": {"byte_position": ..., "format": ...}, ...}}
+        """
         file_path, _ = QFileDialog.getOpenFileName(
             self, "Load Header Configuration",
             "", "JSON Files (*.json);;All Files (*)"
@@ -581,15 +633,68 @@ class ExportOptionsDialog(QDialog):
             with open(file_path, 'r') as f:
                 config = json.load(f)
 
-            self.header_table.setRowCount(0)
-            for item in config.get('header_mapping', []):
-                self._add_header_row(
-                    item.get('parquet_column', ''),
-                    item.get('segy_field', ''),
-                    item.get('byte_position', 0),
-                    item.get('format', 'i'),
-                    item.get('enabled', True)
+            mapping_items = []
+
+            # Check for export format (header_mapping list)
+            if 'header_mapping' in config and isinstance(config['header_mapping'], list):
+                mapping_items = config['header_mapping']
+
+            # Check for import/remap format (fields dictionary)
+            elif 'fields' in config and isinstance(config['fields'], dict):
+                # Convert fields dict to mapping list format
+                for col_name, field_info in config['fields'].items():
+                    mapping_items.append({
+                        'parquet_column': field_info.get('name', col_name),
+                        'segy_field': col_name,  # Use column name as SEG-Y field reference
+                        'byte_position': field_info.get('byte_position', 0),
+                        'format': field_info.get('format', 'i'),
+                        'enabled': True
+                    })
+
+            if not mapping_items:
+                QMessageBox.warning(
+                    self, "Empty Config",
+                    "No header mapping found in the file.\n\n"
+                    "Expected either:\n"
+                    "- 'header_mapping' list (export format)\n"
+                    "- 'fields' dictionary (import/remap format)"
                 )
+                return
+
+            # Collect parquet columns from config to add to available columns
+            config_columns = [item.get('parquet_column', '') for item in mapping_items if item.get('parquet_column')]
+            for col in config_columns:
+                if col and col not in self.available_columns:
+                    self.available_columns.append(col)
+
+            # Clear and reload table
+            self.header_table.setRowCount(0)
+            loaded_count = 0
+            for item in mapping_items:
+                parquet_col = item.get('parquet_column', '')
+                segy_field = item.get('segy_field', '')
+                byte_pos = item.get('byte_position', 0)
+                fmt = item.get('format', 'i')
+                enabled = item.get('enabled', True)
+
+                if parquet_col and byte_pos > 0:
+                    self._add_header_row(parquet_col, segy_field, byte_pos, fmt, enabled)
+                    loaded_count += 1
+
+            # Update columns info label
+            if hasattr(self, 'columns_info_label') and self.available_columns:
+                col_text = ", ".join(self.available_columns[:15])
+                if len(self.available_columns) > 15:
+                    col_text += f"... ({len(self.available_columns)} total)"
+                self.columns_info_label.setText(f"Available columns: {col_text}")
+
+            QMessageBox.information(
+                self, "Config Loaded",
+                f"Loaded {loaded_count} header mappings from:\n{Path(file_path).name}"
+            )
+
+        except json.JSONDecodeError as e:
+            QMessageBox.warning(self, "JSON Error", f"Invalid JSON file:\n{e}")
         except Exception as e:
             QMessageBox.warning(self, "Load Error", f"Failed to load configuration:\n{e}")
 
@@ -773,13 +878,9 @@ class ExportOptionsDialog(QDialog):
         headers_path = path / 'headers.parquet'
         if headers_path.exists():
             try:
-                # Read just the schema to get column names
-                df = pd.read_parquet(headers_path, columns=[])
-                self.available_columns = list(df.columns) if hasattr(df, 'columns') else []
-
-                # Actually read columns - parquet needs at least one column
-                schema_df = pd.read_parquet(headers_path)
-                self.available_columns = list(schema_df.columns)
+                # Read first 100 rows for preview (lightweight)
+                self.headers_df = pd.read_parquet(headers_path).head(100)
+                self.available_columns = list(self.headers_df.columns)
 
                 # Update the columns info label
                 if hasattr(self, 'columns_info_label'):
@@ -788,7 +889,7 @@ class ExportOptionsDialog(QDialog):
                         col_text += f"... ({len(self.available_columns)} total)"
                     self.columns_info_label.setText(f"Available columns: {col_text}")
 
-                # Update combo boxes in existing rows
+                # Update combo boxes and previews in existing rows
                 for row in range(self.header_table.rowCount()):
                     parquet_combo = self.header_table.cellWidget(row, 1)
                     if parquet_combo:
@@ -797,8 +898,15 @@ class ExportOptionsDialog(QDialog):
                         parquet_combo.addItems(self.available_columns)
                         parquet_combo.setCurrentText(current_text)
 
+                        # Update preview for this row
+                        preview_item = self.header_table.item(row, 5)
+                        if preview_item:
+                            preview_text = self._get_column_preview(current_text)
+                            preview_item.setText(preview_text)
+
             except Exception as e:
                 self.available_columns = []
+                self.headers_df = None
                 if hasattr(self, 'columns_info_label'):
                     self.columns_info_label.setText(f"Error reading columns: {e}")
 

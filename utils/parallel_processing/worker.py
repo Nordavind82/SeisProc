@@ -27,53 +27,17 @@ from datetime import datetime
 
 from .config import ProcessingTask, ProcessingWorkerResult, SortOptions
 
+# Import shared data management from centralized module
+from .shared_data import (
+    get_shared_headers,
+    get_shared_ensemble_index,
+    get_shared_ensemble_arrays,
+    set_shared_headers,  # Re-export for backward compatibility
+    clear_shared_headers,  # Re-export for backward compatibility
+)
 
-# =============================================================================
-# SHARED HEADERS FOR FORK CONTEXT - Pre-loaded in parent, shared via COW
-# =============================================================================
-# When using fork context, if headers are loaded BEFORE forking, all child
-# processes share the same memory pages via copy-on-write. This saves ~178MB
-# per worker for a 22M trace dataset (vs each worker loading independently).
-#
-# The coordinator calls set_shared_headers() before creating the ProcessPoolExecutor.
-# Workers call get_shared_headers() to access the pre-loaded data.
-# This only works with fork context (Linux). With spawn, workers load independently.
-_SHARED_HEADERS_DF = None  # Pre-loaded headers DataFrame (shared via fork COW)
-_SHARED_HEADERS_COLUMNS = None  # List of columns that were pre-loaded
-
-
-def set_shared_headers(headers_df, columns: list):
-    """
-    Set pre-loaded headers for workers to share via fork copy-on-write.
-
-    Call this in the coordinator BEFORE creating ProcessPoolExecutor with fork context.
-    Workers will inherit this data through fork's memory sharing.
-
-    Args:
-        headers_df: pandas DataFrame with required header columns
-        columns: list of column names that were loaded
-    """
-    global _SHARED_HEADERS_DF, _SHARED_HEADERS_COLUMNS
-    _SHARED_HEADERS_DF = headers_df
-    _SHARED_HEADERS_COLUMNS = columns
-
-
-def get_shared_headers():
-    """
-    Get pre-loaded headers if available.
-
-    Returns:
-        (headers_df, columns) if headers were pre-loaded, (None, None) otherwise
-    """
-    global _SHARED_HEADERS_DF, _SHARED_HEADERS_COLUMNS
-    return _SHARED_HEADERS_DF, _SHARED_HEADERS_COLUMNS
-
-
-def clear_shared_headers():
-    """Clear shared headers to free memory after processing completes."""
-    global _SHARED_HEADERS_DF, _SHARED_HEADERS_COLUMNS
-    _SHARED_HEADERS_DF = None
-    _SHARED_HEADERS_COLUMNS = None
+# Import parquet_io for accelerated parquet reading
+from utils.parquet_io import read_parquet
 
 
 # =============================================================================
@@ -623,6 +587,35 @@ def process_gather_range(
         _super_early_log(">>> SeismicData imported")
         _worker_log("Imports complete", include_memory=True)
 
+        # CRITICAL: Test and re-initialize CUDA in forked worker
+        # The parent process may have initialized CUDA (e.g., for GPU status display),
+        # which breaks CUDA in forked children. We need to test and potentially fix this.
+        _super_early_log(">>> Testing CUDA availability in worker...")
+        try:
+            import torch
+            cuda_available = torch.cuda.is_available()
+            _super_early_log(f">>> torch.cuda.is_available() = {cuda_available}")
+            _worker_log(f"CUDA available: {cuda_available}")
+
+            if cuda_available:
+                # Test if CUDA actually works by creating a small tensor
+                try:
+                    test_tensor = torch.zeros(1, device='cuda')
+                    device_name = torch.cuda.get_device_name(0)
+                    del test_tensor
+                    torch.cuda.empty_cache()
+                    _super_early_log(f">>> CUDA context test PASSED: {device_name}")
+                    _worker_log(f"CUDA context verified: {device_name}")
+                except Exception as cuda_e:
+                    _super_early_log(f">>> CUDA context test FAILED: {cuda_e}")
+                    _worker_log(f"CUDA context broken in worker: {cuda_e}, will use CPU")
+            else:
+                _super_early_log(">>> CUDA not available, worker will use CPU")
+                _worker_log("CUDA not available, worker will use CPU fallback")
+        except Exception as torch_e:
+            _super_early_log(f">>> Error testing CUDA: {torch_e}")
+            _worker_log(f"Error testing CUDA: {torch_e}")
+
         # Open data sources
         _super_early_log(">>> Opening input zarr...")
         _worker_log("Opening input zarr...", include_memory=True)
@@ -630,11 +623,19 @@ def process_gather_range(
         _super_early_log(f">>> Input zarr opened: shape={input_zarr.shape}")
         _worker_log(f"Input zarr opened: shape={input_zarr.shape}", include_memory=True)
 
+        # Load ensemble index - try shared data first (fork COW), fall back to file
         _super_early_log(">>> Loading ensemble index...")
         _worker_log("Loading ensemble index...", include_memory=True)
-        ensemble_df = pd.read_parquet(task.ensemble_index_path)
-        _super_early_log(f">>> Ensemble index loaded: {len(ensemble_df)} rows")
-        _worker_log(f"Ensemble index loaded: {len(ensemble_df)} rows", include_memory=True)
+        ensemble_df = get_shared_ensemble_index()
+        if ensemble_df is not None:
+            _super_early_log(f">>> Using pre-loaded ensemble index (fork COW - zero copy!): {len(ensemble_df)} rows")
+            _worker_log(f"Using pre-loaded ensemble index: {len(ensemble_df)} rows (shared via fork COW)", include_memory=True)
+        else:
+            # Fall back to loading from file (spawn context or pre-load failed)
+            _super_early_log(">>> Loading ensemble index from file...")
+            ensemble_df = read_parquet(task.ensemble_index_path)
+            _super_early_log(f">>> Ensemble index loaded from file: {len(ensemble_df)} rows")
+            _worker_log(f"Ensemble index loaded from file: {len(ensemble_df)} rows", include_memory=True)
 
         # Open output zarr only if outputting processed
         output_zarr = None
@@ -683,46 +684,80 @@ def process_gather_range(
                 if col not in header_columns:
                     header_columns.append(col)
 
+        # Check if FKK processor which needs all headers for volume building
+        _super_early_log(">>> Checking processor class...")
+        processor_class = task.processor_config.get('class_name', '') if task.processor_config else ''
+        is_fkk_processor = processor_class == 'FKKProcessor'
+        # Only load all headers for FKK - NOT just because header_columns is empty
+        # Other processors (STFT, etc.) don't need headers if sorting/mute disabled
+        load_all_headers = is_fkk_processor
+        _super_early_log(f">>> processor_class={processor_class}, is_fkk={is_fkk_processor}, load_all={load_all_headers}")
+
+        if is_fkk_processor:
+            _super_early_log(">>> FKK processor detected - need all headers for volume building")
+            _worker_log("FKK processor detected - will load all headers for volume building")
+
         # Load required header columns (or use pre-loaded shared headers from fork COW)
         headers_df = None
-        if header_columns:
+        _super_early_log(f">>> header_columns={header_columns}, load_all_headers={load_all_headers}")
+        if header_columns or load_all_headers:
             # Check for pre-loaded shared headers (fork context optimization)
+            # For FKK, coordinator now pre-loads ALL headers, so we can use shared headers
+            _super_early_log(">>> Calling get_shared_headers()...")
             shared_headers, shared_cols = get_shared_headers()
-            if shared_headers is not None:
-                # Verify all required columns are available in shared headers
-                # Use case-insensitive matching since coordinator normalizes column names
-                shared_cols_lower = {c.lower() for c in shared_cols}
-                missing_cols = []
-                for col in header_columns:
-                    if col not in shared_cols and col.lower() not in shared_cols_lower:
-                        missing_cols.append(col)
+            _super_early_log(f">>> shared_headers is {'NOT ' if shared_headers is None else ''}None, n_cols={len(shared_cols) if shared_cols else 0}")
 
-                if not missing_cols:
-                    _super_early_log(">>> Using pre-loaded shared headers (fork COW - zero copy!)")
-                    _worker_log(f"Using pre-loaded shared headers: {len(shared_headers)} rows, "
-                               f"cols={shared_cols} (shared via fork COW)", include_memory=True)
-                    headers_df = shared_headers
+            if shared_headers is not None:
+                if is_fkk_processor:
+                    # For FKK, coordinator should have pre-loaded ALL headers
+                    # Check if we have enough columns (coordinator loads all for FKK)
+                    if len(shared_cols) >= 10:  # Arbitrary threshold - real header files have many columns
+                        _super_early_log(f">>> FKK: Using pre-loaded shared headers with {len(shared_cols)} columns (fork COW)")
+                        _worker_log(f"FKK: Using pre-loaded shared headers: {len(shared_headers)} rows, "
+                                   f"{len(shared_cols)} cols (shared via fork COW)", include_memory=True)
+                        headers_df = shared_headers
+                    else:
+                        _super_early_log(f">>> FKK: Shared headers only have {len(shared_cols)} cols, need full headers")
+                        _worker_log(f"FKK: Shared headers insufficient ({len(shared_cols)} cols), loading full headers...")
                 else:
-                    _worker_log(f"Shared headers missing columns {missing_cols}, loading from file...")
-                    shared_headers = None  # Fall through to file loading
+                    # For non-FKK, verify required columns are available
+                    shared_cols_lower = {c.lower() for c in shared_cols}
+                    missing_cols = []
+                    for col in header_columns:
+                        if col not in shared_cols and col.lower() not in shared_cols_lower:
+                            missing_cols.append(col)
+
+                    if not missing_cols:
+                        _super_early_log(">>> Using pre-loaded shared headers (fork COW - zero copy!)")
+                        _worker_log(f"Using pre-loaded shared headers: {len(shared_headers)} rows, "
+                                   f"cols={shared_cols} (shared via fork COW)", include_memory=True)
+                        headers_df = shared_headers
+                    else:
+                        _worker_log(f"Shared headers missing columns {missing_cols}, loading from file...")
 
             # Fall back to loading from file if shared headers not available
+            _super_early_log(f">>> headers_df is {'NOT ' if headers_df is None else ''}None, checking if need to load...")
             if headers_df is None:
-                _worker_log(f"Loading headers from file (columns: {header_columns})...", include_memory=True)
-                try:
-                    headers_df = pd.read_parquet(
-                        task.headers_parquet_path,
-                        columns=header_columns
-                    )
-                    _worker_log(f"Headers loaded: {len(headers_df)} rows, {len(headers_df.columns)} cols", include_memory=True)
-                except Exception as e:
-                    # Some columns may not exist, try loading all
-                    _worker_log(f"Partial column load failed ({e}), loading full headers...", include_memory=True)
-                    headers_df = pd.read_parquet(task.headers_parquet_path)
+                if load_all_headers:
+                    _super_early_log(f">>> About to load ALL headers from {task.headers_parquet_path}...")
+                    _worker_log(f"Loading ALL headers from file (for FKK/volume processors)...", include_memory=True)
+                    headers_df = read_parquet(task.headers_parquet_path)
+                    _super_early_log(f">>> Headers loaded: {len(headers_df)} rows")
                     _worker_log(f"Full headers loaded: {len(headers_df)} rows, {len(headers_df.columns)} cols", include_memory=True)
-        else:
-            _super_early_log(">>> No headers needed - skipping parquet load")
-            _worker_log("No headers needed for this configuration")
+                else:
+                    _worker_log(f"Loading headers from file (columns: {header_columns})...", include_memory=True)
+                    try:
+                        # Use parquet_io for Polars acceleration
+                        headers_df = read_parquet(
+                            task.headers_parquet_path,
+                            columns=header_columns
+                        )
+                        _worker_log(f"Headers loaded: {len(headers_df)} rows, {len(headers_df.columns)} cols", include_memory=True)
+                    except Exception as e:
+                        # Some columns may not exist, try loading all
+                        _worker_log(f"Partial column load failed ({e}), loading full headers...", include_memory=True)
+                        headers_df = read_parquet(task.headers_parquet_path)
+                        _worker_log(f"Full headers loaded: {len(headers_df)} rows, {len(headers_df.columns)} cols", include_memory=True)
 
         _super_early_log(">>> Headers section complete")
 
@@ -783,10 +818,14 @@ def process_gather_range(
                 _worker_log(f"  Gather loaded: shape={gather_traces.shape}, dtype={gather_traces.dtype}, "
                            f"size={gather_traces.nbytes/(1024*1024):.2f}MB", include_memory=True)
 
+            # Get gather headers (needed for FKKProcessor and mute)
+            gather_headers = None
+            if headers_df is not None:
+                gather_headers = headers_df.iloc[g_start:g_end + 1]
+
             # Get offsets for mute if needed
             offsets = None
-            if mute_enabled and headers_df is not None:
-                gather_headers = headers_df.iloc[g_start:g_end + 1]
+            if mute_enabled and gather_headers is not None:
                 for col in ['offset', 'OFFSET', 'Offset']:
                     if col in gather_headers.columns:
                         offsets = gather_headers[col].values.astype(np.float32)
@@ -803,7 +842,8 @@ def process_gather_range(
                 metadata={
                     **task.metadata,
                     'gather_idx': gather_idx,
-                    'n_traces': n_traces
+                    'n_traces': n_traces,
+                    'headers_df': gather_headers  # Include headers for FKKProcessor (may be None)
                 }
             )
 

@@ -144,9 +144,11 @@ class DWTDenoise(BaseProcessor):
 
         start_time = time.time()
 
-        # Use direct reference - processing methods don't modify input
-        # This saves ~20MB per gather (one fewer copy in memory)
+        # Convert to float32 if needed for memory efficiency (50% savings)
+        # This also ensures all intermediate arrays use float32
         traces = data.traces
+        if traces.dtype != np.float32:
+            traces = traces.astype(np.float32)
         n_samples, n_traces = traces.shape
 
         # Determine decomposition level

@@ -104,10 +104,10 @@ def _get_cached_windows(n: int, fmin: float, fmax: float, positive_freqs: np.nda
             use_numba = False
 
     if not use_numba:
-        # Fallback to pure NumPy
+        # Fallback to pure NumPy (float32 for memory efficiency)
         n_freqs = len(freq_indices)
-        windows = np.zeros((n_freqs, n))
-        freq_range = np.arange(n)
+        windows = np.zeros((n_freqs, n), dtype=np.float32)
+        freq_range = np.arange(n, dtype=np.float32)
 
         for i, k in enumerate(freq_indices):
             f = output_freqs[i]
@@ -135,10 +135,11 @@ def _compute_gaussian_windows_numba(freq_indices, positive_freqs, n):
 
     Pre-computes Gaussian windows for all frequencies.
     Note: parallel=False to avoid conflicts with joblib multiprocessing.
+    Uses float32 for 50% memory savings.
     """
     n_freqs = len(freq_indices)
-    windows = np.zeros((n_freqs, n), dtype=np.float64)
-    freq_range = np.arange(n, dtype=np.float64)
+    windows = np.zeros((n_freqs, n), dtype=np.float32)
+    freq_range = np.arange(n, dtype=np.float32)
 
     for i in range(n_freqs):  # Use range instead of prange
         k = freq_indices[i]
@@ -192,9 +193,9 @@ def stockwell_transform(data, fmin=None, fmax=None):
         n, fmin_norm, fmax_norm, positive_freqs
     )
 
-    # Initialize S-transform matrix
+    # Initialize S-transform matrix (complex64 for memory efficiency)
     n_freqs = len(freq_indices)
-    S = np.zeros((n_freqs, n), dtype=complex)
+    S = np.zeros((n_freqs, n), dtype=np.complex64)
 
     # Log S-Transform config once per session (debug level)
     if not hasattr(stockwell_transform, '_debug_printed'):
@@ -449,7 +450,12 @@ class TFDenoise(BaseProcessor):
 
         start_time_total = time.time()
 
-        traces = data.traces.copy()
+        # Convert to float32 for memory efficiency (50% savings)
+        traces = data.traces
+        if traces.dtype != np.float32:
+            traces = traces.astype(np.float32)
+        else:
+            traces = traces.copy()
         n_samples, n_traces = traces.shape
 
         # Log gather summary once at start

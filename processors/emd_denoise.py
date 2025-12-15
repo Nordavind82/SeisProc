@@ -188,7 +188,12 @@ class EMDDenoise(BaseProcessor):
 
         start_time = time.time()
 
-        traces = data.traces.copy()
+        # Convert to float32 for memory efficiency (50% savings)
+        traces = data.traces
+        if traces.dtype != np.float32:
+            traces = traces.astype(np.float32)
+        else:
+            traces = traces.copy()
         n_samples, n_traces = traces.shape
 
         # Determine processing strategy
@@ -349,7 +354,7 @@ class EMDDenoise(BaseProcessor):
             # Pad and average
             averaged_imfs = []
             for imf_idx in range(max_imfs):
-                imf_sum = np.zeros(n_samples)
+                imf_sum = np.zeros(n_samples, dtype=np.float32)
                 count = 0
                 for imfs in valid_results:
                     if imf_idx < len(imfs):

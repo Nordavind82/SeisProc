@@ -51,6 +51,7 @@ class TFDenoiseGPU(TFDenoise):
         use_gpu: Literal['auto', 'force', 'never'] = 'auto',
         low_amp_protection: bool = True,
         low_amp_factor: float = 0.3,
+        time_smoothing: int = 1,
         device_manager: Optional[DeviceManager] = None
     ):
         """
@@ -74,25 +75,26 @@ class TFDenoiseGPU(TFDenoise):
                 - 'never': Always use CPU
             low_amp_protection: Prevent inflation of low-amplitude samples
             low_amp_factor: Threshold for low-amplitude protection (fraction of median)
+            time_smoothing: Time window size for MAD smoothing (1=no smoothing)
             device_manager: Optional DeviceManager instance (created if None)
         """
-        # Initialize parent class (CPU version)
+        # Initialize parent class with all serializable params
         super().__init__(
             aperture=aperture,
             fmin=fmin,
             fmax=fmax,
             threshold_k=threshold_k,
             threshold_type=threshold_type,
-            transform_type=transform_type
+            threshold_mode=threshold_mode,
+            transform_type=transform_type,
+            low_amp_protection=low_amp_protection,
+            low_amp_factor=low_amp_factor,
+            time_smoothing=time_smoothing
         )
 
-        # New threshold mode parameters
-        self.threshold_mode = threshold_mode
-        self.low_amp_protection = low_amp_protection
-        self.low_amp_factor = low_amp_factor
-
-        # GPU configuration
+        # GPU configuration (stored separately, added to params for serialization)
         self.use_gpu_mode = use_gpu
+        self.params['use_gpu'] = use_gpu  # Add to params for serialization
         self._oom_retry_count = 0
         self._max_oom_retries = 3
 

@@ -202,30 +202,43 @@ class HeaderVectorizer:
 
         return self._mapped_columns
 
-    def vectorize(self) -> Dict[str, np.ndarray]:
+    def vectorize(self, keep_original_names: bool = False) -> Dict[str, np.ndarray]:
         """
-        Convert DataFrame columns to numpy arrays with segyio field names.
+        Convert DataFrame columns to numpy arrays.
+
+        Args:
+            keep_original_names: If True, keep original parquet column names.
+                                If False (default), map to segyio field names.
 
         Returns:
-            Dictionary mapping segyio field names to numpy arrays
+            Dictionary mapping column/field names to numpy arrays
         """
         if self._header_arrays is not None:
             return self._header_arrays
 
         self._header_arrays = {}
-        column_mapping = self._build_column_mapping()
 
-        for df_col, segyio_name in column_mapping.items():
-            # Convert to int32 for SEG-Y headers (all are integer values)
-            try:
-                arr = self.headers_df[df_col].values
-                # Handle NaN values by replacing with 0
-                if np.issubdtype(arr.dtype, np.floating):
-                    arr = np.nan_to_num(arr, nan=0.0)
-                self._header_arrays[segyio_name] = arr.astype(np.int32)
-            except (ValueError, TypeError):
-                # Skip columns that can't be converted to int32
-                continue
+        if keep_original_names:
+            # Keep original parquet column names - used for custom header mapping
+            for col in self.headers_df.columns:
+                try:
+                    arr = self.headers_df[col].values
+                    if np.issubdtype(arr.dtype, np.floating):
+                        arr = np.nan_to_num(arr, nan=0.0)
+                    self._header_arrays[col] = arr.astype(np.int32)
+                except (ValueError, TypeError):
+                    continue
+        else:
+            # Map to segyio field names - used for auto-detect mode
+            column_mapping = self._build_column_mapping()
+            for df_col, segyio_name in column_mapping.items():
+                try:
+                    arr = self.headers_df[df_col].values
+                    if np.issubdtype(arr.dtype, np.floating):
+                        arr = np.nan_to_num(arr, nan=0.0)
+                    self._header_arrays[segyio_name] = arr.astype(np.int32)
+                except (ValueError, TypeError):
+                    continue
 
         return self._header_arrays
 

@@ -52,6 +52,19 @@ from models.fk_config import FKConfigManager, FKFilterConfig
 from utils.trace_spacing import calculate_trace_spacing_with_stats
 from utils.storage_manager import ProcessingStorageManager
 from utils.volume_builder import build_volume_from_gathers, extract_traces_from_volume
+from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass
+class FKKVolumeBuildParams:
+    """Parameters for rebuilding FKK volume from any gather."""
+    inline_key: str
+    xline_key: str
+    dx: float  # meters
+    dy: float  # meters
+    coordinate_units: str
+    coord_scalar: float
 
 
 class MainWindow(QMainWindow):
@@ -2946,16 +2959,6 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # Check if we have the original SEG-Y path
-        if self.original_segy_path is None:
-            QMessageBox.warning(
-                self,
-                "No Original SEG-Y Path",
-                "Export requires the original SEG-Y file for headers.\n\n"
-                "Please ensure data was imported with 'Import SEG-Y (Optimized)'."
-            )
-            return
-
         # Check if we have headers
         if self.headers_df is None:
             QMessageBox.warning(
@@ -3102,13 +3105,14 @@ class MainWindow(QMainWindow):
                 for col, field in options.header_mapping.items()
             }
 
-        # Create export config
+        # Create export config (original_segy_path is optional - used for text/binary header template)
         config = ExportConfig(
-            original_segy_path=self.original_segy_path,
             processed_zarr_path=processed_zarr_path,
             headers_parquet_path=str(headers_path),
             output_path=output_file,
             temp_dir=str(temp_dir),
+            # Optional: use original SEG-Y for text/binary header template if available
+            original_segy_path=self.original_segy_path if self.original_segy_path and Path(self.original_segy_path).exists() else None,
             n_workers=n_workers,
             # Export type and noise calculation
             export_type=export_type,
@@ -3642,6 +3646,19 @@ class MainWindow(QMainWindow):
             self._current_3d_volume = volume
             self._fkk_volume_geometry = geometry
 
+            # Store volume build parameters for rebuilding on other gathers
+            self._fkk_volume_build_params = FKKVolumeBuildParams(
+                inline_key=geometry.inline_key,
+                xline_key=geometry.xline_key,
+                dx=geometry.dx,
+                dy=geometry.dy,
+                coordinate_units=self.input_data.metadata.get('coordinate_units', 'meters'),
+                coord_scalar=self.input_data.metadata.get('coord_scalar', 1.0)
+            )
+
+            # Store headers used for this volume (for trace extraction in design mode)
+            self._fkk_volume_headers = headers_df.copy()
+
             self.statusBar().showMessage(
                 f"Volume built: {volume.shape}, {volume.memory_mb():.1f} MB, "
                 f"{geometry.coverage_percent:.1f}% coverage"
@@ -3662,7 +3679,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Volume building failed")
 
     def _on_fkk_apply_requested(self, config: FKKConfig):
-        """Handle FKK apply request - apply filter directly without designer."""
+        """Handle FKK apply request - rebuild volume from current gather and apply filter."""
         if self.input_data is None:
             QMessageBox.warning(
                 self,
@@ -3671,66 +3688,125 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # Check if we have a built volume
-        if not hasattr(self, '_current_3d_volume') or self._current_3d_volume is None:
+        # Check if we have stored volume build params from design mode
+        if not hasattr(self, '_fkk_volume_build_params') or self._fkk_volume_build_params is None:
             QMessageBox.warning(
                 self,
-                "No Volume",
-                "Please use Design mode first to build a 3D volume\n"
-                "from your data before applying a filter."
+                "No Volume Parameters",
+                "Please use Design mode first to configure volume building\n"
+                "parameters before applying a filter."
+            )
+            return
+
+        # Check for headers
+        if self.headers_df is None or self.headers_df.empty:
+            QMessageBox.warning(
+                self,
+                "No Headers",
+                "Current gather has no trace headers.\n"
+                "3D FKK filter requires headers to define inline/crossline axes."
             )
             return
 
         try:
+            params = self._fkk_volume_build_params
+            traces_data = self.input_data.traces
+            headers_df = self.headers_df.copy()
+            n_traces = traces_data.shape[1]
+
+            # DEBUG: Log what data we're using
+            logger.info(f"FKK Apply: Using current gather with {n_traces} traces, "
+                       f"shape={traces_data.shape}, data_id={id(self.input_data)}")
+            logger.info(f"FKK Apply: Headers shape={headers_df.shape}, "
+                       f"inline_key={params.inline_key}, xline_key={params.xline_key}")
+
+            # Ensure headers match traces
+            if len(headers_df) != n_traces:
+                logger.warning(f"Header count ({len(headers_df)}) != trace count ({n_traces})")
+                headers_df = headers_df.iloc[:n_traces] if len(headers_df) > n_traces else headers_df
+
+            self.statusBar().showMessage(
+                f"Building volume from current gather ({n_traces} traces)..."
+            )
+            QApplication.processEvents()
+
+            # Rebuild volume from current gather using stored params
+            volume, geometry = build_volume_from_gathers(
+                traces_data=traces_data,
+                headers_df=headers_df,
+                inline_key=params.inline_key,
+                xline_key=params.xline_key,
+                sample_rate_ms=self.input_data.sample_rate,
+                coordinate_units=params.coordinate_units,
+                dx=params.dx,
+                dy=params.dy,
+                coord_scalar=params.coord_scalar
+            )
+
             self.statusBar().showMessage("Applying FKK filter...")
             QApplication.processEvents()
 
-            # Get filter processor
+            # Get filter processor and apply
             fkk_filter = get_fkk_filter(prefer_gpu=True)
+            filtered_volume = fkk_filter.apply_filter(volume, config)
 
-            # Apply filter
-            filtered_volume = fkk_filter.apply_filter(self._current_3d_volume, config)
-
-            # Store result
+            # Store results
+            self._current_3d_volume = volume
+            self._fkk_volume_geometry = geometry
             self._current_3d_volume_filtered = filtered_volume
             self._current_fkk_config = config
 
             # Extract filtered traces back to 2D gather format
-            if hasattr(self, '_fkk_volume_geometry') and self.headers_df is not None:
-                geom = self._fkk_volume_geometry
+            filtered_traces = extract_traces_from_volume(
+                filtered_volume,
+                headers_df,
+                params.inline_key,
+                params.xline_key
+            )
 
-                filtered_traces = extract_traces_from_volume(
-                    filtered_volume,
-                    self.headers_df,
-                    geom.inline_key,
-                    geom.xline_key
-                )
+            # Update processed data with filtered result
+            self.processed_data = SeismicData(
+                traces=filtered_traces,
+                sample_rate=self.input_data.sample_rate,
+                metadata={**self.input_data.metadata, 'fkk_filtered': True}
+            )
 
-                # Update processed data with filtered result
-                self.processed_data = SeismicData(
-                    traces=filtered_traces,
-                    sample_rate=self.input_data.sample_rate,
-                    metadata={**self.input_data.metadata, 'fkk_filtered': True}
-                )
+            # Calculate difference
+            difference_traces = self.input_data.traces - self.processed_data.traces
+            self.difference_data = SeismicData(
+                traces=difference_traces,
+                sample_rate=self.input_data.sample_rate,
+                metadata={'description': 'Difference (Input - FKK Filtered)'}
+            )
 
-                # Calculate difference
-                difference_traces = self.input_data.traces - self.processed_data.traces
-                self.difference_data = SeismicData(
-                    traces=difference_traces,
-                    sample_rate=self.input_data.sample_rate,
-                    metadata={'description': 'Difference (Input - FKK Filtered)'}
-                )
+            # Update viewers
+            self.processed_viewer.set_data(self.processed_data)
+            self.difference_viewer.set_data(self.difference_data)
 
-                # Update viewers
-                self.processed_viewer.set_data(self.processed_data)
-                self.difference_viewer.set_data(self.difference_data)
+            self.statusBar().showMessage(
+                f"FKK filter applied to gather ({n_traces} traces): {config.get_summary()}"
+            )
 
-                self.statusBar().showMessage(
-                    f"FKK filter applied: {config.get_summary()}"
-                )
-                return
-
-            self.statusBar().showMessage(f"FKK filter applied: {config.get_summary()}")
+            # Store FKKProcessor for parallel batch processing
+            from processors.fkk_filter_gpu import FKKProcessor
+            self.last_processor = FKKProcessor(
+                v_min=config.v_min,
+                v_max=config.v_max,
+                filter_mode=config.mode,  # FKKConfig uses 'mode' not 'filter_mode'
+                apply_agc=config.apply_agc,
+                agc_window_ms=config.agc_window_ms,
+                edge_method=config.edge_method,
+                pad_traces_x=config.pad_traces_x,
+                pad_traces_y=config.pad_traces_y,
+                padding_factor=config.padding_factor,
+                inline_key=params.inline_key,
+                xline_key=params.xline_key,
+                dx=params.dx,
+                dy=params.dy,
+                coordinate_units=params.coordinate_units,
+                coord_scalar=params.coord_scalar,
+                prefer_gpu=True
+            )
 
         except Exception as e:
             logger.error(f"FKK filter application failed: {e}")
@@ -3747,42 +3823,67 @@ class MainWindow(QMainWindow):
         self._current_fkk_config = config
 
         # Extract filtered traces back to current gather format
-        if hasattr(self, '_fkk_volume_geometry') and self.input_data is not None:
+        # Use stored headers from when volume was built (not current self.headers_df)
+        if (hasattr(self, '_fkk_volume_geometry') and
+            hasattr(self, '_fkk_volume_headers') and
+            self.input_data is not None):
             try:
                 geom = self._fkk_volume_geometry
+                headers_df = self._fkk_volume_headers
 
-                # Use headers_df (set when gather is loaded)
-                if self.headers_df is not None:
-                    filtered_traces = extract_traces_from_volume(
-                        filtered_volume,
-                        self.headers_df,
-                        geom.inline_key,
-                        geom.xline_key
+                filtered_traces = extract_traces_from_volume(
+                    filtered_volume,
+                    headers_df,
+                    geom.inline_key,
+                    geom.xline_key
+                )
+
+                # Update processed data
+                self.processed_data = SeismicData(
+                    traces=filtered_traces,
+                    sample_rate=self.input_data.sample_rate,
+                    metadata={'description': f'FKK filtered: {config.get_summary()}'}
+                )
+
+                # Calculate difference
+                difference_traces = self.input_data.traces - self.processed_data.traces
+                self.difference_data = SeismicData(
+                    traces=difference_traces,
+                    sample_rate=self.input_data.sample_rate,
+                    metadata={'description': 'Difference (Input - FKK Filtered)'}
+                )
+
+                # Update viewers
+                self.processed_viewer.set_data(self.processed_data)
+                self.difference_viewer.set_data(self.difference_data)
+
+                self.statusBar().showMessage(
+                    f"FKK filter applied and displayed: {config.get_summary()}"
+                )
+
+                # Store FKKProcessor for parallel batch processing
+                if hasattr(self, '_fkk_volume_build_params'):
+                    params = self._fkk_volume_build_params
+                    from processors.fkk_filter_gpu import FKKProcessor
+                    self.last_processor = FKKProcessor(
+                        v_min=config.v_min,
+                        v_max=config.v_max,
+                        filter_mode=config.mode,  # FKKConfig uses 'mode' not 'filter_mode'
+                        apply_agc=config.apply_agc,
+                        agc_window_ms=config.agc_window_ms,
+                        edge_method=config.edge_method,
+                        pad_traces_x=config.pad_traces_x,
+                        pad_traces_y=config.pad_traces_y,
+                        padding_factor=config.padding_factor,
+                        inline_key=params.inline_key,
+                        xline_key=params.xline_key,
+                        dx=params.dx,
+                        dy=params.dy,
+                        coordinate_units=params.coordinate_units,
+                        coord_scalar=params.coord_scalar,
+                        prefer_gpu=True
                     )
-
-                    # Update processed data
-                    self.processed_data = SeismicData(
-                        traces=filtered_traces,
-                        sample_rate=self.input_data.sample_rate,
-                        metadata={'description': f'FKK filtered: {config.get_summary()}'}
-                    )
-
-                    # Calculate difference
-                    difference_traces = self.input_data.traces - self.processed_data.traces
-                    self.difference_data = SeismicData(
-                        traces=difference_traces,
-                        sample_rate=self.input_data.sample_rate,
-                        metadata={'description': 'Difference (Input - FKK Filtered)'}
-                    )
-
-                    # Update viewers
-                    self.processed_viewer.set_data(self.processed_data)
-                    self.difference_viewer.set_data(self.difference_data)
-
-                    self.statusBar().showMessage(
-                        f"FKK filter applied and displayed: {config.get_summary()}"
-                    )
-                    return
+                return
 
             except Exception as e:
                 logger.warning(f"Could not update gather view: {e}")

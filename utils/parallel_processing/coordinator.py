@@ -94,6 +94,13 @@ from .config import (
 )
 from .partitioner import GatherPartitioner
 from .worker import process_gather_range, read_streaming_sort_file
+from .shared_data import (
+    set_shared_headers,
+    set_shared_ensemble_index,
+    clear_shared_data,
+    get_shared_data_summary
+)
+from utils.parquet_io import read_parquet, read_parquet_schema, find_columns_case_insensitive
 
 # Import settings for memory configuration
 try:
@@ -905,52 +912,83 @@ class ParallelProcessingCoordinator:
             mp_ctx = mp.get_context('fork')
             _early_log(">>> Using 'fork' context for copy-on-write memory sharing (Linux)")
 
-            # PRE-LOAD HEADERS FOR FORK COW SHARING
-            # If sorting or mute is enabled, workers need header columns.
-            # Loading headers here (in parent) before fork means all workers
-            # share the same memory pages via copy-on-write, saving ~178MB per worker
-            # for a 22M trace dataset. Without this, each worker loads independently.
+            # CRITICAL: Reset GPU DeviceManager singleton before fork!
+            # The UI (control_panel.py) initializes CUDA when checking GPU availability.
+            # If we fork with an initialized DeviceManager, workers inherit a broken
+            # CUDA context. Resetting it ensures workers create fresh CUDA contexts.
+            try:
+                from processors.gpu.device_manager import reset_device_manager
+                reset_device_manager()
+                _early_log(">>> Reset GPU DeviceManager singleton before fork (workers will create fresh CUDA context)")
+            except ImportError:
+                _early_log(">>> GPU device_manager not available, skipping reset")
+
+            # PRE-LOAD DATA FOR FORK COW SHARING
+            # Loading data here (in parent) before fork means all workers
+            # share the same memory pages via copy-on-write, saving significant memory:
+            # - Headers: ~178MB per worker for 22M trace dataset
+            # - Ensemble index: ~80MB per worker
+            # Without this, each worker loads independently.
+
+            # Pre-load ensemble index (all workers need this)
+            ensemble_path = input_dir / 'ensemble_index.parquet'
+            try:
+                _early_log(f">>> Pre-loading ensemble index for fork COW sharing...")
+                ensemble_df = read_parquet(ensemble_path)
+                set_shared_ensemble_index(ensemble_df)
+                _early_log(f">>> Ensemble index pre-loaded: {len(ensemble_df)} gathers, "
+                          f"{ensemble_df.memory_usage(deep=True).sum()/(1024**2):.1f}MB "
+                          f"(will be shared by all {self.n_workers} workers via COW)")
+            except Exception as e:
+                _early_log(f">>> WARNING: Failed to pre-load ensemble index: {e}, workers will load independently")
+
+            # Pre-load headers if sorting, mute, or FKK processor is enabled
             mute_enabled = (
                 self.config.mute_velocity > 0 and
                 (self.config.mute_top or self.config.mute_bottom)
             )
-            header_columns = []
-            if sorting_enabled:
-                header_columns.append(self.config.sort_options.sort_key)
-                if self.config.sort_options.secondary_key:
-                    header_columns.append(self.config.sort_options.secondary_key)
-            if mute_enabled:
-                for col in ['offset', 'OFFSET', 'Offset']:
-                    if col not in header_columns:
-                        header_columns.append(col)
 
-            if header_columns:
-                headers_path = input_dir / 'headers.parquet'
+            # Check if FKK processor is being used (needs ALL headers for volume building)
+            processor_class = self.config.processor_config.get('class_name', '') if self.config.processor_config else ''
+            is_fkk_processor = processor_class == 'FKKProcessor'
+
+            header_columns = []
+            load_all_headers = is_fkk_processor  # FKK needs all headers for inline/xline keys
+
+            if not load_all_headers:
+                if sorting_enabled:
+                    header_columns.append(self.config.sort_options.sort_key)
+                    if self.config.sort_options.secondary_key:
+                        header_columns.append(self.config.sort_options.secondary_key)
+                if mute_enabled:
+                    for col in ['offset', 'OFFSET', 'Offset']:
+                        if col not in header_columns:
+                            header_columns.append(col)
+
+            headers_path = input_dir / 'headers.parquet'
+            if load_all_headers:
+                # FKK processor needs ALL headers for volume building
+                _early_log(f">>> FKK processor detected - pre-loading ALL headers for fork COW sharing")
+                try:
+                    shared_headers = read_parquet(headers_path)
+                    all_cols = list(shared_headers.columns)
+                    set_shared_headers(shared_headers, all_cols)
+                    _early_log(f">>> ALL headers pre-loaded: {len(shared_headers)} rows, {len(all_cols)} columns, "
+                              f"{shared_headers.memory_usage(deep=True).sum()/(1024**2):.1f}MB "
+                              f"(will be shared by all {self.n_workers} workers via COW)")
+                except Exception as e:
+                    _early_log(f">>> WARNING: Failed to pre-load all headers: {e}, workers will load independently")
+            elif header_columns:
                 _early_log(f">>> Pre-loading headers for fork COW sharing: {header_columns}")
                 try:
-                    from .worker import set_shared_headers
-                    import pyarrow.parquet as pq
-
-                    # Get actual columns in the parquet file
-                    parquet_schema = pq.read_schema(headers_path)
-                    available_cols = set(parquet_schema.names)
-
-                    # Find which requested columns actually exist (case-sensitive match first)
-                    cols_to_load = []
-                    for col in header_columns:
-                        if col in available_cols:
-                            if col not in cols_to_load:
-                                cols_to_load.append(col)
-                        else:
-                            # Try case-insensitive match
-                            for avail_col in available_cols:
-                                if avail_col.lower() == col.lower() and avail_col not in cols_to_load:
-                                    cols_to_load.append(avail_col)
-                                    break
+                    # Use parquet_io for case-insensitive column matching
+                    col_mapping = find_columns_case_insensitive(headers_path, header_columns)
+                    cols_to_load = [v for v in col_mapping.values() if v is not None]
 
                     if cols_to_load:
                         _early_log(f">>> Found columns to load: {cols_to_load}")
-                        shared_headers = pd.read_parquet(headers_path, columns=cols_to_load)
+                        # Use Polars via parquet_io for 6x faster loading
+                        shared_headers = read_parquet(headers_path, columns=cols_to_load)
                         set_shared_headers(shared_headers, cols_to_load)
                         _early_log(f">>> Headers pre-loaded: {len(shared_headers)} rows, "
                                   f"{shared_headers.memory_usage(deep=True).sum()/(1024**2):.1f}MB "
@@ -959,6 +997,9 @@ class ParallelProcessingCoordinator:
                         _early_log(f">>> WARNING: None of requested columns {header_columns} found in parquet")
                 except Exception as e:
                     _early_log(f">>> WARNING: Failed to pre-load headers: {e}, workers will load independently")
+
+            # Log summary of pre-loaded shared data
+            _early_log(f">>> {get_shared_data_summary()}")
         else:
             mp_ctx = mp.get_context('spawn')
             _early_log(">>> Using 'spawn' context (non-Linux platform)")
@@ -1101,12 +1142,11 @@ class ParallelProcessingCoordinator:
             _early_log(f">>> TRACEBACK:\n{traceback.format_exc()}")
             raise
         finally:
-            # Clean up shared headers to free memory
+            # Clean up shared data (headers + ensemble index) to free memory
             if sys.platform == 'linux':
                 try:
-                    from .worker import clear_shared_headers
-                    clear_shared_headers()
-                    _early_log(">>> Cleared shared headers from memory")
+                    clear_shared_data()
+                    _early_log(">>> Cleared shared data (headers + ensemble index) from memory")
                 except Exception:
                     pass
 
