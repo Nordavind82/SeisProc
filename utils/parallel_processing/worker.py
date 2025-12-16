@@ -823,6 +823,20 @@ def process_gather_range(
             if headers_df is not None:
                 gather_headers = headers_df.iloc[g_start:g_end + 1]
 
+            # Apply sorting BEFORE processing if enabled
+            # This ensures processors with spatial aperture (STFT, etc.) see sorted neighbors
+            sort_indices = None
+            if sorting_enabled and headers_df is not None:
+                sort_indices = compute_gather_sort_indices(
+                    headers_df, g_start, g_end, task.sort_options
+                )
+                # Reorder traces and headers before processing
+                gather_traces = gather_traces[:, sort_indices]
+                if gather_headers is not None:
+                    gather_headers = gather_headers.iloc[sort_indices].reset_index(drop=True)
+                if log_this_gather:
+                    _worker_log(f"  Applied pre-processing sort by {task.sort_options.sort_key}", include_memory=True)
+
             # Get offsets for mute if needed
             offsets = None
             if mute_enabled and gather_headers is not None:
@@ -904,16 +918,9 @@ def process_gather_range(
                 del gather_data
                 gc.collect()
 
-                # Apply sorting if enabled (to the noise which is now in gather_traces)
-                if sorting_enabled and headers_df is not None:
-                    sort_indices = compute_gather_sort_indices(
-                        headers_df, g_start, g_end, task.sort_options
-                    )
-                    # Reorder noise traces
-                    gather_traces = gather_traces[:, sort_indices]
-
-                    if sort_writer is not None:
-                        sort_writer.write_mapping(gather_idx, g_start, g_end, sort_indices)
+                # Write sort mapping if enabled (traces already sorted before processing)
+                if sorting_enabled and sort_indices is not None and sort_writer is not None:
+                    sort_writer.write_mapping(gather_idx, g_start, g_end, sort_indices)
 
                 # Write noise to output (noise goes to noise_zarr which is the primary output)
                 if noise_zarr is not None:
@@ -962,22 +969,9 @@ def process_gather_range(
                 del gather_traces
                 del gather_data
 
-                # Apply sorting if enabled
-                if sorting_enabled and headers_df is not None:
-                    sort_indices = compute_gather_sort_indices(
-                        headers_df, g_start, g_end, task.sort_options
-                    )
-
-                    # Reorder traces according to sort indices
-                    processed_traces = processed_traces[:, sort_indices]
-
-                    # Also sort noise traces if present
-                    if noise_traces is not None:
-                        noise_traces = noise_traces[:, sort_indices]
-
-                    # STREAM mapping to disk immediately (no memory accumulation!)
-                    if sort_writer is not None:
-                        sort_writer.write_mapping(gather_idx, g_start, g_end, sort_indices)
+                # Write sort mapping if enabled (traces already sorted before processing)
+                if sorting_enabled and sort_indices is not None and sort_writer is not None:
+                    sort_writer.write_mapping(gather_idx, g_start, g_end, sort_indices)
 
                 # Write processed traces to output
                 if output_zarr is not None:
