@@ -163,12 +163,18 @@ def detect_velocity_format(filepath: Union[str, Path]) -> VelocityFileFormat:
         return VelocityFileFormat.UNKNOWN
 
 
-def preview_velocity_file(filepath: Union[str, Path]) -> VelocityFileInfo:
+def preview_velocity_file(
+    filepath: Union[str, Path],
+    inline_byte: Optional[int] = None,
+    xline_byte: Optional[int] = None,
+) -> VelocityFileInfo:
     """
     Preview velocity file without full loading.
 
     Args:
         filepath: Path to velocity file
+        inline_byte: Custom byte position for inline in SEG-Y (None = use standard 189)
+        xline_byte: Custom byte position for xline in SEG-Y (None = use standard 193)
 
     Returns:
         VelocityFileInfo with metadata and optional raw_data
@@ -184,7 +190,7 @@ def preview_velocity_file(filepath: Union[str, Path]) -> VelocityFileInfo:
 
     try:
         if info.format == VelocityFileFormat.SEGY:
-            info = _preview_velocity_segy(filepath, info)
+            info = _preview_velocity_segy(filepath, info, inline_byte, xline_byte)
         elif info.format == VelocityFileFormat.JSON:
             info = _preview_velocity_json(filepath, info)
         elif info.format == VelocityFileFormat.NPZ:
@@ -338,8 +344,24 @@ def _preview_velocity_ascii_ilxltv(filepath: Path, info: VelocityFileInfo) -> Ve
     return info
 
 
-def _preview_velocity_segy(filepath: Path, info: VelocityFileInfo) -> VelocityFileInfo:
-    """Preview SEG-Y velocity file."""
+def _preview_velocity_segy(
+    filepath: Path,
+    info: VelocityFileInfo,
+    inline_byte: Optional[int] = None,
+    xline_byte: Optional[int] = None,
+) -> VelocityFileInfo:
+    """
+    Preview SEG-Y velocity file including inline/xline ranges.
+
+    Args:
+        filepath: Path to SEG-Y file
+        info: VelocityFileInfo to populate
+        inline_byte: Custom byte position for inline (None = use standard INLINE_3D at 189)
+        xline_byte: Custom byte position for xline (None = use standard CROSSLINE_3D at 193)
+
+    Returns:
+        Updated VelocityFileInfo
+    """
     try:
         import segyio
 
@@ -348,16 +370,33 @@ def _preview_velocity_segy(filepath: Path, info: VelocityFileInfo) -> VelocityFi
             n_samples = len(f.samples)
             sample_interval = f.bin[segyio.BinField.Interval] / 1e6
 
+            # Determine which byte positions to use for inline/xline
+            # Standard positions: INLINE_3D=189, CROSSLINE_3D=193
+            # Custom bytes are 1-based, segyio uses enum values
+            use_custom_inline = inline_byte is not None
+            use_custom_xline = xline_byte is not None
+
             # Sample first few traces for velocity range
             sample_traces = min(10, n_traces)
             v_min, v_max = float('inf'), float('-inf')
             cdps = []
+            inlines = []
+            xlines = []
 
             for i in range(sample_traces):
                 trace = f.trace[i]
                 v_min = min(v_min, trace.min())
                 v_max = max(v_max, trace.max())
                 cdps.append(f.header[i][segyio.TraceField.CDP])
+                # Use custom byte positions if specified
+                if use_custom_inline:
+                    inlines.append(f.header[i][inline_byte])
+                else:
+                    inlines.append(f.header[i][segyio.TraceField.INLINE_3D])
+                if use_custom_xline:
+                    xlines.append(f.header[i][xline_byte])
+                else:
+                    xlines.append(f.header[i][segyio.TraceField.CROSSLINE_3D])
 
             times = f.samples / 1000.0
 
@@ -367,12 +406,39 @@ def _preview_velocity_segy(filepath: Path, info: VelocityFileInfo) -> VelocityFi
             info.velocity_range = (float(v_min), float(v_max))
             info.sample_interval = float(sample_interval)
 
-            if any(c != 0 for c in cdps):
-                # Read all CDPs for range
-                all_cdps = [f.header[i][segyio.TraceField.CDP] for i in range(n_traces)]
+            # Read all headers for full ranges
+            all_cdps = []
+            all_inlines = []
+            all_xlines = []
+            for i in range(n_traces):
+                all_cdps.append(f.header[i][segyio.TraceField.CDP])
+                if use_custom_inline:
+                    all_inlines.append(f.header[i][inline_byte])
+                else:
+                    all_inlines.append(f.header[i][segyio.TraceField.INLINE_3D])
+                if use_custom_xline:
+                    all_xlines.append(f.header[i][xline_byte])
+                else:
+                    all_xlines.append(f.header[i][segyio.TraceField.CROSSLINE_3D])
+
+            # Set CDP range if present
+            if any(c != 0 for c in all_cdps):
                 info.cdp_range = (min(all_cdps), max(all_cdps))
 
-            info.raw_data = {'format': 'segy', 'filepath': str(filepath)}
+            # Set inline range if present (check for non-zero values)
+            if any(il != 0 for il in all_inlines):
+                info.inline_range = (min(all_inlines), max(all_inlines))
+
+            # Set xline range if present
+            if any(xl != 0 for xl in all_xlines):
+                info.xline_range = (min(all_xlines), max(all_xlines))
+
+            info.raw_data = {
+                'format': 'segy',
+                'filepath': str(filepath),
+                'inline_byte': inline_byte,
+                'xline_byte': xline_byte,
+            }
             info.is_valid = True
 
     except ImportError:

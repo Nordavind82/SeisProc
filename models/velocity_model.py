@@ -116,9 +116,11 @@ class VelocityModel:
 
     def _validate_velocities(self):
         """Validate that velocities are physically reasonable."""
+        MIN_VELOCITY = 0.1  # Minimum allowed velocity in m/s
+
         if self._type == VelocityType.CONSTANT:
-            if self.data <= 0:
-                raise ValueError(f"Velocity must be positive, got {self.data}")
+            if self.data < MIN_VELOCITY:
+                raise ValueError(f"Velocity must be >= {MIN_VELOCITY} m/s, got {self.data}")
             if self.data < 300 or self.data > 10000:
                 logger.warning(
                     f"Velocity {self.data} m/s outside typical range [300, 10000] m/s"
@@ -126,8 +128,14 @@ class VelocityModel:
         else:
             v_min = np.min(self.data)
             v_max = np.max(self.data)
-            if v_min <= 0:
-                raise ValueError(f"All velocities must be positive, got min={v_min}")
+            # Clip values below minimum instead of raising error
+            if v_min < MIN_VELOCITY:
+                logger.warning(
+                    f"Clipping {np.sum(self.data < MIN_VELOCITY)} velocity values "
+                    f"below {MIN_VELOCITY} m/s (min was {v_min})"
+                )
+                self.data = np.clip(self.data, MIN_VELOCITY, None)
+                v_min = MIN_VELOCITY
             if v_min < 300 or v_max > 10000:
                 logger.warning(
                     f"Velocity range [{v_min}, {v_max}] m/s outside typical "
@@ -206,7 +214,12 @@ class VelocityModel:
                 bounds_error=False,
                 fill_value=None
             )
-            points = np.column_stack([np.atleast_1d(z), np.atleast_1d(x)])
+            z_arr = np.atleast_1d(z)
+            x_arr = np.atleast_1d(x)
+            # Broadcast x to match z length if x is scalar
+            if x_arr.size == 1 and z_arr.size > 1:
+                x_arr = np.full_like(z_arr, x_arr[0])
+            points = np.column_stack([z_arr, x_arr])
             return interp(points).astype(np.float32)
 
         elif self._type == VelocityType.V_OF_XYZ:
@@ -220,11 +233,15 @@ class VelocityModel:
                 bounds_error=False,
                 fill_value=None
             )
-            points = np.column_stack([
-                np.atleast_1d(z),
-                np.atleast_1d(x),
-                np.atleast_1d(y)
-            ])
+            z_arr = np.atleast_1d(z)
+            x_arr = np.atleast_1d(x)
+            y_arr = np.atleast_1d(y)
+            # Broadcast scalars to match z length
+            if x_arr.size == 1 and z_arr.size > 1:
+                x_arr = np.full_like(z_arr, x_arr[0])
+            if y_arr.size == 1 and z_arr.size > 1:
+                y_arr = np.full_like(z_arr, y_arr[0])
+            points = np.column_stack([z_arr, x_arr, y_arr])
             return interp(points).astype(np.float32)
 
     def get_effective_velocity(

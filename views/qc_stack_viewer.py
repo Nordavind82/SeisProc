@@ -44,6 +44,8 @@ class StackData:
     data: np.ndarray  # (n_samples, n_traces)
     sample_interval: float  # seconds
     cdp_numbers: Optional[np.ndarray] = None
+    inline_numbers: Optional[list] = None  # List of inline numbers in the stack
+    inline_ranges: Optional[Dict[int, Tuple[int, int]]] = None  # inline -> (start_idx, end_idx)
     metadata: Optional[Dict[str, Any]] = None
     path: Optional[str] = None
 
@@ -58,6 +60,13 @@ class StackData:
     @property
     def time_axis(self) -> np.ndarray:
         return np.arange(self.n_samples) * self.sample_interval
+
+    def get_inline_data(self, inline_num: int) -> Optional[np.ndarray]:
+        """Get data for a specific inline."""
+        if self.inline_ranges and inline_num in self.inline_ranges:
+            start, end = self.inline_ranges[inline_num]
+            return self.data[:, start:end]
+        return None
 
 
 class StackPanel(QWidget):
@@ -141,11 +150,13 @@ class QCStackViewerWindow(QMainWindow):
 
         self._before_data: Optional[StackData] = None
         self._after_data: Optional[StackData] = None
+        self._qc_stack_data: Optional[StackData] = None  # Single QC stack data
         self._difference: Optional[np.ndarray] = None
 
         self._flip_mode = False
         self._showing_before = True
         self._sync_enabled = True
+        self._current_inline_idx = 0
 
         self._init_ui()
         self._create_actions()
@@ -222,7 +233,36 @@ class QCStackViewerWindow(QMainWindow):
         toolbar = QToolBar("Main")
         self.addToolBar(toolbar)
 
-        # Load buttons
+        # Load QC Stack button (primary action)
+        load_qc_action = QAction("Load QC Stack...", self)
+        load_qc_action.triggered.connect(self._load_qc_stack)
+        toolbar.addAction(load_qc_action)
+
+        toolbar.addSeparator()
+
+        # Inline navigation
+        toolbar.addWidget(QLabel("Inline:"))
+        self.inline_combo = QComboBox()
+        self.inline_combo.setMinimumWidth(100)
+        self.inline_combo.currentIndexChanged.connect(self._on_inline_changed)
+        toolbar.addWidget(self.inline_combo)
+
+        self.prev_inline_btn = QPushButton("<")
+        self.prev_inline_btn.setMaximumWidth(30)
+        self.prev_inline_btn.clicked.connect(self._prev_inline)
+        toolbar.addWidget(self.prev_inline_btn)
+
+        self.next_inline_btn = QPushButton(">")
+        self.next_inline_btn.setMaximumWidth(30)
+        self.next_inline_btn.clicked.connect(self._next_inline)
+        toolbar.addWidget(self.next_inline_btn)
+
+        self.inline_info_label = QLabel("")
+        toolbar.addWidget(self.inline_info_label)
+
+        toolbar.addSeparator()
+
+        # Load comparison buttons
         load_before_action = QAction("Load Before...", self)
         load_before_action.triggered.connect(self._load_before)
         toolbar.addAction(load_before_action)
@@ -253,6 +293,10 @@ class QCStackViewerWindow(QMainWindow):
         # Space for flip
         flip_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
         flip_shortcut.activated.connect(self._do_flip)
+
+        # Arrow keys for inline navigation
+        QShortcut(QKeySequence(Qt.Key.Key_Left), self).activated.connect(self._prev_inline)
+        QShortcut(QKeySequence(Qt.Key.Key_Right), self).activated.connect(self._next_inline)
 
         # Number keys for display modes
         QShortcut(QKeySequence("1"), self).activated.connect(
@@ -301,26 +345,117 @@ class QCStackViewerWindow(QMainWindow):
         self.diff_panel.get_view_box().sigRangeChanged.connect(self._sync_views)
 
     def _load_before(self):
-        """Load before stack."""
-        path, _ = QFileDialog.getOpenFileName(
+        """Load before stack (.zarr directory)."""
+        path = QFileDialog.getExistingDirectory(
             self,
-            "Load Before Stack",
+            "Load Before Stack (.zarr directory)",
             "",
-            "Zarr (*.zarr);;All Files (*)"
+            QFileDialog.Option.ShowDirsOnly
         )
         if path:
             self.load_before_stack(path)
 
     def _load_after(self):
-        """Load after stack."""
-        path, _ = QFileDialog.getOpenFileName(
+        """Load after stack (.zarr directory)."""
+        path = QFileDialog.getExistingDirectory(
             self,
-            "Load After Stack",
+            "Load After Stack (.zarr directory)",
             "",
-            "Zarr (*.zarr);;All Files (*)"
+            QFileDialog.Option.ShowDirsOnly
         )
         if path:
             self.load_after_stack(path)
+
+    def _load_qc_stack(self):
+        """Load QC stack data - select the .zarr directory or metadata JSON."""
+        # Use directory dialog since zarr stores are directories
+        path = QFileDialog.getExistingDirectory(
+            self,
+            "Load QC Stack (.zarr directory)",
+            "",
+            QFileDialog.Option.ShowDirsOnly
+        )
+        if path:
+            self.load_qc_stack(path)
+
+    def load_qc_stack(self, path: str):
+        """Load QC stack from file and populate inline navigation."""
+        try:
+            self._qc_stack_data = self._load_stack(path)
+
+            # Populate inline combo
+            self.inline_combo.blockSignals(True)
+            self.inline_combo.clear()
+
+            if self._qc_stack_data.inline_numbers:
+                for inline in self._qc_stack_data.inline_numbers:
+                    self.inline_combo.addItem(f"Inline {inline}", inline)
+                self.inline_combo.setCurrentIndex(0)
+                self._current_inline_idx = 0
+            else:
+                # No inline info - show all data
+                self.inline_combo.addItem("All Data", -1)
+
+            self.inline_combo.blockSignals(False)
+
+            # Update info label
+            n_inlines = len(self._qc_stack_data.inline_numbers) if self._qc_stack_data.inline_numbers else 1
+            self.inline_info_label.setText(f"({n_inlines} inlines, {self._qc_stack_data.n_traces} CDPs)")
+
+            # Display first inline
+            self._display_current_inline()
+
+            self.status_bar.showMessage(f"Loaded QC Stack: {Path(path).name}")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load QC Stack: {e}")
+            logger.exception("Load QC stack failed")
+
+    def _on_inline_changed(self, index: int):
+        """Handle inline selection change."""
+        if index >= 0:
+            self._current_inline_idx = index
+            self._display_current_inline()
+
+    def _prev_inline(self):
+        """Go to previous inline."""
+        if self.inline_combo.count() > 0:
+            new_idx = max(0, self._current_inline_idx - 1)
+            self.inline_combo.setCurrentIndex(new_idx)
+
+    def _next_inline(self):
+        """Go to next inline."""
+        if self.inline_combo.count() > 0:
+            new_idx = min(self.inline_combo.count() - 1, self._current_inline_idx + 1)
+            self.inline_combo.setCurrentIndex(new_idx)
+
+    def _display_current_inline(self):
+        """Display the currently selected inline."""
+        if self._qc_stack_data is None:
+            return
+
+        inline_num = self.inline_combo.currentData()
+
+        if inline_num == -1 or inline_num is None:
+            # Show all data
+            display_data = self._qc_stack_data.data
+        else:
+            # Get data for specific inline
+            display_data = self._qc_stack_data.get_inline_data(inline_num)
+            if display_data is None:
+                display_data = self._qc_stack_data.data
+
+        # Display in the before panel (using it as main display for single stack)
+        clip = self.clip_spin.value()
+        self.before_panel.set_data(display_data, clip)
+
+        # Hide other panels when viewing single stack
+        self.before_panel.setVisible(True)
+        self.after_panel.setVisible(False)
+        self.diff_panel.setVisible(False)
+
+        # Update statistics for current inline
+        self._update_single_stack_stats(display_data)
 
     def load_before_stack(self, path: str):
         """Load before stack from file."""
@@ -347,42 +482,85 @@ class QCStackViewerWindow(QMainWindow):
             logger.exception("Load after failed")
 
     def _load_stack(self, path: str) -> StackData:
-        """Load stack data from Zarr file."""
+        """Load stack data from Zarr directory."""
         path = Path(path)
 
-        # Handle directory or file
-        if path.is_dir():
-            zarr_path = path
-        else:
-            zarr_path = path
+        # Zarr stores are directories
+        if not path.is_dir():
+            raise ValueError(f"Expected zarr directory, got: {path}")
 
+        zarr_path = path
         data = np.array(zarr.open(str(zarr_path), mode='r'))
+
+        logger.info(f"Loaded zarr data shape: {data.shape} from {zarr_path}")
 
         # Try to load metadata
         metadata = {}
         sample_interval = 0.004
         cdp_numbers = None
+        inline_numbers = None
+        inline_ranges = None
 
         # Look for metadata file
+        # For qc_stack_rd.zarr, metadata is qc_stack_rd_metadata.json in parent dir
+        zarr_name = path.name  # e.g., "qc_stack_rd.zarr"
+        base_name = zarr_name.replace('.zarr', '')  # e.g., "qc_stack_rd"
+
         meta_paths = [
-            path.parent / f"{path.stem}_metadata.json",
-            path.with_suffix('.json'),
-            path.parent / "metadata.json",
+            path.parent / f"{base_name}_metadata.json",  # Primary: same dir, _metadata suffix
+            path.parent / f"{base_name}.json",           # Alternative: same dir, .json
+            path / "metadata.json",                       # Inside zarr dir
+            path.parent / "metadata.json",               # Generic in parent
         ]
+
+        logger.info(f"Looking for metadata in: {[str(p) for p in meta_paths]}")
 
         for meta_path in meta_paths:
             if meta_path.exists():
+                logger.info(f"Found metadata at: {meta_path}")
                 with open(meta_path) as f:
                     metadata = json.load(f)
                 sample_interval = metadata.get('sample_interval', 0.004)
                 if 'cdp_numbers' in metadata:
                     cdp_numbers = np.array(metadata['cdp_numbers'])
+                if 'inline_numbers' in metadata:
+                    inline_numbers = metadata['inline_numbers']
+                # Read inline_ranges directly from metadata if available
+                if 'inline_ranges' in metadata:
+                    # Convert string keys back to int
+                    inline_ranges = {
+                        int(k): tuple(v)
+                        for k, v in metadata['inline_ranges'].items()
+                    }
+                    logger.info(f"Loaded inline_ranges: {inline_ranges}")
                 break
+        else:
+            logger.warning(f"No metadata file found for {zarr_path}")
+
+        # Fallback: Build inline ranges from cdp_numbers if not in metadata
+        if inline_ranges is None and inline_numbers and cdp_numbers is not None and len(cdp_numbers) > 0:
+            logger.info("Building inline_ranges from cdp_numbers (fallback)")
+            inline_ranges = {}
+            # CDPs are stored inline by inline, need to find boundaries
+            # Simple approach: divide evenly
+            cdps_per_inline = len(cdp_numbers) // len(inline_numbers)
+            start_idx = 0
+
+            for i, inline in enumerate(inline_numbers):
+                if i < len(inline_numbers) - 1:
+                    end_idx = start_idx + cdps_per_inline
+                else:
+                    end_idx = len(cdp_numbers)
+
+                inline_ranges[inline] = (start_idx, end_idx)
+                start_idx = end_idx
 
         return StackData(
             data=data,
             sample_interval=sample_interval,
             cdp_numbers=cdp_numbers,
+            inline_numbers=inline_numbers,
+            inline_ranges=inline_ranges,
             metadata=metadata,
             path=str(path)
         )
@@ -528,28 +706,51 @@ class QCStackViewerWindow(QMainWindow):
             self.max_diff_label.setText("-")
             self.snr_improvement_label.setText("-")
 
+    def _update_single_stack_stats(self, data: np.ndarray):
+        """Update statistics for single stack display."""
+        if data is None or data.size == 0:
+            return
+
+        rms = np.sqrt(np.mean(data**2))
+        max_val = np.max(np.abs(data))
+
+        self.rms_before_label.setText(f"{rms:.2e}")
+        self.rms_after_label.setText("-")
+        self.rms_diff_label.setText("-")
+        self.correlation_label.setText("-")
+        self.max_diff_label.setText(f"Max: {max_val:.2e}")
+        self.snr_improvement_label.setText(f"Traces: {data.shape[1]}")
+
 
 # =============================================================================
 # Convenience function
 # =============================================================================
 
-def show_qc_stack_viewer(before_path: Optional[str] = None, after_path: Optional[str] = None):
+def show_qc_stack_viewer(
+    qc_stack_path: Optional[str] = None,
+    before_path: Optional[str] = None,
+    after_path: Optional[str] = None
+):
     """
     Show QC stack viewer with optional initial data.
 
     Args:
-        before_path: Path to before stack
-        after_path: Path to after stack
+        qc_stack_path: Path to QC stack (for single stack viewing with inline navigation)
+        before_path: Path to before stack (for comparison mode)
+        after_path: Path to after stack (for comparison mode)
 
     Returns:
         QCStackViewerWindow instance
     """
     viewer = QCStackViewerWindow()
 
-    if before_path:
-        viewer.load_before_stack(before_path)
-    if after_path:
-        viewer.load_after_stack(after_path)
+    if qc_stack_path:
+        viewer.load_qc_stack(qc_stack_path)
+    elif before_path or after_path:
+        if before_path:
+            viewer.load_before_stack(before_path)
+        if after_path:
+            viewer.load_after_stack(after_path)
 
     viewer.show()
     return viewer

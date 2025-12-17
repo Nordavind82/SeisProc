@@ -9,7 +9,7 @@ Integrates:
 import logging
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                               QMenuBar, QMenu, QFileDialog, QMessageBox, QSplitter,
-                              QPushButton, QProgressDialog, QApplication)
+                              QPushButton, QProgressDialog, QApplication, QDialog)
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QAction, QShortcut, QKeySequence
 import numpy as np
@@ -812,8 +812,14 @@ class MainWindow(QMainWindow):
         # Load data into gather navigator - use lazy loading if available
         if isinstance(seismic_data, LazySeismicData):
             self.gather_navigator.load_lazy_data(seismic_data, ensembles_df)
+            # Store reference for QC operations (QC Stacking, Batch Processing)
+            self.lazy_seismic_data = seismic_data
+            self.input_storage_dir = storage_path
         else:
             self.gather_navigator.load_data(seismic_data, headers_df, ensembles_df)
+            # For non-lazy data, clear these references
+            self.lazy_seismic_data = None
+            self.input_storage_dir = None
 
         # Store ensembles for reference
         self.ensembles_df = ensembles_df
@@ -4445,6 +4451,9 @@ class MainWindow(QMainWindow):
             self.input_data = None
             self.processed_data = None
             self.difference_data = None
+            # Clear QC references
+            self.lazy_seismic_data = None
+            self.input_storage_dir = None
             self.statusBar().showMessage("No dataset loaded")
             return
 
@@ -4467,6 +4476,10 @@ class MainWindow(QMainWindow):
 
         # Load into gather navigator
         self.gather_navigator.load_lazy_data(lazy_data, ensembles_df)
+
+        # Update QC references for QC Stacking and Batch Processing
+        self.lazy_seismic_data = lazy_data
+        self.input_storage_dir = info.storage_path
 
         # Reset batch processing state for new dataset
         self.full_processed_data = None
@@ -4515,6 +4528,10 @@ class MainWindow(QMainWindow):
         self.input_data = None
         self.processed_data = None
         self.difference_data = None
+
+        # Clear QC references
+        self.lazy_seismic_data = None
+        self.input_storage_dir = None
 
         self.statusBar().showMessage("All datasets closed")
 
