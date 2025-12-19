@@ -13,11 +13,11 @@ import numpy as np
 import pyqtgraph as pg
 from pyqtgraph import ImageView, GraphicsLayoutWidget
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
-    QPushButton, QToolBar, QFrame, QGraphicsOpacityEffect
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QPushButton, QFrame, QGraphicsOpacityEffect
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve
-from PyQt6.QtGui import QAction, QPainter, QColor, QLinearGradient, QPalette
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve, QEvent
+from PyQt6.QtGui import QPainter, QColor, QLinearGradient
 import sys
 from models.seismic_data import SeismicData
 from models.lazy_seismic_data import LazySeismicData
@@ -152,12 +152,12 @@ class SeismicViewerPyQtGraph(QWidget):
     High-performance seismic viewer using PyQtGraph.
 
     Mouse Controls:
+    - Left Mouse Drag: Rectangle zoom (rubber band selection)
+    - Middle Mouse Drag: Pan/drag navigation
+    - Right Mouse Click: Reset view to full extent
     - Mouse Wheel: Zoom in/out (both axes)
-    - Ctrl + Mouse Wheel: Zoom X-axis only
-    - Shift + Mouse Wheel: Zoom Y-axis only
-    - Left Mouse Drag: Pan
-    - Right Mouse Drag: Box zoom
-    - Middle Mouse: Reset view
+    - Ctrl + Mouse Wheel: Zoom X-axis only (traces)
+    - Shift + Mouse Wheel: Zoom Y-axis only (time)
     """
 
     # Signal emitted when user clicks on a trace
@@ -179,6 +179,11 @@ class SeismicViewerPyQtGraph(QWidget):
 
         # Multi-window cache with LRU eviction
         self._window_cache = WindowCache(max_windows=5, max_memory_mb=500)
+
+        # Mouse interaction state for panning
+        self._initial_range = None
+        self._is_panning = False
+        self._pan_start = None
 
         # Create UI
         self._init_ui()
@@ -248,7 +253,7 @@ class SeismicViewerPyQtGraph(QWidget):
         self._is_loading = False
 
     def _create_toolbar(self) -> QWidget:
-        """Create toolbar with zoom mode controls."""
+        """Create toolbar with title and reset button."""
         toolbar_widget = QWidget()
         toolbar_layout = QHBoxLayout()
         toolbar_layout.setContentsMargins(5, 2, 5, 2)
@@ -259,18 +264,10 @@ class SeismicViewerPyQtGraph(QWidget):
 
         toolbar_layout.addStretch()
 
-        # Zoom mode selector
-        toolbar_layout.addWidget(QLabel("Zoom Mode:"))
-        self.zoom_mode_combo = QComboBox()
-        self.zoom_mode_combo.addItems([
-            "Both Axes (2D)",
-            "X-Axis Only (Traces)",
-            "Y-Axis Only (Time)",
-            "Pan Mode",
-            "Box Zoom"
-        ])
-        self.zoom_mode_combo.currentIndexChanged.connect(self._on_zoom_mode_changed)
-        toolbar_layout.addWidget(self.zoom_mode_combo)
+        # Mouse controls hint
+        controls_label = QLabel("LMB: Zoom | MMB: Pan | RMB: Reset")
+        controls_label.setStyleSheet("color: #666666; font-size: 10px;")
+        toolbar_layout.addWidget(controls_label)
 
         # Reset view button
         reset_btn = QPushButton("Reset View")
@@ -399,7 +396,7 @@ class SeismicViewerPyQtGraph(QWidget):
         # Enable mouse interaction
         self.view_box.setMouseEnabled(x=True, y=True)
 
-        # Set default mouse mode (both axes)
+        # Set mouse mode to RectMode for left-button rectangle zoom
         self.view_box.setMouseMode(pg.ViewBox.RectMode)
 
         # Connect range change signal for synchronization
@@ -407,6 +404,12 @@ class SeismicViewerPyQtGraph(QWidget):
 
         # Connect mouse click for trace selection (for ISA)
         self.image_item.mouseClickEvent = self._on_image_clicked
+
+        # Install event filter for custom mouse handling:
+        # - Middle mouse: pan/drag
+        # - Right click: reset to full view
+        self.graphics_widget.scene().sigMouseClicked.connect(self._on_scene_mouse_clicked)
+        self.graphics_widget.viewport().installEventFilter(self)
 
     def _on_image_clicked(self, event):
         """Handle mouse click on image - emit trace index."""
@@ -427,23 +430,51 @@ class SeismicViewerPyQtGraph(QWidget):
         # Let PyQtGraph handle the event normally
         event.accept()
 
-    def _on_zoom_mode_changed(self, index: int):
-        """Handle zoom mode change."""
-        if index == 0:  # Both axes
-            self.view_box.setMouseEnabled(x=True, y=True)
-            self.view_box.setMouseMode(pg.ViewBox.RectMode)
-        elif index == 1:  # X-axis only
-            self.view_box.setMouseEnabled(x=True, y=False)
-            self.view_box.setMouseMode(pg.ViewBox.RectMode)
-        elif index == 2:  # Y-axis only
-            self.view_box.setMouseEnabled(x=False, y=True)
-            self.view_box.setMouseMode(pg.ViewBox.RectMode)
-        elif index == 3:  # Pan mode
-            self.view_box.setMouseEnabled(x=True, y=True)
-            self.view_box.setMouseMode(pg.ViewBox.PanMode)
-        elif index == 4:  # Box zoom
-            self.view_box.setMouseEnabled(x=True, y=True)
-            self.view_box.setMouseMode(pg.ViewBox.RectMode)
+    def _on_scene_mouse_clicked(self, event):
+        """Handle mouse click events on scene - right click resets view."""
+        if event.button() == Qt.MouseButton.RightButton:
+            self._reset_view_local()
+
+    def eventFilter(self, obj, event):
+        """Event filter for middle mouse button panning."""
+        if event.type() == QEvent.Type.MouseButtonPress:
+            if event.button() == Qt.MouseButton.MiddleButton:
+                self._is_panning = True
+                self._pan_start = event.pos()
+                return True
+
+        elif event.type() == QEvent.Type.MouseMove:
+            if self._is_panning and self._pan_start is not None:
+                # Calculate delta in view coordinates
+                delta = event.pos() - self._pan_start
+                self._pan_start = event.pos()
+
+                # Get current view range
+                vr = self.view_box.viewRange()
+                x_range = vr[0][1] - vr[0][0]
+                y_range = vr[1][1] - vr[1][0]
+
+                # Get widget size for scaling
+                widget_size = self.graphics_widget.size()
+
+                # Convert pixel delta to data coordinates
+                dx = -delta.x() * x_range / widget_size.width()
+                dy = delta.y() * y_range / widget_size.height()
+
+                # Y is inverted (seismic convention: time increases downward)
+                dy = -dy
+
+                # Pan the view
+                self.view_box.translateBy(x=dx, y=dy)
+                return True
+
+        elif event.type() == QEvent.Type.MouseButtonRelease:
+            if event.button() == Qt.MouseButton.MiddleButton:
+                self._is_panning = False
+                self._pan_start = None
+                return True
+
+        return super().eventFilter(obj, event)
 
     def _on_view_range_changed(self):
         """Handle view range change from mouse interaction."""
@@ -858,32 +889,26 @@ class SeismicViewerPyQtGraph(QWidget):
 
     def wheelEvent(self, event):
         """
-        Handle mouse wheel for zooming.
+        Handle mouse wheel for zooming with modifier key support.
 
         - Wheel only: Zoom both axes
-        - Ctrl + Wheel: Zoom X-axis only
-        - Shift + Wheel: Zoom Y-axis only
+        - Ctrl + Wheel: Zoom X-axis only (traces)
+        - Shift + Wheel: Zoom Y-axis only (time)
         """
         modifiers = event.modifiers()
 
         if modifiers == Qt.KeyboardModifier.ControlModifier:
             # X-axis zoom only
-            self.zoom_mode_combo.setCurrentIndex(1)
+            self.view_box.setMouseEnabled(x=True, y=False)
         elif modifiers == Qt.KeyboardModifier.ShiftModifier:
             # Y-axis zoom only
-            self.zoom_mode_combo.setCurrentIndex(2)
+            self.view_box.setMouseEnabled(x=False, y=True)
         else:
             # Both axes zoom
-            self.zoom_mode_combo.setCurrentIndex(0)
+            self.view_box.setMouseEnabled(x=True, y=True)
 
         # Let the widget handle the actual zoom
         super().wheelEvent(event)
 
-    def mousePressEvent(self, event):
-        """Handle mouse press for custom interactions."""
-        if event.button() == Qt.MouseButton.MiddleButton:
-            # Middle click: reset view
-            self._reset_view_local()
-            event.accept()
-        else:
-            super().mousePressEvent(event)
+        # Reset to both axes enabled after wheel event
+        self.view_box.setMouseEnabled(x=True, y=True)

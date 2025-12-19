@@ -28,6 +28,17 @@ try:
 except ImportError:
     GPU_AVAILABLE = False
 
+# Try to import Metal kernel backend
+try:
+    from views.widgets.kernel_selector import KernelSelectorWidget
+    from processors.kernel_backend import (
+        KernelBackend, get_backend_info, is_metal_available,
+        set_global_backend, get_global_backend
+    )
+    METAL_BACKEND_AVAILABLE = True
+except ImportError:
+    METAL_BACKEND_AVAILABLE = False
+
 
 class ControlPanel(QWidget):
     """
@@ -141,6 +152,11 @@ class ControlPanel(QWidget):
 
         # Algorithm selection
         controls_layout.addWidget(self._create_algorithm_selector())
+
+        # Kernel backend selector (Metal C++ vs Python)
+        if METAL_BACKEND_AVAILABLE:
+            self.kernel_selector_group = self._create_kernel_selector_group()
+            controls_layout.addWidget(self.kernel_selector_group)
 
         # Processing controls (dynamic based on algorithm)
         self.bandpass_group = self._create_bandpass_group()
@@ -258,6 +274,38 @@ class ControlPanel(QWidget):
 
         group.setLayout(layout)
         return group
+
+    def _create_kernel_selector_group(self) -> QGroupBox:
+        """Create kernel backend selector group."""
+        group = QGroupBox("Compute Backend")
+        layout = QVBoxLayout()
+
+        # Kernel selector widget
+        self.kernel_selector = KernelSelectorWidget(
+            parent=self,
+            show_status=True,
+            compact=False
+        )
+        self.kernel_selector.backendChanged.connect(self._on_kernel_backend_changed)
+        layout.addWidget(self.kernel_selector)
+
+        group.setLayout(layout)
+        return group
+
+    def _on_kernel_backend_changed(self, backend: str):
+        """Handle kernel backend selection change."""
+        try:
+            backend_enum = KernelBackend(backend)
+            set_global_backend(backend_enum)
+            print(f"Kernel backend changed to: {backend}")
+        except Exception as e:
+            print(f"Error setting kernel backend: {e}")
+
+    def get_kernel_backend(self):
+        """Get currently selected kernel backend."""
+        if METAL_BACKEND_AVAILABLE and hasattr(self, 'kernel_selector'):
+            return self.kernel_selector.get_kernel_backend_enum()
+        return None
 
     def _create_bandpass_group(self) -> QGroupBox:
         """Create bandpass filter parameters group."""
@@ -2656,6 +2704,9 @@ class ControlPanel(QWidget):
                 best_basis = (transform_type in ['wpt', 'wpt_spatial'] and
                              self.dwt_best_basis_checkbox.isChecked())
 
+                # Get kernel backend for batch processing serialization
+                kernel_backend = self.get_kernel_backend() if METAL_BACKEND_AVAILABLE else None
+
                 processor = DWTDenoise(
                     wavelet=wavelet,
                     level=self.dwt_level_spin.value(),
@@ -2663,7 +2714,8 @@ class ControlPanel(QWidget):
                     threshold_mode=threshold_mode,
                     transform_type=transform_type,
                     aperture=self.dwt_aperture_spin.value(),
-                    best_basis=best_basis
+                    best_basis=best_basis,
+                    backend=kernel_backend
                 )
                 print(f"✓ Using DWT-Denoise ({transform_type.upper()})")
                 extra_info = ", best-basis" if best_basis else ""

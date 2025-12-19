@@ -21,7 +21,7 @@ WPT advantages over DWT:
 - Ideal for narrowband noise (ground roll, powerline harmonics)
 """
 import numpy as np
-from typing import Optional, Literal
+from typing import Optional, Literal, TYPE_CHECKING
 import logging
 from models.seismic_data import SeismicData
 from processors.base_processor import BaseProcessor
@@ -35,6 +35,16 @@ try:
 except ImportError:
     PYWT_AVAILABLE = False
     logger.warning("PyWavelets not available. Install with: pip install PyWavelets")
+
+# Try to import kernel backend for Metal C++ acceleration
+try:
+    from processors.kernel_backend import (
+        KernelBackend, get_dispatcher, get_effective_backend
+    )
+    KERNEL_BACKEND_AVAILABLE = True
+except ImportError:
+    KERNEL_BACKEND_AVAILABLE = False
+    KernelBackend = None
 
 
 class DWTDenoise(BaseProcessor):
@@ -61,7 +71,8 @@ class DWTDenoise(BaseProcessor):
                  threshold_mode: Literal['soft', 'hard'] = 'soft',
                  transform_type: Literal['dwt', 'swt', 'dwt_spatial', 'wpt', 'wpt_spatial'] = 'dwt',
                  aperture: int = 7,
-                 best_basis: bool = False):
+                 best_basis: bool = False,
+                 backend=None):
         """
         Initialize DWT-Denoise processor.
 
@@ -82,6 +93,10 @@ class DWTDenoise(BaseProcessor):
                 - 'wpt_spatial': WPT with spatial aperture processing
             aperture: Spatial aperture size for spatial modes (odd number)
             best_basis: For WPT modes, use best-basis selection (Shannon entropy)
+            backend: Kernel backend to use (KernelBackend enum or None for auto)
+                - None/AUTO: Auto-select best available (Metal > Python)
+                - PYTHON: Force Python implementation
+                - METAL_CPP: Force Metal C++ kernels
         """
         if not PYWT_AVAILABLE:
             raise ImportError("PyWavelets required. Install with: pip install PyWavelets")
@@ -93,6 +108,15 @@ class DWTDenoise(BaseProcessor):
         self.transform_type = transform_type
         self.aperture = aperture
         self.best_basis = best_basis
+        self.backend = backend
+
+        # Convert backend to string for serialization (needed for batch processing)
+        backend_str = None
+        if backend is not None:
+            if KERNEL_BACKEND_AVAILABLE and isinstance(backend, KernelBackend):
+                backend_str = backend.value
+            elif isinstance(backend, str):
+                backend_str = backend
 
         super().__init__(
             wavelet=wavelet,
@@ -101,7 +125,8 @@ class DWTDenoise(BaseProcessor):
             threshold_mode=threshold_mode,
             transform_type=transform_type,
             aperture=aperture,
-            best_basis=best_basis
+            best_basis=best_basis,
+            backend=backend_str
         )
 
     def _validate_params(self):
@@ -130,6 +155,39 @@ class DWTDenoise(BaseProcessor):
             desc += ", best-basis"
         return desc
 
+    def _get_backend_enum(self):
+        """Convert backend to KernelBackend enum, handling string from deserialization."""
+        if not KERNEL_BACKEND_AVAILABLE:
+            return None
+
+        backend = self.backend
+        if backend is None:
+            return None
+        if isinstance(backend, KernelBackend):
+            return backend
+        if isinstance(backend, str):
+            try:
+                return KernelBackend(backend)
+            except ValueError:
+                return None
+        return None
+
+    def _can_use_metal_backend(self) -> bool:
+        """Check if Metal backend can be used for this configuration."""
+        if not KERNEL_BACKEND_AVAILABLE:
+            return False
+
+        # Metal backend supports basic DWT and SWT modes
+        # Spatial and WPT modes require Python implementation
+        supported_modes = ['dwt', 'swt']
+        if self.transform_type not in supported_modes:
+            return False
+
+        # Check if Metal backend is available and selected
+        backend_enum = self._get_backend_enum()
+        effective = get_effective_backend(backend_enum)
+        return effective == KernelBackend.METAL_CPP
+
     def process(self, data: SeismicData) -> SeismicData:
         """
         Apply DWT-domain denoising to seismic data.
@@ -156,13 +214,58 @@ class DWTDenoise(BaseProcessor):
             max_level = pywt.dwt_max_level(n_samples, self.wavelet)
             self.level = min(max_level, 6)  # Cap at 6 for efficiency
 
+        # Check if we can use Metal backend for acceleration
+        use_metal = self._can_use_metal_backend()
+        backend_name = "Metal C++" if use_metal else "Python"
+
         logger.info(
-            f"DWT-Denoise: {n_traces} traces × {n_samples} samples | "
+            f"DWT-Denoise [{backend_name}]: {n_traces} traces × {n_samples} samples | "
             f"Wavelet: {self.wavelet} | Level: {self.level} | "
             f"Type: {self.transform_type} | k={self.threshold_k}"
         )
 
-        # Process based on transform type
+        # Try Metal backend for supported modes
+        if use_metal:
+            try:
+                backend_enum = self._get_backend_enum()
+                dispatcher = get_dispatcher(backend_enum)
+                if self.transform_type == 'dwt':
+                    denoised_traces, metrics = dispatcher.dwt_denoise(
+                        traces,
+                        wavelet=self.wavelet,
+                        level=self.level,
+                        threshold_mode=self.threshold_mode,
+                        threshold_k=self.threshold_k
+                    )
+                else:  # swt
+                    denoised_traces, metrics = dispatcher.swt_denoise(
+                        traces,
+                        wavelet=self.wavelet,
+                        level=self.level,
+                        threshold_mode=self.threshold_mode,
+                        threshold_k=self.threshold_k
+                    )
+
+                elapsed = metrics.get('total_time_ms', 0) / 1000
+                throughput = n_traces / elapsed if elapsed > 0 else 0
+                logger.info(
+                    f"DWT-Denoise complete [Metal]: {elapsed*1000:.1f}ms | "
+                    f"{throughput:.0f} traces/s"
+                )
+
+                return SeismicData(
+                    traces=denoised_traces,
+                    sample_rate=data.sample_rate,
+                    metadata={
+                        **data.metadata,
+                        'processor': self.get_description(),
+                        'backend': 'metal_cpp'
+                    }
+                )
+            except Exception as e:
+                logger.warning(f"Metal backend failed, falling back to Python: {e}")
+
+        # Process based on transform type (Python implementation)
         if self.transform_type == 'dwt':
             denoised_traces = self._process_dwt(traces)
         elif self.transform_type == 'swt':

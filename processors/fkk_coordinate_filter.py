@@ -142,7 +142,7 @@ class FKKCoordinateFilter:
         else:
             headers_df = data.headers
 
-        sample_rate_ms = data.sample_rate * 1000  # Convert to ms
+        sample_rate_ms = data.sample_rate  # Already in milliseconds (SeismicData convention)
 
         logger.info(f"FKK Coordinate Filter: {data.traces.shape[1]} traces, "
                    f"bin_size={self.coord_config.bin_size_x}x{self.coord_config.bin_size_y}m")

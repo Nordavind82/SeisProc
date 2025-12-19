@@ -659,8 +659,9 @@ def process_gather_range(
             _worker_log("Skipping noise zarr (not needed for this mode)")
 
         # Calculate sample interval in ms for mute calculation
+        # NOTE: task.sample_rate is already in milliseconds (from SeismicData convention)
         _super_early_log(">>> Calculating sample_interval_ms...")
-        sample_interval_ms = task.sample_rate * 1000.0  # sample_rate is in seconds
+        sample_interval_ms = task.sample_rate  # sample_rate is already in milliseconds
         _super_early_log(f">>> sample_interval_ms = {sample_interval_ms}")
         _worker_log(f"Sample interval: {sample_interval_ms} ms")
 

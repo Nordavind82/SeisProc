@@ -436,7 +436,7 @@ class Denoise3D(BaseProcessor):
         if len(headers_df) != n_traces:
             raise ValueError(f"Header count ({len(headers_df)}) != trace count ({n_traces})")
 
-        sample_rate_ms = data.sample_rate * 1000  # Convert to ms
+        sample_rate_ms = data.sample_rate  # Already in milliseconds (SeismicData convention)
 
         logger.info(
             f"3D-Denoise: {n_traces} traces x {n_samples} samples | "
