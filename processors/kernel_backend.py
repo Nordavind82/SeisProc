@@ -51,9 +51,10 @@ def _check_metal_availability() -> bool:
         return _metal_available
 
     # Try multiple import paths for the Metal module
+    # Note: seismic_metal/python/ is added to sys.path above, so direct import works
     import_paths = [
-        "seismic_metal.python.seismic_metal",  # Package structure
-        "seismic_metal",  # Direct import (if in path)
+        "seismic_metal",  # Direct import (seismic_metal/python/ added to sys.path)
+        "seismic_metal.python.seismic_metal",  # Fallback: package structure
     ]
 
     for import_path in import_paths:

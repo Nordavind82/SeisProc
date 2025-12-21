@@ -1,5 +1,16 @@
 """Models package - data structures and state management."""
 from .seismic_data import SeismicData
+
+# Job management models
+from .job import Job, JobState, JobType, JobPriority
+from .job_progress import JobProgress, WorkerProgress, ProgressUpdate
+from .job_config import (
+    JobConfig,
+    ResourceRequirements,
+    CheckpointConfig,
+    RetryConfig,
+    CancellationConfig,
+)
 from .lazy_seismic_data import LazySeismicData
 from .viewport_state import ViewportState, ViewportLimits
 from .gather_navigator import GatherNavigator
@@ -46,6 +57,20 @@ from .header_mapping import (
 )
 
 __all__ = [
+    # Job management
+    'Job',
+    'JobState',
+    'JobType',
+    'JobPriority',
+    'JobProgress',
+    'WorkerProgress',
+    'ProgressUpdate',
+    'JobConfig',
+    'ResourceRequirements',
+    'CheckpointConfig',
+    'RetryConfig',
+    'CancellationConfig',
+    # Data models
     'SeismicData',
     'LazySeismicData',
     'ViewportState',

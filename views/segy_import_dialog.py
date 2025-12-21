@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFont, QIcon
 from typing import Optional, List
+from pathlib import Path
 import sys
 
 # Set up logging
@@ -30,6 +31,7 @@ from utils.segy_import import (
     ImportStageResult,
     get_optimal_workers,
 )
+from utils.ray_orchestration.segy_workers import SEGYImportWorker, SEGYImportResult
 from models.seismic_data import SeismicData
 from models.app_settings import get_settings, AppSettings
 
@@ -47,6 +49,7 @@ class SEGYImportDialog(QDialog):
     """
 
     import_completed = pyqtSignal(object, object, object, str)  # data (SeismicData or LazySeismicData), headers_df, ensembles_df, file_path
+    import_started = pyqtSignal(object, str, dict)  # worker, output_dir, file_info - for async import
 
     def __init__(self, parent=None, initial_file: str = None):
         logger.info("SEGYImportDialog.__init__() - START")
@@ -72,6 +75,9 @@ class SEGYImportDialog(QDialog):
             self.header_mapping = HeaderMapping()
             self.reader = None
             self._initial_file = initial_file  # Store for loading after UI init
+            self._import_worker: Optional[SEGYImportWorker] = None
+            self._import_output_dir: Optional[str] = None  # Store for completion handler
+            self._import_file_info: Optional[dict] = None  # Store for completion handler
             logger.info("  ✓ Instance variables initialized")
 
             logger.info("  → Calling _init_ui()...")
@@ -1443,14 +1449,13 @@ The binary header contains file-level metadata about the entire SEG-Y dataset.
         self.accept()
 
     def _import_streaming(self, output_dir: str, file_info: dict, ensemble_keys: List[str]):
-        """Import using multiprocess parallel method (for large files)."""
-        import time
-        import json
-        import shutil
-        from pathlib import Path
+        """Import using multiprocess parallel method (for large files).
 
-        n_traces = file_info['n_traces']
-        n_samples = file_info['n_samples']
+        Uses SEGYImportWorker for background execution with centralized
+        job dashboard progress tracking (no built-in QProgressDialogs).
+        """
+        import json
+
         n_workers = get_optimal_workers()
 
         # Configure parallel import
@@ -1463,129 +1468,69 @@ The binary header contains file-level metadata about the entire SEG-Y dataset.
             chunk_size=DEFAULT_CHUNK_SIZE
         )
 
-        coordinator = ParallelImportCoordinator(config)
-        cancelled = False
+        # Store state for completion handler
+        self._import_output_dir = output_dir
+        self._import_file_info = file_info
+
+        # Create worker
+        self._import_worker = SEGYImportWorker(
+            config,
+            job_name=Path(self.segy_file).name,
+            parent=self
+        )
+
+        # Show job dashboard if available (through parent main window)
+        self._show_job_dashboard()
+
+        # Start background import
+        logger.info(f"Starting parallel import with {n_workers} workers (Job Dashboard)...")
+        self._import_worker.start()
+
+        # Emit signal for main window to take over worker handling
+        # Pass worker, output_dir, and file_info so main window can handle completion
+        self.import_started.emit(
+            self._import_worker,
+            output_dir,
+            {
+                'file_info': file_info,
+                'segy_file': str(self.segy_file),
+                'header_mapping': self.header_mapping.to_dict() if self.header_mapping else {},
+                'qc_config': self._get_qc_config() if hasattr(self, '_get_qc_config') else None,
+            }
+        )
+
+        # Close dialog - main window handles the rest via import_started signal
+        self.accept()
+
+    def _get_qc_config(self) -> Optional[dict]:
+        """Get QC configuration if enabled."""
+        if hasattr(self, 'qc_inlines_enabled') and self.qc_inlines_enabled.isChecked():
+            qc_inlines = self._parse_qc_inlines()
+            if qc_inlines:
+                return {
+                    'enabled': True,
+                    'inline_numbers': qc_inlines,
+                    'auto_open_batch': self.auto_open_qc_batch.isChecked(),
+                }
+        return None
+
+    def _show_job_dashboard(self):
+        """Show the job dashboard in main window if available."""
+        try:
+            parent = self.parent()
+            if parent and hasattr(parent, '_job_integration') and parent._job_integration:
+                parent._job_integration.show_job_dashboard()
+        except Exception as e:
+            logger.debug(f"Could not show job dashboard: {e}")
+
+    def _on_streaming_import_complete(self, result: SEGYImportResult):
+        """Handle successful streaming import completion."""
+        import json
+
+        output_dir = self._import_output_dir
+        file_info = self._import_file_info
 
         try:
-            # ═══════════════════════════════════════════════════════════════════
-            # STAGE 1: Parallel Import (traces progress)
-            # ═══════════════════════════════════════════════════════════════════
-            import_progress = QProgressDialog(
-                f"Parallel import with {n_workers} workers...",
-                "Cancel", 0, n_traces, self
-            )
-            import_progress.setWindowModality(Qt.WindowModality.WindowModal)
-            import_progress.setWindowTitle("Parallel Import - Stage 1/4")
-            import_progress.setMinimumDuration(0)
-            import_progress.setValue(0)
-
-            def on_import_progress(prog: ImportProgress):
-                nonlocal cancelled
-                if import_progress.wasCanceled():
-                    coordinator.cancel()
-                    cancelled = True
-                    return
-                import_progress.setValue(prog.current_traces)
-
-                # Format ETA
-                if prog.eta_seconds > 0 and prog.eta_seconds < float('inf'):
-                    eta_str = f"{prog.eta_seconds:.0f}s"
-                else:
-                    eta_str = "calculating..."
-
-                import_progress.setLabelText(
-                    f"Importing traces ({prog.active_workers} workers)...\n"
-                    f"{prog.current_traces:,} / {prog.total_traces:,} traces\n"
-                    f"ETA: {eta_str}"
-                )
-                QApplication.processEvents()
-
-            # Run parallel import stage
-            print(f"Starting parallel import with {n_workers} workers...")
-            stage_result = coordinator.run_parallel_import(progress_callback=on_import_progress)
-
-            was_canceled = import_progress.wasCanceled()
-            import_progress.close()
-
-            if was_canceled or coordinator.was_cancelled:
-                raise InterruptedError("Import cancelled by user")
-
-            if not stage_result.success:
-                raise RuntimeError(stage_result.error)
-
-            # ═══════════════════════════════════════════════════════════════════
-            # STAGE 2: Merge Headers (segments progress)
-            # ═══════════════════════════════════════════════════════════════════
-            n_segments = len(stage_result.worker_results)
-
-            merge_progress = QProgressDialog(
-                "Merging header files...",
-                None, 0, n_segments, self  # No cancel for post-processing
-            )
-            merge_progress.setWindowModality(Qt.WindowModality.WindowModal)
-            merge_progress.setWindowTitle("Parallel Import - Stage 2/4")
-            merge_progress.setMinimumDuration(0)
-            merge_progress.setCancelButton(None)
-
-            def on_merge_progress(segments_done: int, total: int):
-                merge_progress.setValue(segments_done)
-                merge_progress.setLabelText(f"Merging headers... segment {segments_done}/{total}")
-                QApplication.processEvents()
-
-            headers_path = coordinator.run_merge_headers(stage_result, progress_callback=on_merge_progress)
-            merge_progress.close()
-
-            # ═══════════════════════════════════════════════════════════════════
-            # STAGE 3: Build Ensemble Index (traces progress)
-            # ═══════════════════════════════════════════════════════════════════
-            index_progress = QProgressDialog(
-                "Building ensemble index...",
-                None, 0, n_traces, self
-            )
-            index_progress.setWindowModality(Qt.WindowModality.WindowModal)
-            index_progress.setWindowTitle("Parallel Import - Stage 3/4")
-            index_progress.setMinimumDuration(0)
-            index_progress.setCancelButton(None)
-
-            def on_index_progress(traces_done: int, total: int):
-                index_progress.setValue(traces_done)
-                index_progress.setLabelText(
-                    f"Building ensemble index...\n"
-                    f"{traces_done:,} / {total:,} traces scanned"
-                )
-                QApplication.processEvents()
-
-            coordinator.run_build_index(stage_result, headers_path, progress_callback=on_index_progress)
-            index_progress.close()
-
-            # ═══════════════════════════════════════════════════════════════════
-            # STAGE 4: Cleanup (files progress)
-            # ═══════════════════════════════════════════════════════════════════
-            cleanup_progress = QProgressDialog(
-                "Cleaning up temporary files...",
-                None, 0, n_segments, self
-            )
-            cleanup_progress.setWindowModality(Qt.WindowModality.WindowModal)
-            cleanup_progress.setWindowTitle("Parallel Import - Stage 4/4")
-            cleanup_progress.setMinimumDuration(0)
-            cleanup_progress.setCancelButton(None)
-
-            def on_cleanup_progress(files_done: int, total: int):
-                cleanup_progress.setValue(files_done)
-                cleanup_progress.setLabelText(f"Cleaning up... {files_done}/{total} files")
-                QApplication.processEvents()
-
-            coordinator.run_cleanup(stage_result, progress_callback=on_cleanup_progress)
-            cleanup_progress.close()
-
-            # ═══════════════════════════════════════════════════════════════════
-            # Get Final Result
-            # ═══════════════════════════════════════════════════════════════════
-            result = coordinator.get_final_result(stage_result, headers_path)
-
-            if not result.success:
-                raise RuntimeError(result.error)
-
             # Update metadata with source file info
             metadata_path = Path(output_dir) / 'metadata.json'
             if metadata_path.exists():
@@ -1612,17 +1557,21 @@ The binary header contains file-level metadata about the entire SEG-Y dataset.
                     json.dump(metadata, f, indent=2)
 
             # Show success statistics
+            n_traces = file_info['n_traces']
+            n_samples = file_info['n_samples']
+            n_workers = get_optimal_workers()
+            elapsed = result.elapsed_time
+
             stats_text = f"""
 Parallel Import Successful!
 
 Data Statistics:
 - Traces: {n_traces:,}
 - Samples: {n_samples}
-- Segments: {result.n_segments}
 
 Performance:
-- Import time: {result.elapsed_time:.1f}s
-- Throughput: {n_traces / result.elapsed_time:,.0f} traces/sec
+- Import time: {elapsed:.1f}s
+- Throughput: {n_traces / elapsed:,.0f} traces/sec
 - Workers used: {n_workers}
 
 Output: {output_dir}
@@ -1644,18 +1593,35 @@ Output: {output_dir}
 
             self.accept()
 
-        except InterruptedError:
-            # User cancelled - clean up
-            output_path = Path(output_dir)
-            if output_path.exists():
-                shutil.rmtree(output_path, ignore_errors=True)
-            QMessageBox.information(self, "Import Cancelled", "Import was cancelled by user.")
         except Exception as e:
-            # Error - clean up
+            logger.error(f"Error in import completion handler: {e}")
+            QMessageBox.critical(self, "Error", f"Error loading imported data:\n{e}")
+            self.setEnabled(True)
+            self.setWindowTitle("SEG-Y Import")
+
+    def _on_streaming_import_error(self, error_msg: str):
+        """Handle streaming import error or cancellation."""
+        import shutil
+
+        output_dir = self._import_output_dir
+
+        # Clean up partial output
+        if output_dir:
             output_path = Path(output_dir)
             if output_path.exists():
-                shutil.rmtree(output_path, ignore_errors=True)
-            raise
+                try:
+                    shutil.rmtree(output_path, ignore_errors=True)
+                except Exception:
+                    pass
+
+        # Re-enable dialog
+        self.setEnabled(True)
+        self.setWindowTitle("SEG-Y Import")
+
+        if "cancelled" in error_msg.lower():
+            QMessageBox.information(self, "Import Cancelled", "Import was cancelled by user.")
+        else:
+            QMessageBox.critical(self, "Import Failed", f"Import failed:\n{error_msg}")
 
     def _show_success_stats(self, storage: DataStorage, loaded_data, output_dir: str):
         """Show success statistics dialog."""

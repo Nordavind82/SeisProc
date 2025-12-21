@@ -42,7 +42,9 @@ std::tuple<std::vector<float>, KernelMetrics> stft_denoise(
     float threshold_k = 3.0f,
     float fmin = 0.0f,
     float fmax = 0.0f,
-    float sample_rate = 500.0f
+    float sample_rate = 500.0f,
+    bool low_amp_protection = true,
+    float low_amp_factor = 0.3f
 );
 
 /**

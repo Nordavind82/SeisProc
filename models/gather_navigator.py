@@ -106,6 +106,10 @@ class GatherNavigator(QObject):
             lazy_data: LazySeismicData for memory-efficient loading
             ensembles_df: DataFrame with ensemble boundaries (optional)
         """
+        import time
+        start_time = time.perf_counter()
+        logger.debug(f"[GatherNavigator.load_lazy_data] Starting with lazy_data={lazy_data}")
+
         self.lazy_data = lazy_data
         self.full_data = None  # Clear full data to prevent conflicts
         self.headers_df = None  # Headers loaded on-demand from lazy_data
@@ -117,22 +121,30 @@ class GatherNavigator(QObject):
         if ensembles_df is not None and len(ensembles_df) > 0:
             self.n_gathers = len(ensembles_df)
             self.current_gather_id = 0
+            logger.debug(f"[GatherNavigator.load_lazy_data] Loaded {self.n_gathers} gathers from ensembles_df")
 
             # Extract ensemble keys from metadata if available
             if 'header_mapping' in lazy_data.metadata:
                 mapping = lazy_data.metadata['header_mapping']
                 self.ensemble_keys = mapping.get('ensemble_keys', [])
+                logger.debug(f"[GatherNavigator.load_lazy_data] Ensemble keys: {self.ensemble_keys}")
         else:
             # No ensembles - treat as single gather
             self.n_gathers = 1
             self.current_gather_id = 0
             self.ensemble_keys = []
+            logger.debug("[GatherNavigator.load_lazy_data] Single gather mode (no ensembles)")
 
         # Start prefetch thread for lazy loading
+        logger.debug("[GatherNavigator.load_lazy_data] Starting prefetch thread...")
         self._start_prefetch_thread()
 
         # Emit initial state
         self._emit_state_changes()
+
+        elapsed = time.perf_counter() - start_time
+        logger.info(f"[GatherNavigator.load_lazy_data] COMPLETE in {elapsed:.3f}s - "
+                   f"{self.n_gathers} gathers, keys={self.ensemble_keys}")
 
     def has_gathers(self) -> bool:
         """Check if data has multiple gathers."""
@@ -252,6 +264,10 @@ class GatherNavigator(QObject):
         Returns:
             Tuple of (gather_data, gather_headers, gather_info)
         """
+        import time
+        total_start = time.perf_counter()
+        logger.debug(f"[GatherNavigator._get_lazy_gather] Loading gather {gather_id}...")
+
         # Check cache first (thread-safe)
         with self._cache_lock:
             if gather_id in self._ensemble_cache:
@@ -267,15 +283,32 @@ class GatherNavigator(QObject):
                     )
 
                 gather_info = self._get_gather_info(gather_id)
+                logger.debug(f"[GatherNavigator._get_lazy_gather] CACHE HIT for gather {gather_id} "
+                            f"in {time.perf_counter() - total_start:.3f}s")
                 return gather_data, gather_headers, gather_info
 
         # Cache miss - load from Zarr (outside lock to avoid blocking other threads)
         with self._cache_lock:
             self._cache_misses += 1
+        logger.debug(f"[GatherNavigator._get_lazy_gather] CACHE MISS for gather {gather_id}, loading from disk...")
+
+        timings = {}
 
         if not self.has_gathers():
-            # Load all data for single gather mode
-            gather_traces = self.lazy_data.get_trace_range(0, self.lazy_data.n_traces)
+            # Single gather mode - for very large datasets, load a limited window
+            # to avoid memory exhaustion (22M traces = 142GB for float32 1600 samples)
+            MAX_TRACES_SINGLE_GATHER = 10000  # Limit to 10K traces for initial display
+
+            n_traces_to_load = self.lazy_data.n_traces
+            if n_traces_to_load > MAX_TRACES_SINGLE_GATHER:
+                logger.warning(f"[GatherNavigator._get_lazy_gather] Single gather has {n_traces_to_load:,} traces - "
+                              f"limiting display to first {MAX_TRACES_SINGLE_GATHER:,} traces to avoid memory issues. "
+                              f"Consider importing with ensemble keys for navigation.")
+                n_traces_to_load = MAX_TRACES_SINGLE_GATHER
+
+            step_start = time.perf_counter()
+            gather_traces = self.lazy_data.get_trace_range(0, n_traces_to_load)
+            timings['load_traces'] = time.perf_counter() - step_start
 
             gather_data = SeismicData(
                 traces=gather_traces,
@@ -283,13 +316,17 @@ class GatherNavigator(QObject):
                 metadata={
                     **self.lazy_data.metadata,
                     'gather_id': 0,
-                    'n_traces': self.lazy_data.n_traces
+                    'n_traces': n_traces_to_load,
+                    'total_traces': self.lazy_data.n_traces,
+                    'limited_view': n_traces_to_load < self.lazy_data.n_traces
                 }
             )
 
-            # Load headers for all traces
-            trace_indices = list(range(self.lazy_data.n_traces))
+            # Load headers for displayed traces only
+            step_start = time.perf_counter()
+            trace_indices = list(range(n_traces_to_load))
             gather_headers = self.lazy_data.get_headers(trace_indices)
+            timings['load_headers'] = time.perf_counter() - step_start
         else:
             # Load specific ensemble
             ensemble = self.ensembles_df.iloc[gather_id]
@@ -298,8 +335,14 @@ class GatherNavigator(QObject):
             end_trace = int(ensemble['end_trace'])
             n_traces = int(ensemble['n_traces'])
 
+            logger.debug(f"[GatherNavigator._get_lazy_gather] Loading ensemble {ensemble_id}: "
+                        f"traces {start_trace}-{end_trace} ({n_traces} traces)")
+
             # Load ensemble traces from Zarr
+            step_start = time.perf_counter()
             gather_traces = self.lazy_data.get_ensemble(ensemble_id)
+            timings['load_traces'] = time.perf_counter() - step_start
+            logger.debug(f"[GatherNavigator._get_lazy_gather] Traces loaded in {timings['load_traces']:.3f}s")
 
             # Create SeismicData for this gather
             gather_data = SeismicData(
@@ -316,21 +359,32 @@ class GatherNavigator(QObject):
             )
 
             # Load headers for this gather
+            step_start = time.perf_counter()
             trace_indices = list(range(start_trace, end_trace + 1))
             gather_headers = self.lazy_data.get_headers(trace_indices)
             gather_headers = gather_headers.reset_index(drop=True)
+            timings['load_headers'] = time.perf_counter() - step_start
+            logger.debug(f"[GatherNavigator._get_lazy_gather] Headers loaded in {timings['load_headers']:.3f}s")
 
         # Add to cache with LRU eviction
+        step_start = time.perf_counter()
         self._add_to_cache(gather_id, gather_data, gather_headers)
+        timings['add_cache'] = time.perf_counter() - step_start
 
         # Apply sorting if sort keys are set
         if self.sort_keys:
+            step_start = time.perf_counter()
             gather_data, gather_headers = self._sort_gather_traces(
                 gather_data, gather_headers
             )
+            timings['sort'] = time.perf_counter() - step_start
 
         # Get gather info
         gather_info = self._get_gather_info(gather_id)
+
+        total_elapsed = time.perf_counter() - total_start
+        logger.info(f"[GatherNavigator._get_lazy_gather] Gather {gather_id} loaded in {total_elapsed:.3f}s "
+                   f"(traces: {timings.get('load_traces', 0):.3f}s, headers: {timings.get('load_headers', 0):.3f}s)")
 
         return gather_data, gather_headers, gather_info
 

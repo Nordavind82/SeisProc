@@ -153,7 +153,9 @@ def stft_denoise(
     threshold_k: float = 3.0,
     fmin: float = 0.0,
     fmax: float = 0.0,
-    sample_rate: float = 500.0
+    sample_rate: float = 500.0,
+    low_amp_protection: bool = True,
+    low_amp_factor: float = 0.3
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     """
     Apply STFT denoising using Metal GPU acceleration.
@@ -174,6 +176,10 @@ def stft_denoise(
         Frequency range (0 = no limit)
     sample_rate : float
         Sample rate in Hz
+    low_amp_protection : bool
+        Prevent inflation of low-amplitude samples (default True)
+    low_amp_factor : float
+        Threshold for low-amplitude protection as fraction of median (default 0.3)
 
     Returns
     -------
@@ -187,7 +193,8 @@ def stft_denoise(
 
     return _metal_module.stft_denoise(
         traces, nperseg, noverlap, aperture,
-        threshold_k, fmin, fmax, sample_rate
+        threshold_k, fmin, fmax, sample_rate,
+        low_amp_protection, low_amp_factor
     )
 
 

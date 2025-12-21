@@ -799,6 +799,15 @@ def process_gather_range(
 
         # Process each gather in assigned range
         _worker_log(f"Starting gather processing loop: {task.start_gather} to {task.end_gather}", include_memory=True)
+
+        # Performance tracking accumulators
+        _perf_read_times = []
+        _perf_process_times = []
+        _perf_write_times = []
+        _perf_gather_sizes = []
+        _perf_total_bytes_read = 0
+        _perf_total_bytes_written = 0
+
         for gather_idx in range(task.start_gather, task.end_gather + 1):
             # Get gather boundaries from ensemble index
             ensemble = ensemble_df.iloc[gather_idx]
@@ -811,13 +820,22 @@ def process_gather_range(
             if log_this_gather:
                 _worker_log(f"Processing gather {gather_idx} ({n_traces} traces, trace range {g_start}-{g_end})", include_memory=True)
 
-            # Load gather traces from input
+            # Load gather traces from input - TIMED
+            _t_read_start = time.perf_counter()
             if log_this_gather:
                 _worker_log(f"  Loading {n_traces} traces from input zarr...", include_memory=True)
             gather_traces = np.array(input_zarr[:, g_start:g_end + 1])
+            _t_read_end = time.perf_counter()
+            _read_time_ms = (_t_read_end - _t_read_start) * 1000
+            _perf_read_times.append(_read_time_ms)
+            _perf_gather_sizes.append(gather_traces.nbytes)
+            _perf_total_bytes_read += gather_traces.nbytes
+
             if log_this_gather:
+                _read_speed_mbs = (gather_traces.nbytes / (1024*1024)) / (_read_time_ms / 1000) if _read_time_ms > 0 else 0
                 _worker_log(f"  Gather loaded: shape={gather_traces.shape}, dtype={gather_traces.dtype}, "
-                           f"size={gather_traces.nbytes/(1024*1024):.2f}MB", include_memory=True)
+                           f"size={gather_traces.nbytes/(1024*1024):.2f}MB, "
+                           f"READ TIME: {_read_time_ms:.1f}ms ({_read_speed_mbs:.1f} MB/s)", include_memory=True)
 
             # Get gather headers (needed for FKKProcessor and mute)
             gather_headers = None
@@ -862,12 +880,16 @@ def process_gather_range(
                 }
             )
 
-            # Process the gather
+            # Process the gather - TIMED
+            _t_process_start = time.perf_counter()
             if log_this_gather:
                 _worker_log(f"  Processing gather with {processor.__class__.__name__}...", include_memory=True)
             processed = processor.process(gather_data)
+            _t_process_end = time.perf_counter()
+            _process_time_ms = (_t_process_end - _t_process_start) * 1000
+            _perf_process_times.append(_process_time_ms)
             if log_this_gather:
-                _worker_log(f"  Processing complete", include_memory=True)
+                _worker_log(f"  Processing complete, PROCESS TIME: {_process_time_ms:.1f}ms", include_memory=True)
 
             # Get processed traces
             processed_traces = processed.traces
@@ -923,9 +945,17 @@ def process_gather_range(
                 if sorting_enabled and sort_indices is not None and sort_writer is not None:
                     sort_writer.write_mapping(gather_idx, g_start, g_end, sort_indices)
 
-                # Write noise to output (noise goes to noise_zarr which is the primary output)
+                # Write noise to output (noise goes to noise_zarr which is the primary output) - TIMED
+                _t_write_start = time.perf_counter()
                 if noise_zarr is not None:
                     noise_zarr[:, g_start:g_end + 1] = gather_traces
+                    _perf_total_bytes_written += gather_traces.nbytes
+                _t_write_end = time.perf_counter()
+                _write_time_ms = (_t_write_end - _t_write_start) * 1000
+                _perf_write_times.append(_write_time_ms)
+                if log_this_gather:
+                    _write_speed_mbs = (gather_traces.nbytes / (1024*1024)) / (_write_time_ms / 1000) if _write_time_ms > 0 else 0
+                    _worker_log(f"  WRITE TIME: {_write_time_ms:.1f}ms ({_write_speed_mbs:.1f} MB/s)", include_memory=True)
 
                 # Cleanup
                 del gather_traces
@@ -974,13 +1004,25 @@ def process_gather_range(
                 if sorting_enabled and sort_indices is not None and sort_writer is not None:
                     sort_writer.write_mapping(gather_idx, g_start, g_end, sort_indices)
 
-                # Write processed traces to output
+                # Write processed traces to output - TIMED
+                _t_write_start = time.perf_counter()
+                _bytes_written_this_gather = 0
                 if output_zarr is not None:
                     output_zarr[:, g_start:g_end + 1] = processed_traces
+                    _bytes_written_this_gather += processed_traces.nbytes
 
                 # Write noise traces if enabled
                 if noise_traces is not None and noise_zarr is not None:
                     noise_zarr[:, g_start:g_end + 1] = noise_traces
+                    _bytes_written_this_gather += noise_traces.nbytes
+
+                _t_write_end = time.perf_counter()
+                _write_time_ms = (_t_write_end - _t_write_start) * 1000
+                _perf_write_times.append(_write_time_ms)
+                _perf_total_bytes_written += _bytes_written_this_gather
+                if log_this_gather:
+                    _write_speed_mbs = (_bytes_written_this_gather / (1024*1024)) / (_write_time_ms / 1000) if _write_time_ms > 0 else 0
+                    _worker_log(f"  WRITE TIME: {_write_time_ms:.1f}ms ({_write_speed_mbs:.1f} MB/s)", include_memory=True)
 
                 # Cleanup
                 del processed_traces
@@ -1008,14 +1050,56 @@ def process_gather_range(
 
         elapsed = time.time() - start_time
 
-        # Log successful completion
-        _worker_log("=" * 50)
+        # Log successful completion with DETAILED PERFORMANCE SUMMARY
+        _worker_log("=" * 60)
         _worker_log("WORKER COMPLETED SUCCESSFULLY", include_memory=True)
         _worker_log(f"Gathers processed: {gathers_done}")
         _worker_log(f"Traces processed: {traces_done}")
         _worker_log(f"Elapsed time: {elapsed:.2f}s")
         _worker_log(f"Throughput: {traces_done/elapsed:.0f} traces/sec" if elapsed > 0 else "N/A")
-        _worker_log("=" * 50)
+        _worker_log("-" * 60)
+        _worker_log("PERFORMANCE BREAKDOWN (I/O vs Compute):")
+
+        # Calculate statistics
+        if _perf_read_times:
+            _avg_read = sum(_perf_read_times) / len(_perf_read_times)
+            _max_read = max(_perf_read_times)
+            _min_read = min(_perf_read_times)
+            _total_read = sum(_perf_read_times)
+            _read_speed = (_perf_total_bytes_read / (1024*1024)) / (_total_read / 1000) if _total_read > 0 else 0
+            _worker_log(f"  READ:    Total={_total_read/1000:.2f}s, Avg={_avg_read:.1f}ms, Min={_min_read:.1f}ms, Max={_max_read:.1f}ms")
+            _worker_log(f"           Data={_perf_total_bytes_read/(1024*1024*1024):.2f}GB, Speed={_read_speed:.1f}MB/s")
+
+        if _perf_process_times:
+            _avg_process = sum(_perf_process_times) / len(_perf_process_times)
+            _max_process = max(_perf_process_times)
+            _min_process = min(_perf_process_times)
+            _total_process = sum(_perf_process_times)
+            _worker_log(f"  PROCESS: Total={_total_process/1000:.2f}s, Avg={_avg_process:.1f}ms, Min={_min_process:.1f}ms, Max={_max_process:.1f}ms")
+
+        if _perf_write_times:
+            _avg_write = sum(_perf_write_times) / len(_perf_write_times)
+            _max_write = max(_perf_write_times)
+            _min_write = min(_perf_write_times)
+            _total_write = sum(_perf_write_times)
+            _write_speed = (_perf_total_bytes_written / (1024*1024)) / (_total_write / 1000) if _total_write > 0 else 0
+            _worker_log(f"  WRITE:   Total={_total_write/1000:.2f}s, Avg={_avg_write:.1f}ms, Min={_min_write:.1f}ms, Max={_max_write:.1f}ms")
+            _worker_log(f"           Data={_perf_total_bytes_written/(1024*1024*1024):.2f}GB, Speed={_write_speed:.1f}MB/s")
+
+        # Time breakdown
+        if _perf_read_times and _perf_process_times and _perf_write_times:
+            _total_measured = sum(_perf_read_times) + sum(_perf_process_times) + sum(_perf_write_times)
+            _pct_read = (sum(_perf_read_times) / _total_measured * 100) if _total_measured > 0 else 0
+            _pct_process = (sum(_perf_process_times) / _total_measured * 100) if _total_measured > 0 else 0
+            _pct_write = (sum(_perf_write_times) / _total_measured * 100) if _total_measured > 0 else 0
+            _worker_log("-" * 60)
+            _worker_log(f"  TIME BREAKDOWN: Read={_pct_read:.1f}%, Process={_pct_process:.1f}%, Write={_pct_write:.1f}%")
+            if _pct_read > 50 or _pct_write > 50:
+                _worker_log("  *** I/O BOUND: Disk is the bottleneck! ***")
+            elif _pct_process > 70:
+                _worker_log("  *** COMPUTE BOUND: Good - GPU/CPU is the bottleneck ***")
+
+        _worker_log("=" * 60)
         _close_worker_log()
 
         return ProcessingWorkerResult(

@@ -244,6 +244,7 @@ class SEGYFileHandle:
             'h': (2, '>h'),  # 2-byte signed int, big-endian
             'I': (4, '>I'),  # 4-byte unsigned int, big-endian
             'H': (2, '>H'),  # 2-byte unsigned int, big-endian
+            'f': (4, '>f'),  # 4-byte IEEE float, big-endian
         }
 
         # Read each trace header and extract fields from raw bytes
@@ -264,7 +265,11 @@ class SEGYFileHandle:
 
                     if len(raw_bytes) == size:
                         value = struct.unpack(struct_fmt, raw_bytes)[0]
-                        headers[trace_offset][name] = int(value)
+                        # Preserve float values, convert others to int
+                        if fmt_code == 'f':
+                            headers[trace_offset][name] = float(value)
+                        else:
+                            headers[trace_offset][name] = int(value)
                     else:
                         headers[trace_offset][name] = 0
 
@@ -461,6 +466,7 @@ class SEGYReader:
             'h': (2, '>h'),  # 2-byte signed int, big-endian
             'I': (4, '>I'),  # 4-byte unsigned int, big-endian
             'H': (2, '>H'),  # 2-byte unsigned int, big-endian
+            'f': (4, '>f'),  # 4-byte IEEE float, big-endian
         }
 
         # Read each trace header and extract fields from raw bytes
@@ -481,7 +487,11 @@ class SEGYReader:
 
                     if len(raw_bytes) == size:
                         value = struct.unpack(struct_fmt, raw_bytes)[0]
-                        headers[trace_offset][name] = int(value)
+                        # Preserve float values, convert others to int
+                        if fmt_code == 'f':
+                            headers[trace_offset][name] = float(value)
+                        else:
+                            headers[trace_offset][name] = int(value)
                     else:
                         headers[trace_offset][name] = 0
 

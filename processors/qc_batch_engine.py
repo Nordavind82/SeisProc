@@ -26,6 +26,7 @@ from typing import Optional, Dict, Any, List, Tuple, Callable
 from dataclasses import dataclass
 import json
 import logging
+import time
 
 from PyQt6.QtCore import QObject, pyqtSignal, QThread
 
@@ -33,6 +34,12 @@ from models.velocity_model import VelocityModel
 from processors.base_processor import BaseProcessor
 from processors.nmo_processor import NMOProcessor, NMOConfig
 from processors.cdp_stacker import CDPStacker, StackConfig, StackResult
+
+# Job management integration
+from utils.ray_orchestration.job_manager import get_job_manager
+from utils.ray_orchestration.qt_bridge import get_job_bridge
+from models.job import Job, JobType
+from models.job_config import JobConfig
 
 logger = logging.getLogger(__name__)
 
@@ -802,22 +809,149 @@ class QCBatchWorker(QThread):
         self.config = config
         self._engine: Optional[QCBatchEngine] = None
 
+        # Job management integration
+        self._job: Optional[Job] = None
+        self._job_manager = get_job_manager()
+        self._qt_bridge = get_job_bridge()
+        self._start_time: Optional[float] = None
+
     def run(self):
         """Execute batch processing in thread."""
+        self._start_time = time.time()
+
+        # Create job for Dashboard tracking
+        job_name = f"QC Batch: {len(self.config.inline_numbers)} inlines"
+        self._job = self._job_manager.submit_job(
+            name=job_name,
+            job_type=JobType.BATCH_PROCESS,
+            config=JobConfig.for_batch_processing(trace_count=0),
+            custom_config={
+                'inline_numbers': self.config.inline_numbers,
+                'output_dir': self.config.output_dir,
+                'n_processors': len(self.config.processing_chain),
+            },
+        )
+
+        # Emit queued and started signals
+        if self._qt_bridge:
+            try:
+                self._qt_bridge.signals.emit_job_queued(self._job)
+            except Exception:
+                pass
+
+        # Start job
+        self._job_manager.start_job(self._job.id)
+        if self._qt_bridge:
+            try:
+                self._qt_bridge.signals.emit_job_started(self._job)
+            except Exception:
+                pass
+
         self._engine = QCBatchEngine(self.config)
-        self._engine.progress_updated.connect(self.progress_updated.emit)
+        self._engine.progress_updated.connect(self._on_engine_progress)
 
         try:
             result = self._engine.run()
             if result and result.success:
+                # Complete job in job manager
+                elapsed = time.time() - self._start_time if self._start_time else 0
+                self._job_manager.complete_job(
+                    self._job.id,
+                    result={
+                        'output_dir': result.output_dir,
+                        'n_gathers': result.stats.get('n_gathers', 0),
+                        'elapsed_time': elapsed,
+                    },
+                )
+                if self._qt_bridge:
+                    try:
+                        self._qt_bridge.signals.emit_job_completed(self._job)
+                        self._qt_bridge.signals.emit_state_changed(self._job)
+                    except Exception:
+                        pass
                 self.finished_with_result.emit(result)
             else:
-                self.error_occurred.emit(
-                    result.error_message if result else "Processing cancelled or failed"
-                )
+                # Fail or cancel job
+                error_msg = result.error_message if result else "Processing cancelled or failed"
+                if "cancelled" in error_msg.lower():
+                    self._job_manager.cancel_job(self._job.id)
+                else:
+                    self._job_manager.fail_job(self._job.id, error=error_msg)
+                if self._qt_bridge:
+                    try:
+                        if "cancelled" not in error_msg.lower():
+                            self._qt_bridge.signals.emit_job_failed(self._job)
+                        self._qt_bridge.signals.emit_state_changed(self._job)
+                    except Exception:
+                        pass
+                self.error_occurred.emit(error_msg)
         except Exception as e:
             logger.exception("Batch worker error")
+            # Fail job
+            self._job_manager.fail_job(self._job.id, error=str(e))
+            if self._qt_bridge:
+                try:
+                    self._qt_bridge.signals.emit_job_failed(self._job)
+                    self._qt_bridge.signals.emit_state_changed(self._job)
+                except Exception:
+                    pass
             self.error_occurred.emit(str(e))
+
+    def _on_engine_progress(self, progress: BatchProgress):
+        """Handle progress from engine and emit to Dashboard."""
+        # Emit to local listeners
+        self.progress_updated.emit(progress)
+
+        # Emit to Dashboard with full statistics
+        if self._qt_bridge and self._job:
+            try:
+                # Calculate elapsed time and rate
+                elapsed = time.time() - self._start_time if self._start_time else 0.001
+                traces_per_sec = progress.current / elapsed if elapsed > 0 and progress.current > 0 else 0
+
+                # Detect compute kernel from processor chain
+                compute_kernel = self._detect_compute_kernel()
+
+                self._qt_bridge.signals.job_progress.emit(
+                    self._job.id,
+                    {
+                        'percent': progress.percent,
+                        'message': progress.message,
+                        'phase': progress.phase,
+                        'current_gathers': progress.gather_current or progress.current,
+                        'total_gathers': progress.total,
+                        'current_traces': progress.current,
+                        'total_traces': progress.total,
+                        'active_workers': 1,  # QC batch uses single-threaded processing
+                        'traces_per_sec': traces_per_sec,
+                        'compute_kernel': compute_kernel,
+                    }
+                )
+            except Exception:
+                pass
+
+    def _detect_compute_kernel(self) -> str:
+        """Detect compute kernel from processing chain."""
+        if not hasattr(self, 'config') or not self.config.processing_chain:
+            return "CPU (Python)"
+
+        for proc_config in self.config.processing_chain:
+            backend = proc_config.get('params', {}).get('backend', '') or ''
+            backend_lower = backend.lower()
+            if backend_lower in ('metal', 'metal_cpp'):
+                return "Metal GPU"
+            elif backend_lower in ('cuda', 'gpu'):
+                return "CUDA GPU"
+            elif backend_lower == 'auto':
+                try:
+                    from processors.kernel_backend import get_backend_info
+                    info = get_backend_info()
+                    if info.get('effective_backend') == 'metal_cpp':
+                        return "Metal GPU (Auto)"
+                except ImportError:
+                    pass
+
+        return "CPU (Python)"
 
     def cancel(self):
         """Request cancellation."""

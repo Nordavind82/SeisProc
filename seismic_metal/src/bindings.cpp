@@ -109,7 +109,9 @@ py::tuple stft_denoise_py(
     float threshold_k,
     float fmin,
     float fmax,
-    float sample_rate
+    float sample_rate,
+    bool low_amp_protection,
+    float low_amp_factor
 ) {
     py::buffer_info buf = traces.request();
 
@@ -124,7 +126,8 @@ py::tuple stft_denoise_py(
     auto [output, metrics] = stft_denoise(
         data_ptr, n_samples, n_traces,
         nperseg, noverlap, aperture,
-        threshold_k, fmin, fmax, sample_rate
+        threshold_k, fmin, fmax, sample_rate,
+        low_amp_protection, low_amp_factor
     );
 
     py::array_t<float> result({n_samples, n_traces});
@@ -308,6 +311,8 @@ PYBIND11_MODULE(seismic_metal, m) {
           py::arg("fmin") = 0.0f,
           py::arg("fmax") = 0.0f,
           py::arg("sample_rate") = 500.0f,
+          py::arg("low_amp_protection") = true,
+          py::arg("low_amp_factor") = 0.3f,
           R"doc(
           Apply STFT denoising using Metal GPU acceleration.
 
@@ -327,6 +332,10 @@ PYBIND11_MODULE(seismic_metal, m) {
               Frequency range (0 = no limit)
           sample_rate : float
               Sample rate in Hz
+          low_amp_protection : bool
+              Prevent inflation of low-amplitude samples (default True)
+          low_amp_factor : float
+              Threshold for low-amplitude protection as fraction of median (default 0.3)
 
           Returns
           -------

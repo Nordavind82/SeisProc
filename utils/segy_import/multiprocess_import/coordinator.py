@@ -47,6 +47,10 @@ class ImportProgress:
     worker_progress: Dict[int, int] = field(default_factory=dict)
     elapsed_time: float = 0.0
     eta_seconds: float = 0.0
+    # I/O metrics for monitoring storage performance
+    io_rate_mbps: float = 0.0          # Current write rate in MB/s
+    io_rate_trend: str = ""            # '▲' rising, '▼' falling, '─' stable
+    io_stall_detected: bool = False    # True if I/O stall detected
 
 
 @dataclass
@@ -192,7 +196,7 @@ class ParallelImportCoordinator:
                     phase='merging',
                     current_traces=n_traces,
                     total_traces=n_traces,
-                    active_workers=0
+                    active_workers=1  # Merging uses 1 worker (main thread)
                 ))
 
             headers_path = self._merge_headers(output_dir, worker_results)
@@ -703,6 +707,25 @@ class ParallelImportCoordinator:
         results = []
         processed_futures = set()  # Track which futures we've already processed
 
+        # Rate tracking for improved ETA calculation
+        # Track recent rates to handle worker completion rate decay
+        rate_history = []  # List of (timestamp, traces_done, active_workers)
+        RATE_WINDOW_SIZE = 10  # Number of samples for moving average
+        last_rate_sample_time = 0.0
+        RATE_SAMPLE_INTERVAL = 0.5  # Sample rate every 0.5s
+
+        # I/O rate tracking for stall detection
+        # Each trace = n_samples * 4 bytes (float32)
+        bytes_per_trace = n_samples * 4
+        io_rate_history = []  # List of (timestamp, bytes_written, rate_mbps)
+        IO_RATE_WINDOW = 5  # Seconds for I/O rate calculation
+        last_io_sample_time = 0.0
+        IO_SAMPLE_INTERVAL = 1.0  # Sample I/O rate every second
+        stall_threshold_seconds = 3.0  # Detect stall if no progress for 3s
+        last_progress_time = time.time()
+        last_progress_traces = 0
+        io_stall_detected = False
+
         print(f"  Launching {len(tasks)} worker processes...")
 
         try:
@@ -758,17 +781,93 @@ class ParallelImportCoordinator:
                     if progress_callback:
                         total_done = sum(worker_progress.values())
                         elapsed = time.time() - start_time
-                        rate = total_done / elapsed if elapsed > 0 else 0
-                        eta = (n_traces - total_done) / rate if rate > 0 else 0
+                        active_workers = len(futures) - len(processed_futures)
+                        current_time = time.time()
+
+                        # Detect I/O stall (no progress for extended period)
+                        if total_done > last_progress_traces:
+                            last_progress_time = current_time
+                            last_progress_traces = total_done
+                            io_stall_detected = False
+                        elif current_time - last_progress_time > stall_threshold_seconds and total_done > 0:
+                            io_stall_detected = True
+
+                        # Sample rate periodically for moving average
+                        if elapsed - last_rate_sample_time >= RATE_SAMPLE_INTERVAL:
+                            rate_history.append((elapsed, total_done, active_workers))
+                            if len(rate_history) > RATE_WINDOW_SIZE:
+                                rate_history.pop(0)
+                            last_rate_sample_time = elapsed
+
+                        # Sample I/O rate periodically
+                        io_rate_mbps = 0.0
+                        io_rate_trend = ""
+                        if elapsed - last_io_sample_time >= IO_SAMPLE_INTERVAL:
+                            bytes_written = total_done * bytes_per_trace
+                            io_rate_history.append((elapsed, bytes_written))
+                            # Keep only recent samples within window
+                            io_rate_history = [(t, b) for t, b in io_rate_history if elapsed - t <= IO_RATE_WINDOW]
+                            last_io_sample_time = elapsed
+
+                        # Calculate I/O rate from history
+                        if len(io_rate_history) >= 2:
+                            old_time, old_bytes = io_rate_history[0]
+                            new_time, new_bytes = io_rate_history[-1]
+                            time_delta = new_time - old_time
+                            if time_delta > 0:
+                                bytes_delta = new_bytes - old_bytes
+                                io_rate_mbps = (bytes_delta / time_delta) / (1024 * 1024)
+
+                            # Calculate trend from last few samples
+                            if len(io_rate_history) >= 3:
+                                mid_idx = len(io_rate_history) // 2
+                                mid_time, mid_bytes = io_rate_history[mid_idx]
+                                first_half_rate = (mid_bytes - old_bytes) / (mid_time - old_time) if mid_time > old_time else 0
+                                second_half_rate = (new_bytes - mid_bytes) / (new_time - mid_time) if new_time > mid_time else 0
+                                if second_half_rate > first_half_rate * 1.1:
+                                    io_rate_trend = "▲"
+                                elif second_half_rate < first_half_rate * 0.9:
+                                    io_rate_trend = "▼"
+                                else:
+                                    io_rate_trend = "─"
+
+                        # Calculate ETA using recent rate with decay awareness
+                        if len(rate_history) >= 2:
+                            # Recent rate from sliding window
+                            old_time, old_traces, old_workers = rate_history[0]
+                            recent_rate = (total_done - old_traces) / (elapsed - old_time) if elapsed > old_time else 0
+
+                            # Estimate rate decay factor based on worker completion
+                            # As workers complete, rate decays proportionally
+                            if active_workers > 0 and old_workers > 0:
+                                # If workers are completing, adjust expected future rate
+                                worker_decay = active_workers / old_workers
+                                # Blend recent rate with decay estimate
+                                projected_rate = recent_rate * (0.7 + 0.3 * worker_decay)
+                            else:
+                                projected_rate = recent_rate
+
+                            # If I/O stall detected, be conservative with ETA
+                            if io_stall_detected:
+                                projected_rate *= 0.5  # Assume continued slowdown
+
+                            eta = (n_traces - total_done) / projected_rate if projected_rate > 0 else 0
+                        else:
+                            # Fallback to simple average for early stages
+                            rate = total_done / elapsed if elapsed > 0 else 0
+                            eta = (n_traces - total_done) / rate if rate > 0 else 0
 
                         progress_callback(ImportProgress(
                             phase='importing',
                             current_traces=total_done,
                             total_traces=n_traces,
-                            active_workers=len(futures) - len(processed_futures),
+                            active_workers=active_workers,
                             worker_progress=worker_progress.copy(),
                             elapsed_time=elapsed,
-                            eta_seconds=eta
+                            eta_seconds=eta,
+                            io_rate_mbps=io_rate_mbps,
+                            io_rate_trend=io_rate_trend,
+                            io_stall_detected=io_stall_detected
                         ))
 
                     # Small sleep to avoid busy-waiting

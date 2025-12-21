@@ -1,6 +1,14 @@
 """
 Coordinator for parallel multiprocess gather processing.
 
+DEPRECATED: This module uses ProcessPoolExecutor which has issues with
+Metal GPU initialization in child processes. Use the Ray-based
+RayProcessingCoordinator from utils.ray_orchestration instead:
+
+    from utils.ray_orchestration import RayProcessingCoordinator
+    coordinator = RayProcessingCoordinator(config)
+    result = coordinator.run()
+
 Orchestrates the full processing pipeline:
 1. Validate inputs and load metadata
 2. Pre-create shared output Zarr array
@@ -323,21 +331,27 @@ class ParallelProcessingCoordinator:
     """
     Orchestrates parallel multiprocess gather processing.
 
+    .. deprecated::
+        This class uses ProcessPoolExecutor which has issues with Metal GPU
+        initialization in forked processes. Use RayProcessingCoordinator from
+        utils.ray_orchestration instead, which properly initializes GPU
+        contexts in each Ray actor.
+
     Workers write directly to a pre-created shared Zarr array,
     eliminating the need for output merging.
 
     When sorting is enabled, traces are sorted within each gather
     and a sorted headers.parquet is created for export.
 
-    Usage:
-        config = ProcessingConfig(
-            input_storage_dir='/path/to/input',
-            output_storage_dir='/path/to/output',
-            processor_config=processor.to_dict(),
-            sort_options=SortOptions(enabled=True, sort_key='offset')
-        )
+    Usage (deprecated):
+        config = ProcessingConfig(...)
         coordinator = ParallelProcessingCoordinator(config)
         result = coordinator.run(progress_callback=update_ui)
+
+    New Usage (preferred):
+        from utils.ray_orchestration import RayProcessingCoordinator
+        coordinator = RayProcessingCoordinator(config)
+        result = coordinator.run()
     """
 
     def __init__(self, config: ProcessingConfig):
@@ -347,9 +361,19 @@ class ParallelProcessingCoordinator:
         Args:
             config: Processing configuration
         """
+        import warnings
+        warnings.warn(
+            "ParallelProcessingCoordinator is deprecated. Use "
+            "RayProcessingCoordinator from utils.ray_orchestration instead, "
+            "which properly supports Metal GPU initialization per worker.",
+            DeprecationWarning,
+            stacklevel=2
+        )
         self.config = config
         self.n_workers = config.n_workers or get_optimal_workers()
         self._cancel_requested = False
+        self._executor = None  # Store executor reference for cancellation
+        self._futures = {}  # Store futures for cancellation
 
     def run(
         self,
@@ -651,6 +675,9 @@ class ParallelProcessingCoordinator:
             # For backwards compatibility, output_zarr_path is the processed output (or noise if no processed)
             main_output_path = output_zarr_path if output_zarr_path else noise_zarr_path
 
+            # Validate all output files before declaring success
+            self._validate_output_files(output_dir, output_mode)
+
             # Log successful completion
             _debug_log("=" * 60)
             _debug_log("PARALLEL PROCESSING COMPLETED SUCCESSFULLY", include_memory=True)
@@ -784,21 +811,59 @@ class ParallelProcessingCoordinator:
         return str(noise_path)
 
     def _copy_metadata_files(self, input_dir: Path, output_dir: Path, metadata: dict):
-        """Copy metadata and index files to output."""
-        # Copy headers parquet
-        headers_src = input_dir / 'headers.parquet'
-        if headers_src.exists():
-            shutil.copy2(headers_src, output_dir / 'headers.parquet')
+        """Copy metadata and index files to output.
 
-        # Copy ensemble index
-        ensemble_src = input_dir / 'ensemble_index.parquet'
-        if ensemble_src.exists():
-            shutil.copy2(ensemble_src, output_dir / 'ensemble_index.parquet')
+        Raises
+        ------
+        FileNotFoundError
+            If required metadata files are missing from input
+        RuntimeError
+            If file copy operations fail
+        """
+        # Required files - raise error if missing
+        required_files = [
+            ('headers.parquet', 'Trace headers'),
+            ('ensemble_index.parquet', 'Ensemble/gather index'),
+        ]
 
-        # Copy trace index if exists
-        trace_idx_src = input_dir / 'trace_index.parquet'
-        if trace_idx_src.exists():
-            shutil.copy2(trace_idx_src, output_dir / 'trace_index.parquet')
+        for filename, description in required_files:
+            src = input_dir / filename
+            dst = output_dir / filename
+
+            if not src.exists():
+                raise FileNotFoundError(
+                    f"Required metadata file missing: {filename} ({description}). "
+                    f"Input dataset at {input_dir} may be corrupted or incomplete. "
+                    f"Try re-importing the original SEG-Y file."
+                )
+
+            try:
+                shutil.copy2(src, dst)
+                # Verify copy succeeded
+                if not dst.exists():
+                    raise RuntimeError(f"File copy failed: {filename} not created at {dst}")
+                _debug_log(f"Copied {filename} to output")
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to copy {filename}: {e}. "
+                    f"Check disk space and permissions."
+                ) from e
+
+        # Optional files - copy if exists, log if missing
+        optional_files = ['trace_index.parquet']
+
+        for filename in optional_files:
+            src = input_dir / filename
+            dst = output_dir / filename
+
+            if src.exists():
+                try:
+                    shutil.copy2(src, dst)
+                    _debug_log(f"Copied optional file {filename}")
+                except Exception as e:
+                    logger.warning(f"Failed to copy optional file {filename}: {e}")
+            else:
+                _debug_log(f"Optional file {filename} not present in input, skipping")
 
     def _run_workers(
         self,
@@ -1006,6 +1071,7 @@ class ParallelProcessingCoordinator:
         _early_log(">>> Entering ProcessPoolExecutor context...")
         try:
             with ProcessPoolExecutor(max_workers=self.n_workers, mp_context=mp_ctx) as executor:
+                self._executor = executor  # Store for cancellation
                 _early_log(">>> ProcessPoolExecutor created, submitting tasks with staggered startup...")
                 _debug_log("ProcessPoolExecutor created, submitting tasks with staggered startup...", include_memory=True)
 
@@ -1051,6 +1117,7 @@ class ParallelProcessingCoordinator:
 
                     future = executor.submit(process_gather_range, task, progress_queue)
                     futures[future] = task
+                    self._futures = futures  # Store for cancellation
                     _early_log(f">>> Task {i+1} submitted, waiting {STAGGER_DELAY}s before next...")
 
                     # Stagger startup - give each worker time to complete heavy imports
@@ -1133,8 +1200,8 @@ class ParallelProcessingCoordinator:
                         except Exception as cb_err:
                             _early_log(f">>> ERROR in progress_callback: {type(cb_err).__name__}: {cb_err}")
 
-                    # Small sleep to avoid busy-waiting
-                    time.sleep(0.1)
+                    # Sleep interval between UI updates (500ms to reduce blinking)
+                    time.sleep(0.5)
 
         except Exception as executor_err:
             _early_log(f">>> EXECUTOR EXCEPTION: {type(executor_err).__name__}: {executor_err}")
@@ -1259,12 +1326,27 @@ class ParallelProcessingCoordinator:
         gc.collect()
 
         # Copy ensemble index (gather boundaries remain the same, just internal order changed)
-        shutil.copy2(input_dir / 'ensemble_index.parquet', output_dir / 'ensemble_index.parquet')
+        ensemble_src = input_dir / 'ensemble_index.parquet'
+        ensemble_dst = output_dir / 'ensemble_index.parquet'
+        if not ensemble_src.exists():
+            raise FileNotFoundError(
+                f"Required file missing: ensemble_index.parquet. "
+                f"Input dataset at {input_dir} may be corrupted."
+            )
+        try:
+            shutil.copy2(ensemble_src, ensemble_dst)
+            if not ensemble_dst.exists():
+                raise RuntimeError("ensemble_index.parquet copy failed")
+        except Exception as e:
+            raise RuntimeError(f"Failed to copy ensemble_index.parquet: {e}") from e
 
-        # Copy trace index if exists
+        # Copy trace index if exists (optional)
         trace_idx_src = input_dir / 'trace_index.parquet'
         if trace_idx_src.exists():
-            shutil.copy2(trace_idx_src, output_dir / 'trace_index.parquet')
+            try:
+                shutil.copy2(trace_idx_src, output_dir / 'trace_index.parquet')
+            except Exception as e:
+                logger.warning(f"Failed to copy optional trace_index.parquet: {e}")
 
         print(f"    Sorted headers saved: {n_saved:,} traces")
         logger.info(f"Sorted headers complete: {n_saved:,} traces")
@@ -1326,9 +1408,89 @@ class ParallelProcessingCoordinator:
         with open(metadata_path, 'w') as f:
             json.dump(metadata, f, indent=2)
 
+    def _validate_output_files(self, output_dir: Path, output_mode: str) -> None:
+        """Validate all required output files exist after processing.
+
+        Parameters
+        ----------
+        output_dir : Path
+            Output directory to validate
+        output_mode : str
+            Output mode ('processed', 'noise', 'both')
+
+        Raises
+        ------
+        RuntimeError
+            If required output files are missing
+        """
+        required_files = [
+            'headers.parquet',
+            'ensemble_index.parquet',
+            'metadata.json',
+        ]
+
+        # Add appropriate zarr file based on output mode
+        if output_mode == 'noise':
+            required_files.append('noise.zarr')
+            # traces.zarr should be a symlink to noise.zarr
+        else:
+            required_files.append('traces.zarr')
+
+        if output_mode == 'both':
+            required_files.append('noise.zarr')
+
+        missing_files = []
+        for filename in required_files:
+            path = output_dir / filename
+            if not path.exists():
+                missing_files.append(filename)
+
+        if missing_files:
+            raise RuntimeError(
+                f"Output validation failed. Missing files in {output_dir}: "
+                f"{', '.join(missing_files)}. "
+                f"Processing may have failed silently. Check logs for details."
+            )
+
+        _debug_log(f"Output validation passed: all {len(required_files)} required files present")
+
     def cancel(self):
         """Request cancellation of processing."""
         self._cancel_requested = True
+        self._force_terminate_workers()
+
+    def _force_terminate_workers(self):
+        """Force terminate all worker processes."""
+        _early_log(">>> CANCEL: Force terminating worker processes...")
+
+        # Cancel pending futures
+        if self._futures:
+            for future in self._futures:
+                if not future.done():
+                    future.cancel()
+
+        # Shutdown executor and terminate processes
+        if self._executor:
+            try:
+                # Shutdown without waiting
+                self._executor.shutdown(wait=False, cancel_futures=True)
+
+                # Force terminate any processes still running
+                if hasattr(self._executor, '_processes'):
+                    for pid, process in list(self._executor._processes.items()):
+                        try:
+                            _early_log(f">>> CANCEL: Terminating worker process {pid}")
+                            process.terminate()
+                        except Exception as e:
+                            _early_log(f">>> CANCEL: Error terminating {pid}: {e}")
+                            try:
+                                process.kill()
+                            except Exception:
+                                pass
+            except Exception as e:
+                _early_log(f">>> CANCEL: Error during shutdown: {e}")
+
+        _early_log(">>> CANCEL: Worker termination complete")
 
     def _check_memory_budget(
         self,

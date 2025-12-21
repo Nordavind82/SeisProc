@@ -190,7 +190,9 @@ std::tuple<std::vector<float>, KernelMetrics> stft_denoise(
     float threshold_k,
     float fmin,
     float fmax,
-    float sample_rate
+    float sample_rate,
+    bool low_amp_protection,
+    float low_amp_factor
 ) {
     auto start_total = std::chrono::high_resolution_clock::now();
 
@@ -358,6 +360,12 @@ std::tuple<std::vector<float>, KernelMetrics> stft_denoise(
                     float new_dev = std::max(abs_dev - thresh, 0.0f);
                     float new_mag = std::max(median + sign * new_dev, 0.0f);
 
+                    // Low-amplitude protection: NEVER inflate any magnitude
+                    // Only allow attenuation (reduction), not amplification
+                    if (low_amp_protection && new_mag > mag) {
+                        new_mag = mag;  // Keep original, don't inflate
+                    }
+
                     stft[f * n_times + t] = std::polar(new_mag, phase);
                 }
             }
@@ -429,7 +437,8 @@ std::tuple<std::vector<float>, KernelMetrics> gabor_denoise(
     // For this implementation, delegate to STFT
     // A full implementation would use create_gaussian_window
     return stft_denoise(traces, n_samples, n_traces, window_size, noverlap,
-                        aperture, threshold_k, fmin, fmax, sample_rate);
+                        aperture, threshold_k, fmin, fmax, sample_rate,
+                        true, 0.3f);  // Default low_amp_protection enabled
 }
 
 std::tuple<std::vector<float>, std::vector<float>, std::vector<float>>

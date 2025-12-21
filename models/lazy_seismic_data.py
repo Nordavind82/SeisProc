@@ -9,8 +9,13 @@ import pandas as pd
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 import json
+import time
+import logging
 
 from utils.parquet_io import read_parquet
+
+# Set up module logger
+logger = logging.getLogger(__name__)
 
 
 class LazySeismicData:
@@ -52,24 +57,36 @@ class LazySeismicData:
             headers_path: Optional path to headers.parquet
             ensemble_index_path: Optional path to ensemble_index.parquet
         """
+        init_start = time.perf_counter()
+        logger.debug(f"[LazySeismicData.__init__] Starting initialization...")
+
         self.zarr_path = Path(zarr_path)
         self.metadata = metadata
         self.headers_path = headers_path
         self.ensemble_index_path = ensemble_index_path
 
         # Open Zarr array in read-only mode (memory-mapped, not loaded)
+        step_start = time.perf_counter()
         self._zarr_array = zarr.open_array(str(self.zarr_path), mode='r')
+        logger.debug(f"[LazySeismicData.__init__] Zarr array opened in {time.perf_counter() - step_start:.3f}s "
+                    f"- shape={self._zarr_array.shape}")
 
         # Cache ensemble index if available (small, can keep in memory)
         # Using Polars for faster loading when available
         self._ensemble_index = None
         if ensemble_index_path and ensemble_index_path.exists():
+            step_start = time.perf_counter()
+            logger.debug(f"[LazySeismicData.__init__] Loading ensemble index from: {ensemble_index_path}")
             self._ensemble_index = read_parquet(ensemble_index_path)
+            logger.debug(f"[LazySeismicData.__init__] Ensemble index loaded in {time.perf_counter() - step_start:.3f}s "
+                        f"- {len(self._ensemble_index)} ensembles")
 
         # Store metadata for quick access
         self._n_samples = int(metadata.get('n_samples', self._zarr_array.shape[0]))
         self._n_traces = int(metadata.get('n_traces', self._zarr_array.shape[1]))
         self._sample_rate = float(metadata.get('sample_rate', 2.0))
+
+        logger.debug(f"[LazySeismicData.__init__] COMPLETE in {time.perf_counter() - init_start:.3f}s")
 
     @classmethod
     def from_storage_dir(cls, storage_dir: str) -> 'LazySeismicData':
@@ -86,6 +103,9 @@ class LazySeismicData:
             FileNotFoundError: If required files don't exist
             ValueError: If metadata is invalid
         """
+        total_start = time.perf_counter()
+        logger.debug(f"[LazySeismicData.from_storage_dir] Starting from: {storage_dir}")
+
         storage_path = Path(storage_dir)
 
         # Handle case where user selected traces.zarr or noise.zarr directory directly
@@ -105,8 +125,10 @@ class LazySeismicData:
             raise FileNotFoundError(f"Metadata not found: {metadata_path}")
 
         # Load metadata
+        step_start = time.perf_counter()
         with open(metadata_path, 'r') as f:
             metadata = json.load(f)
+        logger.debug(f"[LazySeismicData.from_storage_dir] Metadata loaded in {time.perf_counter() - step_start:.3f}s")
 
         # Optional files
         headers_path = storage_path / 'headers.parquet'
@@ -115,7 +137,20 @@ class LazySeismicData:
         headers_path = headers_path if headers_path.exists() else None
         ensemble_index_path = ensemble_index_path if ensemble_index_path.exists() else None
 
-        return cls(zarr_path, metadata, headers_path, ensemble_index_path)
+        logger.debug(f"[LazySeismicData.from_storage_dir] Headers path: {headers_path}")
+        logger.debug(f"[LazySeismicData.from_storage_dir] Ensemble index path: {ensemble_index_path}")
+
+        # Create instance (this will open Zarr and load ensemble index)
+        step_start = time.perf_counter()
+        instance = cls(zarr_path, metadata, headers_path, ensemble_index_path)
+        logger.debug(f"[LazySeismicData.from_storage_dir] Instance created in {time.perf_counter() - step_start:.3f}s")
+
+        total_elapsed = time.perf_counter() - total_start
+        logger.info(f"[LazySeismicData.from_storage_dir] COMPLETE in {total_elapsed:.3f}s - "
+                   f"n_traces={instance.n_traces}, n_samples={instance.n_samples}, "
+                   f"ensembles={instance.get_ensemble_count()}")
+
+        return instance
 
     # Properties matching SeismicData interface
     @property
@@ -315,6 +350,10 @@ class LazySeismicData:
             >>> # Load all headers (use with caution for large datasets)
             >>> all_headers = lazy_data.get_headers()
         """
+        start_time = time.perf_counter()
+        n_indices = len(trace_indices) if trace_indices is not None else 'ALL'
+        logger.debug(f"[LazySeismicData.get_headers] Loading headers for {n_indices} traces...")
+
         if self.headers_path is None:
             raise ValueError("Headers not available for this dataset")
 
@@ -326,18 +365,31 @@ class LazySeismicData:
             try:
                 # Try Parquet filtering for efficiency
                 # This loads only relevant row groups instead of entire file
+                step_start = time.perf_counter()
                 df = read_parquet(
                     self.headers_path,
                     filters=[('trace_index', 'in', trace_list)]
                 )
-            except (ValueError, KeyError):
+                logger.debug(f"[LazySeismicData.get_headers] Filtered read in {time.perf_counter() - step_start:.3f}s")
+            except (ValueError, KeyError) as e:
                 # Fallback: load all and filter (if trace_index column doesn't exist or filtering fails)
+                logger.warning(f"[LazySeismicData.get_headers] Filtered read failed ({e}), falling back to full read...")
+                step_start = time.perf_counter()
                 df = read_parquet(self.headers_path)
+                logger.debug(f"[LazySeismicData.get_headers] Full parquet read in {time.perf_counter() - step_start:.3f}s")
                 if 'trace_index' in df.columns:
+                    step_start = time.perf_counter()
                     df = df[df['trace_index'].isin(trace_list)]
+                    logger.debug(f"[LazySeismicData.get_headers] DataFrame filter in {time.perf_counter() - step_start:.3f}s")
         else:
             # Load all headers (use with caution)
+            step_start = time.perf_counter()
             df = read_parquet(self.headers_path)
+            logger.warning(f"[LazySeismicData.get_headers] Loading ALL headers took {time.perf_counter() - step_start:.3f}s "
+                          f"- {len(df)} rows. Consider using trace_indices for efficiency.")
+
+        elapsed = time.perf_counter() - start_time
+        logger.debug(f"[LazySeismicData.get_headers] COMPLETE in {elapsed:.3f}s - returned {len(df)} rows")
 
         return df
 

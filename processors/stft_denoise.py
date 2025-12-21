@@ -14,6 +14,8 @@ Best suited for:
 - Broadband noise removal
 - Signals with slowly varying frequency content
 - When computational speed is important
+
+Supports Metal GPU acceleration on Apple Silicon for significant speedup.
 """
 import numpy as np
 from scipy import signal
@@ -30,11 +32,53 @@ logger = logging.getLogger(__name__)
 try:
     from joblib import Parallel, delayed
     import multiprocessing
+    import os
     JOBLIB_AVAILABLE = True
-    N_JOBS = max(1, multiprocessing.cpu_count() - 1)
+
+    # Check if running inside Ray worker (constrained CPU allocation)
+    # Ray sets RAY_NUM_CPUS or we can check for ray worker process
+    def _get_effective_n_jobs():
+        """Get optimal thread count respecting Ray CPU allocation."""
+        # Check Ray environment variable
+        ray_cpus = os.environ.get('RAY_NUM_CPUS')
+        if ray_cpus:
+            return max(1, int(float(ray_cpus)))
+
+        # Check if we're in a Ray worker by looking for ray import
+        try:
+            import ray
+            if ray.is_initialized():
+                # Inside Ray - use conservative thread count to avoid over-subscription
+                # Each Ray worker already runs in parallel, internal threading adds overhead
+                return 1
+        except (ImportError, Exception):
+            pass
+
+        # Standalone execution - use multiple cores
+        return max(1, multiprocessing.cpu_count() - 1)
+
+    N_JOBS = _get_effective_n_jobs()
 except ImportError:
     JOBLIB_AVAILABLE = False
     N_JOBS = 1
+
+# Try to import kernel backend for Metal C++ acceleration
+try:
+    from processors.kernel_backend import (
+        KernelBackend, get_dispatcher, get_effective_backend
+    )
+    KERNEL_BACKEND_AVAILABLE = True
+except ImportError:
+    KERNEL_BACKEND_AVAILABLE = False
+    logger.debug("Kernel backend module not available for STFT")
+
+# Try to import Metal STFT kernels
+try:
+    from seismic_metal import stft_denoise as metal_stft_denoise, is_available as metal_is_available
+    METAL_STFT_AVAILABLE = metal_is_available()
+except ImportError:
+    METAL_STFT_AVAILABLE = False
+    metal_stft_denoise = None
 
 
 class STFTDenoise(BaseProcessor):
@@ -61,7 +105,8 @@ class STFTDenoise(BaseProcessor):
                  threshold_mode: Literal['soft', 'hard', 'scaled', 'adaptive'] = 'adaptive',
                  time_smoothing: int = 1,
                  low_amp_protection: bool = True,
-                 low_amp_factor: float = 0.3):
+                 low_amp_factor: float = 0.3,
+                 backend=None):
         """
         Initialize STFT-Denoise processor.
 
@@ -81,6 +126,10 @@ class STFTDenoise(BaseProcessor):
                            >1 averages MAD over neighboring time bins)
             low_amp_protection: Prevent inflation of low-amplitude samples
             low_amp_factor: Threshold for low-amplitude protection (fraction of median)
+            backend: Kernel backend to use:
+                - None/AUTO: Auto-select best available (Metal > Python)
+                - PYTHON: Force Python implementation
+                - METAL_CPP: Force Metal C++ kernels
         """
         self.aperture = aperture
         self.fmin = fmin
@@ -92,6 +141,15 @@ class STFTDenoise(BaseProcessor):
         self.time_smoothing = time_smoothing
         self.low_amp_protection = low_amp_protection
         self.low_amp_factor = low_amp_factor
+        self.backend = backend
+
+        # Convert backend to string for serialization
+        backend_str = None
+        if backend is not None:
+            if KERNEL_BACKEND_AVAILABLE and isinstance(backend, KernelBackend):
+                backend_str = backend.value
+            elif isinstance(backend, str):
+                backend_str = backend
 
         super().__init__(
             aperture=aperture,
@@ -103,7 +161,8 @@ class STFTDenoise(BaseProcessor):
             threshold_mode=threshold_mode,
             time_smoothing=time_smoothing,
             low_amp_protection=low_amp_protection,
-            low_amp_factor=low_amp_factor
+            low_amp_factor=low_amp_factor,
+            backend=backend_str
         )
 
     def _validate_params(self):
@@ -128,6 +187,37 @@ class STFTDenoise(BaseProcessor):
             raise ValueError("time_smoothing must be at least 1")
         if self.low_amp_factor <= 0 or self.low_amp_factor >= 1:
             raise ValueError("low_amp_factor must be between 0 and 1")
+
+    def _get_backend_enum(self):
+        """Convert backend to KernelBackend enum, handling string from deserialization."""
+        if not KERNEL_BACKEND_AVAILABLE:
+            return None
+
+        backend = self.backend
+        if backend is None:
+            return KernelBackend.AUTO
+        if isinstance(backend, KernelBackend):
+            return backend
+        if isinstance(backend, str):
+            try:
+                return KernelBackend(backend)
+            except ValueError:
+                return KernelBackend.AUTO
+        return KernelBackend.AUTO
+
+    def _can_use_metal_backend(self) -> bool:
+        """Check if Metal backend can be used for this configuration."""
+        if not METAL_STFT_AVAILABLE:
+            return False
+
+        if not KERNEL_BACKEND_AVAILABLE:
+            # Metal available but no backend selector - use Metal
+            return True
+
+        # Check if Metal backend is available and selected
+        backend_enum = self._get_backend_enum()
+        effective = get_effective_backend(backend_enum)
+        return effective == KernelBackend.METAL_CPP
 
     def get_description(self) -> str:
         """Get processor description."""
@@ -157,16 +247,67 @@ class STFTDenoise(BaseProcessor):
         traces = data.traces.copy()
         n_samples, n_traces = traces.shape
 
-        # Log gather summary
-        parallel_info = f"Parallel({N_JOBS} cores)" if JOBLIB_AVAILABLE else "Sequential"
+        # Get sample rate for frequency conversion
+        sample_rate = 2.0 * data.nyquist_freq
+
+        # Check if we can use Metal backend
+        use_metal = self._can_use_metal_backend()
+        backend_name = "Metal GPU" if use_metal else "CPU"
+
         logger.info(
-            f"STFT-Denoise: {n_traces} traces x {n_samples} samples | "
+            f"STFT-Denoise [{backend_name}]: {n_traces} traces x {n_samples} samples | "
             f"Aperture: {self.aperture} | nperseg={self.nperseg} | "
             f"Freq: {self.fmin:.0f}-{self.fmax:.0f}Hz | "
-            f"k={self.threshold_k}, mode={self.threshold_mode} | "
-            f"{parallel_info}"
+            f"k={self.threshold_k}, mode={self.threshold_mode}"
         )
 
+        # Try Metal backend
+        if use_metal:
+            try:
+                # Ensure contiguous float32 array
+                traces_f32 = np.ascontiguousarray(traces, dtype=np.float32)
+
+                # Call Metal kernel
+                denoised_traces, metrics = metal_stft_denoise(
+                    traces_f32,
+                    nperseg=self.nperseg,
+                    noverlap=self.noverlap,
+                    aperture=self.aperture,
+                    threshold_k=self.threshold_k,
+                    fmin=self.fmin,
+                    fmax=self.fmax,
+                    sample_rate=sample_rate,
+                    low_amp_protection=self.low_amp_protection,
+                    low_amp_factor=self.low_amp_factor
+                )
+
+                elapsed_total = time.time() - start_time_total
+                throughput = n_traces / elapsed_total if elapsed_total > 0 else 0
+
+                # Energy ratio from metrics or compute
+                input_rms = np.sqrt(np.mean(traces**2))
+                output_rms = np.sqrt(np.mean(denoised_traces**2))
+                energy_ratio = output_rms / input_rms if input_rms > 0 else 0
+
+                logger.info(
+                    f"STFT-Denoise complete [Metal]: {elapsed_total*1000:.1f}ms | "
+                    f"{throughput:.0f} traces/s | Energy: {energy_ratio:.1%}"
+                )
+
+                return SeismicData(
+                    traces=denoised_traces,
+                    sample_rate=data.sample_rate,
+                    metadata={
+                        **data.metadata,
+                        'processor': self.get_description(),
+                        'backend': 'metal_cpp'
+                    }
+                )
+
+            except Exception as e:
+                logger.warning(f"Metal backend failed, falling back to Python: {e}")
+
+        # Python implementation (fallback or when Metal not available)
         # Validate aperture
         if n_traces < self.aperture:
             logger.warning(
@@ -177,13 +318,14 @@ class STFTDenoise(BaseProcessor):
         else:
             effective_aperture = self.aperture
 
-        # Get sample rate for frequency conversion
-        sample_rate = 2.0 * data.nyquist_freq
-
         half_aperture = effective_aperture // 2
 
         # Check if parallel processing is beneficial
         use_parallel = JOBLIB_AVAILABLE and n_traces > 50
+        parallel_info = f"Parallel({N_JOBS} cores)" if use_parallel else "Sequential"
+
+        if not use_metal:
+            logger.info(f"Using Python backend: {parallel_info}")
 
         if use_parallel:
             def process_single_trace(trace_idx):
@@ -389,11 +531,10 @@ class STFTDenoise(BaseProcessor):
             signs = np.where(magnitudes >= median_amp, 1, -1)
             new_magnitudes = np.maximum(median_amp + signs * new_deviations, 0)
 
-        # Apply low-amplitude protection
+        # Apply low-amplitude protection: NEVER inflate any magnitude
+        # Only allow attenuation (reduction), not amplification
         if self.low_amp_protection:
-            low_amp_threshold = median_amp * self.low_amp_factor
-            low_amp_mask = magnitudes < low_amp_threshold
-            inflation_mask = low_amp_mask & (new_magnitudes > magnitudes)
+            inflation_mask = new_magnitudes > magnitudes
             new_magnitudes = np.where(inflation_mask, magnitudes, new_magnitudes)
 
         return new_magnitudes

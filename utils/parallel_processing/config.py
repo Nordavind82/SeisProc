@@ -103,6 +103,8 @@ class ProcessingProgress:
     worker_progress: Dict[int, int] = field(default_factory=dict)
     elapsed_time: float = 0.0
     eta_seconds: float = 0.0
+    traces_per_sec: float = 0.0
+    compute_kernel: str = ""
 
 
 @dataclass

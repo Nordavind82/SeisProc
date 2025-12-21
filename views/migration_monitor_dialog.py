@@ -8,6 +8,7 @@ import logging
 import time
 from typing import Optional, Dict, Any, Callable
 from pathlib import Path
+from uuid import UUID
 
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -15,6 +16,12 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer
 from PyQt6.QtGui import QFont, QTextCursor
+
+# Job management integration
+from utils.ray_orchestration.job_manager import get_job_manager
+from utils.ray_orchestration.qt_bridge import get_job_bridge
+from models.job import Job, JobType
+from models.job_config import JobConfig
 
 logger = logging.getLogger(__name__)
 
@@ -493,6 +500,11 @@ class MigrationMonitorDialog(QDialog):
         self.worker: Optional[MigrationWorker] = None
         self.start_time: Optional[float] = None
 
+        # Job management integration
+        self._job: Optional[Job] = None
+        self._job_manager = get_job_manager()
+        self._qt_bridge = get_job_bridge()
+
         job_name = config.get('name', 'Migration Job')
         self.setWindowTitle(f"Migration: {job_name}")
         self.resize(700, 550)
@@ -598,6 +610,26 @@ class MigrationMonitorDialog(QDialog):
 
     def start_job(self):
         """Start the migration job."""
+        # Create job for Dashboard tracking
+        job_name = self.config.get('name', 'Migration Job')
+        self._job = self._job_manager.submit_job(
+            name=f"Migration: {job_name}",
+            job_type=JobType.BATCH_PROCESS,  # Use batch process type for migrations
+            config=JobConfig.for_batch_processing(trace_count=0),  # Trace count unknown
+            custom_config={
+                'input_file': self.config.get('input_file', ''),
+                'output_directory': self.config.get('output_directory', ''),
+                'migration_type': 'PSTM',
+            },
+        )
+
+        # Emit queued signal for Dashboard
+        if self._qt_bridge:
+            try:
+                self._qt_bridge.signals.emit_job_queued(self._job)
+            except Exception:
+                pass
+
         self.worker = MigrationWorker(self.config)
         self.worker.progress_updated.connect(self._on_progress)
         self.worker.log_message.connect(self._on_log)
@@ -606,6 +638,14 @@ class MigrationMonitorDialog(QDialog):
 
         self.start_time = time.time()
         self.timer.start(1000)
+
+        # Start the job in job manager
+        self._job_manager.start_job(self._job.id)
+        if self._qt_bridge:
+            try:
+                self._qt_bridge.signals.emit_job_started(self._job)
+            except Exception:
+                pass
 
         self._log("Starting migration job...", "info")
         self.worker.start()
@@ -619,6 +659,21 @@ class MigrationMonitorDialog(QDialog):
         self.overall_label.setText(f"{overall:.1f}%")
 
         self.bin_progress.setValue(int(bin_percent))
+
+        # Emit progress to Dashboard
+        if self._qt_bridge and self._job:
+            try:
+                self._qt_bridge.signals.job_progress.emit(
+                    self._job.id,
+                    {
+                        'percent': overall,
+                        'message': progress.get('message', 'Processing...'),
+                        'phase': progress.get('phase', 'migration'),
+                        'eta_seconds': progress.get('eta_seconds'),
+                    }
+                )
+            except Exception:
+                pass
 
     def _on_bin_started(self, bin_name: str, current: int, total: int):
         """Handle new bin started."""
@@ -716,6 +771,23 @@ class MigrationMonitorDialog(QDialog):
             self.overall_label.setText("100%")
             self.view_btn.setEnabled(True)
 
+            # Complete job in job manager
+            if self._job:
+                try:
+                    elapsed = time.time() - self.start_time if self.start_time else 0
+                    self._job_manager.complete_job(
+                        self._job.id,
+                        result={
+                            'output_directory': self.config.get('output_directory', ''),
+                            'elapsed_time': elapsed,
+                        },
+                    )
+                    if self._qt_bridge:
+                        self._qt_bridge.signals.emit_job_completed(self._job)
+                        self._qt_bridge.signals.emit_state_changed(self._job)
+                except Exception:
+                    pass
+
             QMessageBox.information(
                 self,
                 "Migration Complete",
@@ -724,6 +796,20 @@ class MigrationMonitorDialog(QDialog):
             )
         else:
             self._log(f"Job failed: {message}", "error")
+
+            # Fail or cancel job in job manager
+            if self._job:
+                try:
+                    if "cancelled" in message.lower():
+                        self._job_manager.cancel_job(self._job.id)
+                    else:
+                        self._job_manager.fail_job(self._job.id, error=message)
+                    if self._qt_bridge:
+                        if "cancelled" not in message.lower():
+                            self._qt_bridge.signals.emit_job_failed(self._job)
+                        self._qt_bridge.signals.emit_state_changed(self._job)
+                except Exception:
+                    pass
 
             if "cancelled" not in message.lower():
                 QMessageBox.warning(

@@ -10,7 +10,7 @@ import logging
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                               QMenuBar, QMenu, QFileDialog, QMessageBox, QSplitter,
                               QPushButton, QProgressDialog, QApplication, QDialog)
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
 from PyQt6.QtGui import QAction, QShortcut, QKeySequence
 import numpy as np
 import pandas as pd
@@ -55,6 +55,13 @@ from utils.volume_builder import build_volume_from_gathers, extract_traces_from_
 from dataclasses import dataclass
 from typing import Optional
 
+# Phase 4: Job Management and Monitoring Integration
+from views.main_window_integration import (
+    MainWindowJobIntegration,
+    add_view_menu_actions,
+)
+from utils.ray_orchestration.segy_workers import ParallelExportWorker, ParallelExportResult
+
 
 @dataclass
 class FKKVolumeBuildParams:
@@ -65,6 +72,267 @@ class FKKVolumeBuildParams:
     dy: float  # meters
     coordinate_units: str
     coord_scalar: float
+
+
+class ZarrLoadWorker(QThread):
+    """
+    Worker thread for loading Zarr/Parquet datasets without blocking the UI.
+
+    This prevents the app hang when loading large datasets by:
+    1. Running all I/O operations in a background thread
+    2. Emitting progress updates for UI feedback
+    3. Caching ensemble index to avoid duplicate reads
+
+    Signals
+    -------
+    progress : str
+        Status message for progress dialog
+    finished : tuple
+        (lazy_data, ensembles_df, stats, original_segy_path) on success
+    error : str
+        Error message if loading fails
+    """
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(object)  # tuple of results
+    error = pyqtSignal(str)
+
+    def __init__(self, data_dir: str, parent=None):
+        super().__init__(parent)
+        self.data_dir = data_dir
+        self._cancelled = False
+
+    def run(self):
+        """Load Zarr/Parquet data in background thread with detailed timing."""
+        import time
+        from utils.segy_import.data_storage import DataStorage
+        from models.lazy_seismic_data import LazySeismicData
+
+        timings = {}
+        total_start = time.perf_counter()
+
+        try:
+            # Step 1: Initialize LazySeismicData (reads ensemble_index.parquet)
+            self.progress.emit("Opening Zarr array and loading metadata...")
+            logger.debug(f"[ZarrLoadWorker] Step 1: Starting LazySeismicData.from_storage_dir({self.data_dir})")
+            step_start = time.perf_counter()
+
+            lazy_data = LazySeismicData.from_storage_dir(self.data_dir)
+
+            timings['lazy_data_init'] = time.perf_counter() - step_start
+            logger.debug(f"[ZarrLoadWorker] Step 1 DONE: LazySeismicData initialized in {timings['lazy_data_init']:.3f}s")
+            logger.debug(f"[ZarrLoadWorker]   - n_traces: {lazy_data.n_traces}, n_samples: {lazy_data.n_samples}")
+            logger.debug(f"[ZarrLoadWorker]   - ensemble_count: {lazy_data.get_ensemble_count()}")
+
+            if self._cancelled:
+                return
+
+            # Step 2: Reuse ensemble index from LazySeismicData (AVOID DUPLICATE READ)
+            self.progress.emit("Loading ensemble index...")
+            logger.debug("[ZarrLoadWorker] Step 2: Reusing ensemble index from LazySeismicData (no duplicate read)")
+            step_start = time.perf_counter()
+
+            # Use the already-loaded ensemble index instead of reading again
+            ensembles_df = lazy_data._ensemble_index
+
+            timings['ensemble_index'] = time.perf_counter() - step_start
+            logger.debug(f"[ZarrLoadWorker] Step 2 DONE: Ensemble index reused in {timings['ensemble_index']:.6f}s")
+            if ensembles_df is not None:
+                logger.debug(f"[ZarrLoadWorker]   - {len(ensembles_df)} ensembles")
+
+            if self._cancelled:
+                return
+
+            # Step 3: Extract original SEG-Y path from metadata
+            self.progress.emit("Reading metadata...")
+            logger.debug("[ZarrLoadWorker] Step 3: Extracting original SEG-Y path from metadata")
+            step_start = time.perf_counter()
+
+            original_segy_path = None
+            if hasattr(lazy_data, 'metadata') and lazy_data.metadata:
+                original_segy_path = lazy_data.metadata.get('original_segy_path')
+                if not original_segy_path:
+                    seismic_meta = lazy_data.metadata.get('seismic_metadata', {})
+                    original_segy_path = seismic_meta.get('original_segy_path') or seismic_meta.get('source_file')
+
+            timings['metadata'] = time.perf_counter() - step_start
+            logger.debug(f"[ZarrLoadWorker] Step 3 DONE: Metadata extracted in {timings['metadata']:.6f}s")
+            logger.debug(f"[ZarrLoadWorker]   - original_segy_path: {original_segy_path}")
+
+            if self._cancelled:
+                return
+
+            # Step 4: Get statistics (OPTIMIZED - avoid rglob)
+            self.progress.emit("Calculating statistics...")
+            logger.debug("[ZarrLoadWorker] Step 4: Getting statistics (optimized)")
+            step_start = time.perf_counter()
+
+            stats = self._get_statistics_fast(self.data_dir, lazy_data)
+
+            timings['statistics'] = time.perf_counter() - step_start
+            logger.debug(f"[ZarrLoadWorker] Step 4 DONE: Statistics calculated in {timings['statistics']:.3f}s")
+
+            if self._cancelled:
+                return
+
+            # Done!
+            timings['total'] = time.perf_counter() - total_start
+            logger.info(f"[ZarrLoadWorker] COMPLETE: Zarr data loaded in {timings['total']:.3f}s")
+            logger.info(f"[ZarrLoadWorker] Timing breakdown:")
+            for step, duration in timings.items():
+                logger.info(f"[ZarrLoadWorker]   - {step}: {duration:.3f}s")
+
+            # Emit result
+            result = (lazy_data, ensembles_df, stats, original_segy_path)
+            self.finished.emit(result)
+
+        except Exception as e:
+            import traceback
+            error_msg = f"Failed to load Zarr data: {str(e)}\n{traceback.format_exc()}"
+            logger.error(f"[ZarrLoadWorker] ERROR: {error_msg}")
+            self.error.emit(error_msg)
+
+    def _get_statistics_fast(self, data_dir: str, lazy_data) -> dict:
+        """
+        Get statistics WITHOUT slow rglob traversal.
+
+        Uses metadata and Zarr array properties instead of walking filesystem.
+        """
+        import time
+        from pathlib import Path
+        import pyarrow.parquet as pq
+
+        storage_path = Path(data_dir)
+        stats = {}
+
+        # Zarr stats from array properties (fast, no I/O)
+        zarr_path = storage_path / 'traces.zarr'
+        if not zarr_path.exists():
+            zarr_path = storage_path / 'noise.zarr'
+
+        if zarr_path.exists():
+            logger.debug(f"[ZarrLoadWorker] Getting Zarr stats from array properties (no rglob)")
+            z = zarr.open(str(zarr_path), mode='r')
+
+            # Calculate approximate size from array info (FAST - no file traversal)
+            # For zarr v3, nbytes is a method; for v2 it's a property
+            try:
+                if hasattr(z, 'nbytes_stored'):
+                    nbytes_stored = z.nbytes_stored
+                    size_bytes = nbytes_stored() if callable(nbytes_stored) else nbytes_stored
+                else:
+                    # Estimate from uncompressed size (assume ~4x compression)
+                    nbytes = z.nbytes
+                    nbytes_val = nbytes() if callable(nbytes) else nbytes
+                    size_bytes = nbytes_val / 4
+            except Exception as e:
+                logger.debug(f"[ZarrLoadWorker] Could not get precise size: {e}, estimating...")
+                # Fallback: estimate from shape and dtype
+                size_bytes = np.prod(z.shape) * np.dtype(z.dtype).itemsize / 4
+
+            stats['zarr'] = {
+                'shape': z.shape,
+                'dtype': str(z.dtype),
+                'chunks': z.chunks,
+                'size_mb': size_bytes / 1024 / 1024
+            }
+            logger.debug(f"[ZarrLoadWorker]   - Zarr shape: {z.shape}, chunks: {z.chunks}")
+
+        # Headers stats from parquet metadata only (fast)
+        headers_path = storage_path / 'headers.parquet'
+        if headers_path.exists():
+            logger.debug(f"[ZarrLoadWorker] Getting headers stats from parquet metadata")
+            parquet_file = pq.ParquetFile(headers_path)
+
+            # Use lazy_data.n_traces if available (already in memory)
+            n_traces = lazy_data.n_traces if lazy_data else parquet_file.metadata.num_rows
+
+            stats['headers'] = {
+                'n_traces': n_traces,
+                'n_columns': len(parquet_file.schema),
+                'columns': [field.name for field in parquet_file.schema],
+                'size_mb': headers_path.stat().st_size / 1024 / 1024
+            }
+            logger.debug(f"[ZarrLoadWorker]   - Headers: {n_traces} traces, {len(parquet_file.schema)} columns")
+
+        # Ensemble stats from already-loaded data (no I/O)
+        if lazy_data._ensemble_index is not None:
+            logger.debug(f"[ZarrLoadWorker] Getting ensemble stats from cached index")
+            df_ensembles = lazy_data._ensemble_index
+            stats['ensembles'] = {
+                'n_ensembles': len(df_ensembles),
+                'avg_traces_per_ensemble': df_ensembles['n_traces'].mean()
+            }
+
+        return stats
+
+    def cancel(self):
+        """Request cancellation of loading."""
+        self._cancelled = True
+        logger.debug("[ZarrLoadWorker] Cancellation requested")
+
+
+class BatchProcessingWorker(QThread):
+    """
+    Worker thread for running batch processing without blocking the UI.
+
+    Signals
+    -------
+    finished : object
+        Emitted when processing completes, carries the result
+    error : str
+        Emitted if processing fails with an exception
+    """
+    finished = pyqtSignal(object)  # ProcessingResult
+    error = pyqtSignal(str)  # Error message
+
+    def __init__(self, adapter, parent=None):
+        super().__init__(parent)
+        self._adapter = adapter
+        self._result = None
+        self._cancelled = False
+
+    def run(self):
+        """Run the processing in background thread."""
+        try:
+            self._result = self._adapter.run()
+            self.finished.emit(self._result)
+        except Exception as e:
+            import traceback
+            error_msg = f"{str(e)}\n{traceback.format_exc()}"
+            self.error.emit(error_msg)
+
+    def cancel(self):
+        """Request cancellation of the processing."""
+        self._cancelled = True
+        if self._adapter:
+            # Request graceful cancellation
+            self._adapter.cancel()
+            # Also force-cancel the coordinator if available
+            if hasattr(self._adapter, '_coordinator') and self._adapter._coordinator:
+                self._adapter._coordinator.cancel()
+                # Terminate worker processes
+                self._terminate_workers()
+
+    def _terminate_workers(self):
+        """Force terminate worker processes."""
+        if not self._adapter or not hasattr(self._adapter, '_coordinator'):
+            return
+        coordinator = self._adapter._coordinator
+        if coordinator and hasattr(coordinator, '_executor'):
+            executor = coordinator._executor
+            if executor:
+                try:
+                    # Shutdown executor and terminate processes
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    # Force kill any remaining processes
+                    if hasattr(executor, '_processes'):
+                        for pid, process in list(executor._processes.items()):
+                            try:
+                                process.terminate()
+                            except Exception:
+                                pass
+                except Exception as e:
+                    logger.warning(f"Error terminating workers: {e}")
 
 
 class MainWindow(QMainWindow):
@@ -130,6 +398,9 @@ class MainWindow(QMainWindow):
         self._create_menu_bar()
         self._setup_keyboard_shortcuts()
 
+        # Phase 4: Initialize job management integration
+        self._setup_job_integration()
+
         # Restore last session if enabled
         if self.app_settings.get_auto_load_last_dataset():
             self._restore_last_session()
@@ -152,6 +423,58 @@ class MainWindow(QMainWindow):
         self.dataset_navigator.datasets_cleared.connect(
             self._on_datasets_cleared
         )
+
+    def _setup_job_integration(self):
+        """Set up Phase 4 job management and monitoring integration."""
+        try:
+            # Import optional components (may not be installed)
+            from utils.ray_orchestration.qt_bridge import get_job_bridge
+            from utils.ray_orchestration.alert_manager import get_alert_manager
+
+            # Create integration instance
+            self._job_integration = MainWindowJobIntegration(self)
+
+            # Get optional managers
+            job_bridge = None
+            alert_manager = None
+
+            try:
+                job_bridge = get_job_bridge()
+            except Exception as e:
+                logger.debug(f"Job bridge not available: {e}")
+
+            try:
+                alert_manager = get_alert_manager()
+            except Exception as e:
+                logger.debug(f"Alert manager not available: {e}")
+
+            # Setup integration with available managers
+            self._job_integration.setup(
+                job_manager=job_bridge.manager if job_bridge else None,
+                signal_bridge=job_bridge,
+                alert_manager=alert_manager,
+                show_job_dock=False,  # Hidden by default
+                show_resource_dock=False,
+                show_analytics_dock=False,
+            )
+
+            # Connect Dashboard cancel signal to unified job cancellation handler
+            dashboard = self._job_integration.get_job_dashboard()
+            if dashboard:
+                dashboard.cancel_job_requested.connect(self._on_cancel_job_requested)
+
+            # Add View menu actions if View menu exists
+            if hasattr(self, '_view_menu') and self._view_menu:
+                add_view_menu_actions(self._view_menu, self._job_integration)
+
+            logger.info("Job management integration initialized successfully")
+
+        except ImportError as e:
+            logger.debug(f"Job integration components not available: {e}")
+            self._job_integration = None
+        except Exception as e:
+            logger.warning(f"Failed to initialize job integration: {e}")
+            self._job_integration = None
 
     def _init_ui(self):
         """Initialize user interface."""
@@ -412,6 +735,10 @@ class MainWindow(QMainWindow):
         # Set initial check state
         self._update_theme_menu_state()
 
+        # Phase 4: Job Management menu items (added after setup completes)
+        # Store view_menu reference for later use in _setup_job_integration
+        self._view_menu = view_menu
+
         # Edit menu (Settings)
         edit_menu = menubar.addMenu("&Edit")
 
@@ -578,6 +905,7 @@ class MainWindow(QMainWindow):
         try:
             dialog = SEGYImportDialog(self, initial_file=file_path)
             dialog.import_completed.connect(self._on_segy_imported)
+            dialog.import_started.connect(self._on_segy_import_started)
             dialog.exec()
         except Exception as e:
             logger.error(f"Failed to open SEG-Y file: {e}", exc_info=True)
@@ -618,6 +946,9 @@ class MainWindow(QMainWindow):
         """
         Populate the control panel sort keys list from headers.parquet.
 
+        Uses pyarrow to read only the schema (column names and types) without
+        loading the actual data, making this O(1) instead of O(n_traces).
+
         Args:
             storage_dir: Path to storage directory containing headers.parquet
         """
@@ -627,21 +958,31 @@ class MainWindow(QMainWindow):
 
         if headers_path.exists():
             try:
-                import pandas as pd
-                headers_df = pd.read_parquet(headers_path)
-                # Get numeric columns suitable for sorting
-                numeric_cols = headers_df.select_dtypes(include=['number']).columns.tolist()
+                import pyarrow.parquet as pq
+                import pyarrow as pa
+
+                # Read ONLY the schema, not the data - instant for any file size
+                parquet_file = pq.ParquetFile(headers_path)
+                schema = parquet_file.schema_arrow
+
+                # Get numeric columns from schema without loading data
+                numeric_cols = []
+                for field in schema:
+                    if pa.types.is_integer(field.type) or pa.types.is_floating(field.type):
+                        numeric_cols.append(field.name)
+
                 # Prioritize common sort keys
                 priority_keys = ['offset', 'TRACE_SEQUENCE_LINE', 'TraceNumber', 'FieldRecord',
                                 'CDP', 'SOURCE_X', 'SOURCE_Y', 'GROUP_X', 'GROUP_Y']
                 sort_keys = [k for k in priority_keys if k in numeric_cols]
                 sort_keys += [k for k in numeric_cols if k not in priority_keys]
-                logger.debug(f"Found {len(sort_keys)} sortable columns")
+                logger.debug(f"Found {len(sort_keys)} sortable columns (from schema)")
 
-                # Build 3D headers with unique counts
-                headers_with_counts = self._get_headers_with_counts(headers_df)
+                # Skip unique counts for large files - would require loading all data
+                # The 3D headers with counts will be populated lazily if needed
+                # headers_with_counts = self._get_headers_with_counts(headers_df)
             except Exception as e:
-                logger.warning(f"Could not read headers for sort keys: {e}")
+                logger.warning(f"Could not read headers schema for sort keys: {e}")
 
         # Fallback to defaults if no headers found
         if not sort_keys:
@@ -761,9 +1102,10 @@ class MainWindow(QMainWindow):
             dialog = SEGYImportDialog(self)
             logger.info("  ✓ SEGYImportDialog created successfully")
 
-            logger.info("  → Connecting import_completed signal...")
+            logger.info("  → Connecting signals...")
             dialog.import_completed.connect(self._on_segy_imported)
-            logger.info("  ✓ Signal connected")
+            dialog.import_started.connect(self._on_segy_import_started)
+            logger.info("  ✓ Signals connected")
 
             logger.info("  → Calling dialog.exec()...")
             dialog.exec()
@@ -775,8 +1117,137 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to open SEG-Y import dialog:\n{e}")
             raise
 
+    def _on_segy_import_started(self, worker, output_dir: str, import_info: dict):
+        """Handle async SEGY import started - take over worker from dialog."""
+        from utils.ray_orchestration.segy_workers import SEGYImportWorker, SEGYImportResult
+
+        logger.info(f"Taking over SEGY import worker for {import_info.get('segy_file', 'unknown')}")
+
+        # Reparent worker to main window so it survives dialog closure
+        worker.setParent(self)
+
+        # Store state for completion handler
+        self._segy_import_worker = worker
+        self._segy_import_output_dir = output_dir
+        self._segy_import_info = import_info
+
+        # Connect completion signals
+        worker.finished_with_result.connect(self._on_segy_import_complete)
+        worker.error_occurred.connect(self._on_segy_import_error)
+
+        self.statusBar().showMessage("Importing SEG-Y... (progress in Job Dashboard)")
+
+    def _on_segy_import_complete(self, result):
+        """Handle successful SEGY import completion."""
+        from utils.ray_orchestration.segy_workers import SEGYImportResult
+        from models.lazy_seismic_data import LazySeismicData
+        from utils.segy_import.data_storage import DataStorage
+        import json
+
+        output_dir = self._segy_import_output_dir
+        import_info = self._segy_import_info
+        file_info = import_info.get('file_info', {})
+        segy_file = import_info.get('segy_file', '')
+        header_mapping = import_info.get('header_mapping', {})
+        qc_config = import_info.get('qc_config')
+
+        try:
+            # Update metadata with source file info
+            metadata_path = Path(output_dir) / 'metadata.json'
+            if metadata_path.exists():
+                with open(metadata_path, 'r') as f:
+                    metadata = json.load(f)
+                metadata['seismic_metadata'] = {
+                    'source_file': segy_file,
+                    'original_segy_path': segy_file,
+                    'file_info': file_info,
+                    'header_mapping': header_mapping,
+                }
+
+                # Add QC configuration if provided
+                if qc_config:
+                    metadata['qc_config'] = qc_config
+
+                with open(metadata_path, 'w') as f:
+                    json.dump(metadata, f, indent=2)
+
+            # Show success statistics
+            n_traces = file_info.get('n_traces', 0)
+            n_samples = file_info.get('n_samples', 0)
+            elapsed = result.elapsed_time
+
+            stats_text = f"""
+Parallel Import Successful!
+
+Data Statistics:
+- Traces: {n_traces:,}
+- Samples: {n_samples}
+
+Performance:
+- Import time: {elapsed:.1f}s
+- Throughput: {n_traces / elapsed:,.0f} traces/sec
+
+Output: {output_dir}
+            """
+
+            QMessageBox.information(self, "Import Complete", stats_text)
+
+            # Load back for viewer using lazy loading
+            lazy_data = LazySeismicData.from_storage_dir(output_dir)
+
+            # Load ensemble index if exists
+            storage = DataStorage(output_dir)
+            ensembles_df = storage.get_ensemble_index()
+
+            # Use the existing _on_segy_imported handler to load data
+            self._on_segy_imported(lazy_data, None, ensembles_df, segy_file)
+
+            self.statusBar().showMessage(f"Import complete: {n_traces:,} traces", 5000)
+
+        except Exception as e:
+            logger.error(f"Error in import completion handler: {e}")
+            QMessageBox.critical(self, "Error", f"Error loading imported data:\n{e}")
+        finally:
+            # Clear state
+            self._segy_import_worker = None
+            self._segy_import_output_dir = None
+            self._segy_import_info = None
+
+    def _on_segy_import_error(self, error_msg: str):
+        """Handle SEGY import error or cancellation."""
+        import shutil
+
+        output_dir = self._segy_import_output_dir
+
+        # Clean up partial output
+        if output_dir:
+            output_path = Path(output_dir)
+            if output_path.exists():
+                try:
+                    shutil.rmtree(output_path, ignore_errors=True)
+                except Exception:
+                    pass
+
+        if "cancelled" in error_msg.lower():
+            self.statusBar().showMessage("Import cancelled.")
+            QMessageBox.information(self, "Import Cancelled", "Import was cancelled by user.")
+        else:
+            QMessageBox.critical(self, "Import Failed", f"Import failed:\n{error_msg}")
+            self.statusBar().showMessage("Import failed.")
+
+        # Clear state
+        self._segy_import_worker = None
+        self._segy_import_output_dir = None
+        self._segy_import_info = None
+
     def _on_segy_imported(self, seismic_data, headers_df, ensembles_df, file_path=None):
-        """Handle completed SEG-Y import."""
+        """Handle completed SEG-Y import with detailed timing."""
+        import time
+        timings = {}
+        total_start = time.perf_counter()
+
+        logger.debug("[_on_segy_imported] Starting import finalization...")
+
         # Store original SEG-Y file path for export (if available)
         if file_path is not None:
             self.original_segy_path = file_path
@@ -786,6 +1257,9 @@ class MainWindow(QMainWindow):
         # Register dataset with DatasetNavigator (for multi-dataset management)
         storage_path = None
         if isinstance(seismic_data, LazySeismicData):
+            step_start = time.perf_counter()
+            logger.debug("[_on_segy_imported] Step 1: Registering dataset with navigator...")
+
             # Get storage path from lazy data
             storage_path = Path(seismic_data.zarr_path).parent
             dataset_name = Path(file_path).stem if file_path else "Imported Data"
@@ -807,9 +1281,13 @@ class MainWindow(QMainWindow):
             if info:
                 self.app_settings.add_loaded_dataset(info.to_dict())
 
-            logger.info(f"Dataset registered: {dataset_name} ({dataset_id[:8]}...)")
+            timings['register_dataset'] = time.perf_counter() - step_start
+            logger.info(f"[_on_segy_imported] Dataset registered: {dataset_name} in {timings['register_dataset']:.3f}s")
 
         # Load data into gather navigator - use lazy loading if available
+        step_start = time.perf_counter()
+        logger.debug("[_on_segy_imported] Step 2: Loading into gather navigator...")
+
         if isinstance(seismic_data, LazySeismicData):
             self.gather_navigator.load_lazy_data(seismic_data, ensembles_df)
             # Store reference for QC operations (QC Stacking, Batch Processing)
@@ -821,16 +1299,26 @@ class MainWindow(QMainWindow):
             self.lazy_seismic_data = None
             self.input_storage_dir = None
 
+        timings['load_gather_nav'] = time.perf_counter() - step_start
+        logger.debug(f"[_on_segy_imported] Step 2 DONE: Gather navigator loaded in {timings['load_gather_nav']:.3f}s")
+
         # Store ensembles for reference
         self.ensembles_df = ensembles_df
 
-        # Display first gather
+        # Display first gather - THIS IS THE MAIN BLOCKING OPERATION
+        step_start = time.perf_counter()
+        logger.debug("[_on_segy_imported] Step 3: Displaying first gather (may block for header loading)...")
         self._display_current_gather()
+        timings['display_gather'] = time.perf_counter() - step_start
+        logger.info(f"[_on_segy_imported] Step 3 DONE: First gather displayed in {timings['display_gather']:.3f}s")
 
         # Update control panel with Nyquist frequency
         self.control_panel.update_nyquist(seismic_data.nyquist_freq)
 
         # Populate sort keys - try storage first, then headers_df, then gather_navigator
+        step_start = time.perf_counter()
+        logger.debug("[_on_segy_imported] Step 4: Populating sort keys...")
+
         if storage_path is not None:
             self._populate_sort_keys_from_storage(storage_path)
         elif headers_df is not None:
@@ -845,6 +1333,16 @@ class MainWindow(QMainWindow):
                 self.control_panel.set_available_sort_headers(
                     ['offset', 'TraceNumber', 'FieldRecord', 'CDP', 'TRACE_SEQUENCE_LINE']
                 )
+
+        timings['populate_sort_keys'] = time.perf_counter() - step_start
+        logger.debug(f"[_on_segy_imported] Step 4 DONE: Sort keys populated in {timings['populate_sort_keys']:.3f}s")
+
+        # Log total timing
+        timings['total'] = time.perf_counter() - total_start
+        logger.info(f"[_on_segy_imported] COMPLETE in {timings['total']:.3f}s")
+        logger.info(f"[_on_segy_imported] Timing breakdown:")
+        for step, duration in timings.items():
+            logger.info(f"[_on_segy_imported]   - {step}: {duration:.3f}s")
 
         # Update datasets menu
         self._update_datasets_menu()
@@ -948,8 +1446,8 @@ class MainWindow(QMainWindow):
         self.control_panel.set_amplitude_range(min_amp, max_amp)
 
     def _load_from_zarr(self):
-        """Load previously imported data from Zarr/Parquet."""
-        from utils.segy_import.data_storage import DataStorage
+        """Load previously imported data from Zarr/Parquet using background thread."""
+        import time
 
         # Select directory
         data_dir = QFileDialog.getExistingDirectory(
@@ -961,38 +1459,83 @@ class MainWindow(QMainWindow):
         if not data_dir:
             return
 
+        logger.info(f"[_load_from_zarr] Starting load from: {data_dir}")
+        start_time = time.perf_counter()
+
+        # Create progress dialog
+        self._zarr_progress = QProgressDialog(
+            "Loading Zarr/Parquet data...",
+            "Cancel",
+            0, 0,  # Indeterminate progress
+            self
+        )
+        self._zarr_progress.setWindowTitle("Loading Dataset")
+        self._zarr_progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self._zarr_progress.setMinimumDuration(0)  # Show immediately
+        self._zarr_progress.setValue(0)
+        self._zarr_progress.show()
+        QApplication.processEvents()  # Ensure dialog is shown
+
+        # Store data_dir for completion handler
+        self._zarr_load_data_dir = data_dir
+        self._zarr_load_start_time = start_time
+
+        # Create and start worker thread
+        self._zarr_worker = ZarrLoadWorker(data_dir, parent=self)
+        self._zarr_worker.progress.connect(self._on_zarr_load_progress)
+        self._zarr_worker.finished.connect(self._on_zarr_load_finished)
+        self._zarr_worker.error.connect(self._on_zarr_load_error)
+        self._zarr_progress.canceled.connect(self._on_zarr_load_cancelled)
+
+        self._zarr_worker.start()
+        logger.debug("[_load_from_zarr] Worker thread started")
+
+    def _on_zarr_load_progress(self, message: str):
+        """Handle progress updates from Zarr load worker."""
+        logger.debug(f"[_load_from_zarr] Progress: {message}")
+        if hasattr(self, '_zarr_progress') and self._zarr_progress:
+            self._zarr_progress.setLabelText(message)
+            QApplication.processEvents()
+
+    def _on_zarr_load_finished(self, result):
+        """Handle successful Zarr load completion."""
+        import time
+
+        # Unpack results
+        lazy_data, ensembles_df, stats, original_segy_path = result
+        data_dir = self._zarr_load_data_dir
+
+        # Close progress dialog
+        if hasattr(self, '_zarr_progress') and self._zarr_progress:
+            self._zarr_progress.close()
+            self._zarr_progress = None
+
+        elapsed = time.perf_counter() - self._zarr_load_start_time
+        logger.info(f"[_load_from_zarr] Worker completed in {elapsed:.3f}s, now loading into UI...")
+
         try:
-            # Load data using lazy loading for memory efficiency
-            from models.lazy_seismic_data import LazySeismicData
-
-            lazy_data = LazySeismicData.from_storage_dir(data_dir)
-            storage = DataStorage(data_dir)
-            ensembles_df = storage.get_ensemble_index()
-
-            # Extract original SEG-Y path from metadata if available
-            original_segy_path = None
-            if hasattr(lazy_data, 'metadata') and lazy_data.metadata:
-                # Try to get it from top-level metadata first (new format)
-                original_segy_path = lazy_data.metadata.get('original_segy_path')
-
-                # Fall back to seismic_metadata section (streaming import format)
-                if not original_segy_path:
-                    seismic_meta = lazy_data.metadata.get('seismic_metadata', {})
-                    original_segy_path = seismic_meta.get('original_segy_path') or seismic_meta.get('source_file')
+            # Update progress for UI loading phase
+            self.statusBar().showMessage("Loading data into viewer...")
+            QApplication.processEvents()
 
             # Load into gather navigator and display
+            ui_start = time.perf_counter()
+            logger.debug("[_load_from_zarr] Calling _on_segy_imported...")
             self._on_segy_imported(lazy_data, None, ensembles_df, original_segy_path)
+            ui_elapsed = time.perf_counter() - ui_start
+            logger.info(f"[_load_from_zarr] _on_segy_imported completed in {ui_elapsed:.3f}s")
 
-            # Show statistics
-            stats = storage.get_statistics()
+            # Build success message
             if ensembles_df is not None and len(ensembles_df) > 0:
+                n_traces = stats.get('headers', {}).get('n_traces', lazy_data.n_traces)
                 msg = (f"Successfully loaded data from:\n{data_dir}\n\n"
                        f"Gathers: {len(ensembles_df)}\n"
-                       f"Total Traces: {stats['headers']['n_traces']:,}\n\n"
+                       f"Total Traces: {n_traces:,}\n\n"
                        f"Use the gather navigation panel to browse gathers.")
             else:
+                n_traces = stats.get('headers', {}).get('n_traces', lazy_data.n_traces)
                 msg = (f"Successfully loaded data from:\n{data_dir}\n\n"
-                       f"Traces: {stats['headers']['n_traces']:,}")
+                       f"Traces: {n_traces:,}")
 
             # Add note about original SEG-Y path availability
             if original_segy_path:
@@ -1003,14 +1546,46 @@ class MainWindow(QMainWindow):
             else:
                 msg += "\n\n⚠️  Original SEG-Y path not in metadata.\nTo enable batch processing, please re-import from SEG-Y."
 
+            total_elapsed = time.perf_counter() - self._zarr_load_start_time
+            logger.info(f"[_load_from_zarr] TOTAL load time: {total_elapsed:.3f}s")
+
             QMessageBox.information(self, "Data Loaded", msg)
 
         except Exception as e:
-            QMessageBox.critical(
-                self,
-                "Load Error",
-                f"Failed to load data:\n{str(e)}"
-            )
+            import traceback
+            error_msg = f"Failed to load data into UI:\n{str(e)}\n{traceback.format_exc()}"
+            logger.error(f"[_load_from_zarr] UI loading error: {error_msg}")
+            QMessageBox.critical(self, "Load Error", error_msg)
+
+    def _on_zarr_load_error(self, error_msg: str):
+        """Handle Zarr load error."""
+        logger.error(f"[_load_from_zarr] Load error: {error_msg}")
+
+        # Close progress dialog
+        if hasattr(self, '_zarr_progress') and self._zarr_progress:
+            self._zarr_progress.close()
+            self._zarr_progress = None
+
+        QMessageBox.critical(
+            self,
+            "Load Error",
+            f"Failed to load data:\n{error_msg}"
+        )
+
+    def _on_zarr_load_cancelled(self):
+        """Handle user cancellation of Zarr load."""
+        logger.info("[_load_from_zarr] Load cancelled by user")
+
+        if hasattr(self, '_zarr_worker') and self._zarr_worker:
+            self._zarr_worker.cancel()
+            self._zarr_worker.wait(1000)  # Wait up to 1 second
+            self._zarr_worker = None
+
+        if hasattr(self, '_zarr_progress') and self._zarr_progress:
+            self._zarr_progress.close()
+            self._zarr_progress = None
+
+        self.statusBar().showMessage("Load cancelled", 3000)
 
     def _generate_sample_data(self):
         """Generate synthetic seismic data for testing."""
@@ -1515,7 +2090,8 @@ class MainWindow(QMainWindow):
         import warnings
         warnings.warn(
             "_batch_process_all_gathers is deprecated. "
-            "Use Parallel Batch Process (Ctrl+Shift+B) for better performance.",
+            "Use Parallel Batch Process (Ctrl+Shift+B) for better performance "
+            "and Job Dashboard integration.",
             DeprecationWarning,
             stacklevel=2
         )
@@ -1842,7 +2418,7 @@ class MainWindow(QMainWindow):
         warnings.warn(
             "_batch_process_and_export_streaming is deprecated. "
             "Use Parallel Batch Process (Ctrl+Shift+B) + Parallel Export (Ctrl+Alt+E) "
-            "for better performance.",
+            "for better performance and Job Dashboard integration.",
             DeprecationWarning,
             stacklevel=2
         )
@@ -2324,6 +2900,16 @@ class MainWindow(QMainWindow):
         on multi-core systems. Processes gathers in parallel and writes
         directly to shared output Zarr array.
         """
+        # Check if a batch job is already running (non-modal dialog allows this check)
+        if hasattr(self, '_batch_processing_active') and self._batch_processing_active:
+            QMessageBox.warning(
+                self,
+                "Job Already Running",
+                "A batch processing job is already running.\n\n"
+                "Please wait for it to complete or cancel it before starting another."
+            )
+            return
+
         # Check if we have multi-gather data with lazy loading
         if not self.gather_navigator.has_gathers():
             QMessageBox.warning(
@@ -2582,21 +3168,26 @@ class MainWindow(QMainWindow):
         sort_key_label = QLabel("Sort by:")
         sort_key_combo = QComboBox()
 
-        # Get available header columns for sorting
+        # Get available header columns for sorting (read schema only, not data)
         headers_path = input_storage_dir / 'headers.parquet'
         sorted_cols = []
         if headers_path.exists():
-            import pandas as pd
             try:
-                sample_headers = pd.read_parquet(headers_path)
-                # Filter to numeric columns suitable for sorting (use 'number' to catch all numeric types)
-                numeric_cols = sample_headers.select_dtypes(include=['number']).columns.tolist()
+                import pyarrow.parquet as pq
+                import pyarrow as pa
+                # Read only schema, not data - instant for any file size
+                parquet_file = pq.ParquetFile(headers_path)
+                schema = parquet_file.schema_arrow
+                numeric_cols = [
+                    field.name for field in schema
+                    if pa.types.is_integer(field.type) or pa.types.is_floating(field.type)
+                ]
                 # Prioritize common sort keys
                 priority_keys = ['offset', 'TRACE_SEQUENCE_LINE', 'TraceNumber', 'FieldRecord', 'CDP', 'SOURCE_X', 'SOURCE_Y', 'GROUP_X', 'GROUP_Y']
                 sorted_cols = [k for k in priority_keys if k in numeric_cols] + [k for k in numeric_cols if k not in priority_keys]
-                logger.debug(f"Found {len(sorted_cols)} sortable columns in headers.parquet")
+                logger.debug(f"Found {len(sorted_cols)} sortable columns in headers.parquet (from schema)")
             except Exception as e:
-                logger.warning(f"Could not read headers.parquet: {e}")
+                logger.warning(f"Could not read headers.parquet schema: {e}")
         else:
             logger.warning(f"Headers file not found: {headers_path}")
 
@@ -2771,26 +3362,20 @@ class MainWindow(QMainWindow):
         session = storage_manager.create_session(f"processed_{dataset_name}")
         _crash_log(f"Step 2: Session created at {session.output_dir}")
 
-        # Create progress dialog
-        progress = QProgressDialog(
-            "Initializing parallel processing...",
-            "Cancel",
-            0,
-            total_traces,
-            self
-        )
-        progress.setWindowModality(Qt.WindowModality.WindowModal)
-        progress.setWindowTitle("Parallel Batch Processing")
-        progress.setMinimumDuration(0)
-        progress.setMinimumWidth(400)
+        # Mark batch processing as active (prevents starting another job)
+        self._batch_processing_active = True
+
+        # Store adapter reference for potential cancellation
+        self._current_batch_adapter = None
 
         try:
             _crash_log("Step 3: Importing parallel_processing modules...")
             from utils.parallel_processing import (
-                ParallelProcessingCoordinator,
                 ProcessingConfig,
                 ProcessingProgress
             )
+            from utils.ray_orchestration.processing_job_adapter import RayProcessingJobAdapter
+            from utils.ray_orchestration.qt_bridge import get_job_bridge
             _crash_log("Step 3: Imports complete")
 
             # Serialize processor configuration
@@ -2816,124 +3401,282 @@ class MainWindow(QMainWindow):
             )
             _crash_log(f"Step 5: ProcessingConfig created - output_mode={config.output_mode}")
 
-            # Progress callback
-            import time
-            start_time = time.time()
-            _crash_log("Step 6: Progress callback defined")
-
-            def on_progress(prog: ProcessingProgress):
-                if progress.wasCanceled():
-                    return
-
-                progress.setValue(prog.current_traces)
-
-                # Format ETA
-                if prog.eta_seconds > 0 and prog.eta_seconds < float('inf'):
-                    if prog.eta_seconds > 60:
-                        eta_str = f"{prog.eta_seconds / 60:.1f} min"
-                    else:
-                        eta_str = f"{prog.eta_seconds:.0f} sec"
-                else:
-                    eta_str = "calculating..."
-
-                # Calculate rate
-                elapsed = time.time() - start_time
-                rate = prog.current_traces / elapsed if elapsed > 0 else 0
-
-                progress.setLabelText(
-                    f"Phase: {prog.phase}\n"
-                    f"Gathers: {prog.current_gathers:,} / {prog.total_gathers:,}\n"
-                    f"Traces: {prog.current_traces:,} / {prog.total_traces:,}\n"
-                    f"Workers: {prog.active_workers} active\n"
-                    f"Rate: {rate:,.0f} traces/sec\n"
-                    f"ETA: {eta_str}"
-                )
-                QApplication.processEvents()
-
-            # Run parallel processing
-            _crash_log("Step 7: Creating ParallelProcessingCoordinator...")
-            coordinator = ParallelProcessingCoordinator(config)
-            _crash_log("Step 7: Coordinator created, starting run()...")
-            result = coordinator.run(progress_callback=on_progress)
-            _crash_log(f"Step 8: Processing complete - success={result.success}")
-
-            if progress.wasCanceled():
-                # User cancelled - cleanup
-                session.cleanup_all()
-                QMessageBox.information(
-                    self,
-                    "Cancelled",
-                    "Parallel processing was cancelled.\n"
-                    "Temporary files have been cleaned up."
-                )
-                return
-
-            if not result.success:
-                # Processing failed
-                session.cleanup_all()
-                QMessageBox.critical(
-                    self,
-                    "Processing Failed",
-                    f"Parallel processing failed:\n\n{result.error}"
-                )
-                return
-
-            # Success - mark session complete
-            session.mark_complete()
-
-            # Build output info
-            output_info = f"Output saved to:\n{result.output_dir}"
-            if result.noise_zarr_path:
-                output_info += f"\n\nNoise output: noise.zarr"
-
-            # Show success message
-            QMessageBox.information(
-                self,
-                "Parallel Processing Complete",
-                f"Successfully processed all {n_gathers:,} gathers!\n\n"
-                f"Statistics:\n"
-                f"  - Traces processed: {result.n_traces:,}\n"
-                f"  - Time: {result.elapsed_time:.1f} seconds\n"
-                f"  - Throughput: {result.throughput_traces_per_sec:,.0f} traces/sec\n"
-                f"  - Workers used: {result.n_workers_used}\n\n"
-                f"{output_info}\n\n"
-                f"Would you like to load the processed data?"
+            # Create RayProcessingJobAdapter with Qt bridge for Dashboard integration
+            # Uses Ray actors for proper per-worker GPU initialization (Metal works!)
+            _crash_log("Step 6: Creating RayProcessingJobAdapter with Qt bridge...")
+            qt_bridge = get_job_bridge()
+            job_name = f"Batch: {self.last_processor.get_description()}"
+            adapter = RayProcessingJobAdapter(
+                config,
+                job_name=job_name,
+                use_ray=True,  # Enable Ray-based parallel processing
+                qt_bridge=qt_bridge,
             )
+            self._current_batch_adapter = adapter
+            _crash_log("Step 6: Adapter created (Ray mode), submitting job...")
 
-            # Offer to load the processed data
-            reply = QMessageBox.question(
-                self,
-                "Load Processed Data?",
-                f"Load the processed dataset?\n\n{result.output_dir}",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-            )
+            # Submit job - appears in Dashboard immediately
+            job = adapter.submit()
+            _crash_log(f"Step 6: Job submitted: {job.id}")
 
-            if reply == QMessageBox.StandardButton.Yes:
-                self._load_from_zarr_path(result.output_dir)
+            # Show Job Dashboard for progress monitoring
+            if hasattr(self, '_job_integration') and self._job_integration:
+                try:
+                    self._job_integration.show_job_dashboard()
+                except Exception as e:
+                    _crash_log(f"Step 6: Could not show dashboard: {e}")
+
+            # Store session and context for completion handler
+            self._current_batch_session = session
+            self._current_batch_n_gathers = n_gathers
+
+            # Create worker thread for non-blocking processing
+            _crash_log("Step 7: Creating worker thread...")
+            self._batch_worker = BatchProcessingWorker(adapter)
+            self._batch_worker.finished.connect(self._on_batch_processing_finished)
+            self._batch_worker.error.connect(self._on_batch_processing_error)
+
+            # Start processing in background - UI remains responsive
+            _crash_log("Step 7: Starting worker thread...")
+            self._batch_worker.start()
 
             self.statusBar().showMessage(
-                f"Parallel processing complete: {result.n_traces:,} traces "
-                f"in {result.elapsed_time:.1f}s "
-                f"({result.throughput_traces_per_sec:,.0f} traces/sec)",
+                f"Processing started - monitor progress in Job Dashboard (Ctrl+J)",
                 10000
             )
 
         except Exception as e:
+            # Handle errors during job setup (before worker starts)
             _crash_log(f"EXCEPTION: {type(e).__name__}: {str(e)}")
             import traceback
             _crash_log(f"TRACEBACK:\n{traceback.format_exc()}")
-            progress.close()
             session.cleanup_all()
+            self._batch_processing_active = False
+            self._current_batch_adapter = None
             QMessageBox.critical(
                 self,
                 "Processing Error",
-                f"Failed to run parallel processing:\n\n{str(e)}"
+                f"Failed to start parallel processing:\n\n{str(e)}"
             )
             traceback.print_exc()
 
-        finally:
-            progress.close()
-            _crash_log("=== PARALLEL PROCESSING ENDED ===")
+    def _on_batch_processing_finished(self, result):
+        """Handle batch processing completion (called from worker thread signal)."""
+        logger.info(f"Batch processing complete - success={result.success}")
+
+        session = getattr(self, '_current_batch_session', None)
+        n_gathers = getattr(self, '_current_batch_n_gathers', 0)
+
+        # Check if cancelled (including "Broken pipe" which happens when workers are killed)
+        error_lower = (result.error or "").lower()
+        is_cancelled = (
+            "cancelled" in error_lower or
+            "broken pipe" in error_lower or
+            "brokenpipeerror" in error_lower
+        )
+
+        if not result.success and is_cancelled:
+            if session:
+                session.cleanup_all()
+            self._cleanup_batch_processing()
+            QMessageBox.information(
+                self,
+                "Cancelled",
+                "Parallel processing was cancelled.\n"
+                "Temporary files have been cleaned up."
+            )
+            return
+
+        if not result.success:
+            # Processing failed (actual error, not cancellation)
+            if session:
+                session.cleanup_all()
+            self._cleanup_batch_processing()
+            QMessageBox.critical(
+                self,
+                "Processing Failed",
+                f"Parallel processing failed:\n\n{result.error}"
+            )
+            return
+
+        # Success - mark session complete
+        if session:
+            session.mark_complete()
+
+        # Build output info
+        output_info = f"Output saved to:\n{result.output_dir}"
+        if result.noise_zarr_path:
+            output_info += f"\n\nNoise output: noise.zarr"
+
+        # Show success message
+        QMessageBox.information(
+            self,
+            "Parallel Processing Complete",
+            f"Successfully processed all {n_gathers:,} gathers!\n\n"
+            f"Statistics:\n"
+            f"  - Traces processed: {result.n_traces:,}\n"
+            f"  - Time: {result.elapsed_time:.1f} seconds\n"
+            f"  - Throughput: {result.throughput_traces_per_sec:,.0f} traces/sec\n"
+            f"  - Workers used: {result.n_workers_used}\n\n"
+            f"{output_info}"
+        )
+
+        # Offer to load the processed data
+        reply = QMessageBox.question(
+            self,
+            "Load Processed Data?",
+            f"Load the processed dataset?\n\n{result.output_dir}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+
+        if reply == QMessageBox.StandardButton.Yes:
+            self._load_from_zarr_path(result.output_dir)
+
+        self.statusBar().showMessage(
+            f"Parallel processing complete: {result.n_traces:,} traces "
+            f"in {result.elapsed_time:.1f}s "
+            f"({result.throughput_traces_per_sec:,.0f} traces/sec)",
+            10000
+        )
+
+        self._cleanup_batch_processing()
+
+    def _on_batch_processing_error(self, error_msg):
+        """Handle batch processing error (called from worker thread signal)."""
+        logger.error(f"EXCEPTION from worker: {error_msg}")
+
+        session = getattr(self, '_current_batch_session', None)
+        if session:
+            session.cleanup_all()
+
+        self._cleanup_batch_processing()
+        QMessageBox.critical(
+            self,
+            "Processing Error",
+            f"Parallel processing failed:\n\n{error_msg.split(chr(10))[0]}"  # First line only
+        )
+
+    def _cleanup_batch_processing(self):
+        """Clean up batch processing state."""
+        self._batch_processing_active = False
+        self._current_batch_adapter = None
+        self._current_batch_session = None
+        self._current_batch_n_gathers = 0
+        self._batch_worker = None
+        logger.info("=== PARALLEL PROCESSING ENDED ===")
+
+    def _on_cancel_job_requested(self, job_id):
+        """
+        Unified cancel handler for all job types.
+
+        Routes to appropriate cancel method based on active job type.
+        """
+        logger.info(f"Cancel requested for job {job_id}")
+
+        # Check if this is an active SEGY import job
+        if hasattr(self, '_segy_import_worker') and self._segy_import_worker:
+            worker = self._segy_import_worker
+            if worker.job and str(worker.job.id) == str(job_id):
+                logger.info(f"Cancelling SEGY import job {job_id}")
+                worker.cancel()
+                self.statusBar().showMessage("Cancelling SEGY import...", 5000)
+                return
+
+        # Check if this is an active SEGY export job
+        if hasattr(self, '_parallel_export_worker') and self._parallel_export_worker:
+            worker = self._parallel_export_worker
+            if worker.job and str(worker.job.id) == str(job_id):
+                logger.info(f"Cancelling SEGY export job {job_id}")
+                worker.cancel()
+                self.statusBar().showMessage("Cancelling SEGY export...", 5000)
+                return
+
+        # Fall back to batch job cancel
+        self._cancel_batch_job(job_id)
+
+    def _cancel_batch_job(self, job_id):
+        """
+        Cancel the current batch processing job.
+
+        Called from Dashboard cancel button or job manager.
+        Terminates worker processes immediately.
+        """
+        import os
+        import signal
+        from datetime import datetime
+
+        # Write to a dedicated cancel log file
+        cancel_log = Path.home() / ".seisproc" / "cancel_debug.log"
+        cancel_log.parent.mkdir(parents=True, exist_ok=True)
+
+        def log_cancel(msg):
+            timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            line = f"[{timestamp}] {msg}"
+            with open(cancel_log, "a") as f:
+                f.write(line + "\n")
+
+        log_cancel(f"========== CANCEL REQUESTED ==========")
+        log_cancel(f"_cancel_batch_job called with job_id: {job_id}")
+
+        # Check if we have an active batch job
+        if not self._current_batch_adapter:
+            log_cancel("No current batch adapter - nothing to cancel")
+            return
+
+        # Compare as strings to avoid UUID type issues
+        current_job = self._current_batch_adapter.job
+        if current_job:
+            log_cancel(f"Current job ID: {current_job.id}")
+            log_cancel(f"Requested job ID: {job_id}")
+            if str(current_job.id) != str(job_id):
+                log_cancel(f"Job ID MISMATCH - ignoring cancel request")
+                return  # Not our job
+            log_cancel("Job ID matches - proceeding with cancellation")
+
+        self.statusBar().showMessage("Cancelling job - terminating workers...", 5000)
+
+        # Kill all child Python processes (worker processes)
+        try:
+            import psutil
+            current_process = psutil.Process(os.getpid())
+            children = current_process.children(recursive=True)
+            log_cancel(f"Found {len(children)} child processes")
+
+            for child in children:
+                try:
+                    log_cancel(f"Terminating PID {child.pid} ({child.name()})")
+                    child.terminate()
+                except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+                    log_cancel(f"Could not terminate {child.pid}: {e}")
+
+            # Wait briefly then kill any remaining
+            log_cancel("Waiting for processes to terminate (2s timeout)...")
+            gone, alive = psutil.wait_procs(children, timeout=2)
+            log_cancel(f"Result: {len(gone)} terminated, {len(alive)} still alive")
+
+            for p in alive:
+                try:
+                    log_cancel(f"Force killing PID {p.pid}")
+                    p.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+                    log_cancel(f"Could not kill {p.pid}: {e}")
+
+            log_cancel("Worker termination complete")
+        except Exception as e:
+            log_cancel(f"ERROR terminating children: {e}")
+            import traceback
+            log_cancel(traceback.format_exc())
+
+        # Also cancel via adapter (sets flags)
+        if self._current_batch_adapter:
+            try:
+                log_cancel("Calling adapter.cancel()...")
+                self._current_batch_adapter.cancel()
+                log_cancel("adapter.cancel() completed")
+            except Exception as e:
+                log_cancel(f"Error in adapter.cancel(): {e}")
+
+        log_cancel("========== CANCEL COMPLETE ==========")
 
     # =========================================================================
     # Parallel SEG-Y Export (Multiprocess - Bypasses GIL)
@@ -2955,6 +3698,10 @@ class MainWindow(QMainWindow):
             ExportProgress,
             ExportStageResult
         )
+        from utils.ray_orchestration.job_manager import get_job_manager
+        from utils.ray_orchestration.qt_bridge import get_job_bridge
+        from models.job import JobType
+        from models.job_config import JobConfig
 
         # Check if we have processed data in lazy storage
         if self.gather_navigator.lazy_data is None:
@@ -3133,186 +3880,111 @@ class MainWindow(QMainWindow):
             header_mapping=header_mapping_config
         )
 
-        # Create coordinator
-        coordinator = ParallelExportCoordinator(config)
+        # Store export state for completion handler
+        self._parallel_export_config = config
+        self._parallel_export_output_file = output_file
+        self._parallel_export_n_traces = n_traces
+        self._parallel_export_temp_dir = temp_dir
+        self._parallel_export_type = export_type
 
-        # Run export in stages with separate progress dialogs
+        # Create worker for background export (no QProgressDialogs - uses Job Dashboard)
+        self._parallel_export_worker = ParallelExportWorker(
+            export_config=config,
+            n_traces=n_traces,
+            estimated_size_mb=int(estimated_size_gb * 1024),
+            job_name=Path(output_file).name,
+            parent=self
+        )
+
+        # Connect signals
+        self._parallel_export_worker.finished_with_result.connect(self._on_parallel_export_complete)
+        self._parallel_export_worker.error_occurred.connect(self._on_parallel_export_error)
+
+        # Show job dashboard
+        if hasattr(self, '_job_integration') and self._job_integration:
+            try:
+                self._job_integration.show_job_dashboard()
+            except Exception:
+                pass
+
+        # Start background export
+        self.statusBar().showMessage(f"Exporting to SEG-Y with {n_workers} workers (progress in Job Dashboard)...")
+        self._parallel_export_worker.start()
+
+    def _on_parallel_export_complete(self, result: ParallelExportResult):
+        """Handle successful parallel export completion."""
+        import shutil
+
+        output_file = self._parallel_export_output_file
+        n_traces = self._parallel_export_n_traces
+        export_type = self._parallel_export_type
+        temp_dir = self._parallel_export_temp_dir
+
         try:
-            self.statusBar().showMessage(f"Exporting to SEG-Y with {n_workers} workers...")
+            # Cleanup temp directory
+            if temp_dir:
+                try:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                except Exception:
+                    pass
 
-            # ═══════════════════════════════════════════════════════════════════
-            # STAGE 1: Parallel Export (traces progress)
-            # ═══════════════════════════════════════════════════════════════════
-            export_progress = QProgressDialog(
-                "Initializing parallel export...",
-                "Cancel",
-                0, n_traces,
-                self
-            )
-            export_progress.setWindowModality(Qt.WindowModality.WindowModal)
-            export_progress.setWindowTitle("Parallel SEG-Y Export - Stage 1/3")
-            export_progress.setMinimumDuration(0)
-            export_progress.setMinimumWidth(400)
-
-            def on_export_progress(prog: ExportProgress):
-                """Update export stage progress dialog."""
-                if export_progress.wasCanceled():
-                    coordinator.cancel()
-                    return
-
-                export_progress.setValue(prog.current_traces)
-
-                if prog.phase == 'vectorizing':
-                    export_progress.setLabelText("Vectorizing headers for fast access...")
-                elif prog.phase == 'exporting':
-                    rate = prog.current_traces / prog.elapsed_time if prog.elapsed_time > 0 else 0
-                    eta_min = prog.eta_seconds / 60 if prog.eta_seconds > 0 else 0
-                    export_progress.setLabelText(
-                        f"Exporting traces ({prog.active_workers} workers)...\n"
-                        f"{prog.current_traces:,} / {prog.total_traces:,} traces\n"
-                        f"Rate: {rate:,.0f} traces/sec | ETA: {eta_min:.1f} min"
-                    )
-
-                QApplication.processEvents()
-
-            # Run parallel export stage
-            stage_result = coordinator.run_parallel_export(progress_callback=on_export_progress)
-
-            was_canceled = export_progress.wasCanceled()
-            export_progress.close()
-
-            if was_canceled or coordinator.was_cancelled:
-                self.statusBar().showMessage("Export canceled.")
-                return
-
-            if not stage_result.success:
-                QMessageBox.critical(
-                    self,
-                    "Export Failed",
-                    f"Parallel export failed:\n\n{stage_result.error}"
-                )
-                return
-
-            # ═══════════════════════════════════════════════════════════════════
-            # STAGE 2: Merge Segments (bytes progress)
-            # ═══════════════════════════════════════════════════════════════════
-            merge_stats = coordinator.get_merge_stats(stage_result)
-            total_bytes = merge_stats['output_size_bytes']
-
-            # Use MB for progress to avoid 32-bit integer overflow on large files
-            # QProgressDialog max is 2^31-1, so files >2GB would overflow with bytes
-            total_mb = max(1, total_bytes // (1024 * 1024))
-
-            merge_progress = QProgressDialog(
-                "Merging segment files...",
-                "Cancel",
-                0, total_mb,
-                self
-            )
-            merge_progress.setWindowModality(Qt.WindowModality.WindowModal)
-            merge_progress.setWindowTitle("Parallel SEG-Y Export - Stage 2/3")
-            merge_progress.setMinimumDuration(0)
-            merge_progress.setMinimumWidth(400)
-
-            def on_merge_progress(bytes_written: int, total: int):
-                """Update merge stage progress dialog."""
-                if merge_progress.wasCanceled():
-                    return False
-                # Convert bytes to MB for progress bar (avoid overflow)
-                mb_written = bytes_written // (1024 * 1024)
-                merge_progress.setValue(mb_written)
-                gb_written = bytes_written / (1024 ** 3)
-                gb_total = total / (1024 ** 3)
-                merge_progress.setLabelText(
-                    f"Merging segment files...\n"
-                    f"{gb_written:.2f} / {gb_total:.2f} GB"
-                )
-                QApplication.processEvents()
-                return True
-
-            # Run merge stage
-            coordinator.run_merge(stage_result, progress_callback=on_merge_progress)
-            merge_progress.close()
-
-            # ═══════════════════════════════════════════════════════════════════
-            # STAGE 3: Cleanup (files progress)
-            # ═══════════════════════════════════════════════════════════════════
-            total_files = len(stage_result.segment_paths) + len(stage_result.segments)
-
-            cleanup_progress = QProgressDialog(
-                "Cleaning up temporary files...",
-                None,  # No cancel button for cleanup
-                0, total_files,
-                self
-            )
-            cleanup_progress.setWindowModality(Qt.WindowModality.WindowModal)
-            cleanup_progress.setWindowTitle("Parallel SEG-Y Export - Stage 3/3")
-            cleanup_progress.setMinimumDuration(0)
-            cleanup_progress.setMinimumWidth(400)
-            cleanup_progress.setCancelButton(None)
-
-            def on_cleanup_progress(files_done: int, total: int):
-                """Update cleanup stage progress dialog."""
-                cleanup_progress.setValue(files_done)
-                cleanup_progress.setLabelText(f"Cleaning up... {files_done}/{total} files")
-                QApplication.processEvents()
-
-            # Run cleanup stage
-            coordinator.run_cleanup(stage_result, progress_callback=on_cleanup_progress)
-            cleanup_progress.close()
-
-            # ═══════════════════════════════════════════════════════════════════
-            # Get Final Result
-            # ═══════════════════════════════════════════════════════════════════
-            result = coordinator.get_final_result(stage_result)
-
-            if not result.success:
-                QMessageBox.critical(
-                    self,
-                    "Export Failed",
-                    f"Parallel export failed:\n\n{result.error}"
-                )
-                return
-
-            # Success
-            file_size_mb = result.file_size_bytes / (1024 ** 2)
             data_type_str = "Noise (Input - Processed)" if export_type == 'noise' else "Processed"
             QMessageBox.information(
                 self,
                 "Export Complete",
-                f"Successfully exported {result.n_traces:,} traces!\n\n"
+                f"Successfully exported {n_traces:,} traces!\n\n"
                 f"Data type: {data_type_str}\n\n"
                 f"Statistics:\n"
-                f"  - File size: {file_size_mb:.1f} MB\n"
                 f"  - Time: {result.elapsed_time:.1f} seconds\n"
-                f"  - Throughput: {result.throughput_traces_per_sec:,.0f} traces/sec\n"
-                f"  - Workers used: {result.n_workers_used}\n\n"
+                f"  - Throughput: {n_traces / result.elapsed_time:,.0f} traces/sec\n\n"
                 f"Output: {output_file}"
             )
 
             self.statusBar().showMessage(
-                f"Export complete: {result.n_traces:,} traces "
-                f"in {result.elapsed_time:.1f}s "
-                f"({result.throughput_traces_per_sec:,.0f} traces/sec)",
+                f"Export complete: {n_traces:,} traces in {result.elapsed_time:.1f}s",
                 10000
             )
-
-        except Exception as e:
-            QMessageBox.critical(
-                self,
-                "Export Error",
-                f"Failed to run parallel export:\n\n{str(e)}"
-            )
-            import traceback
-            traceback.print_exc()
-
         finally:
+            # Clear state
+            self._parallel_export_worker = None
+            self._parallel_export_config = None
+            self._parallel_export_output_file = None
+            self._parallel_export_n_traces = None
+            self._parallel_export_temp_dir = None
+            self._parallel_export_type = None
+
+    def _on_parallel_export_error(self, error_msg: str):
+        """Handle parallel export error or cancellation."""
+        import shutil
+
+        temp_dir = self._parallel_export_temp_dir
+
+        try:
             # Cleanup temp directory
-            try:
-                import shutil
-                shutil.rmtree(temp_dir, ignore_errors=True)
-            except:
-                pass
+            if temp_dir:
+                try:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                except Exception:
+                    pass
+
+            if "cancelled" in error_msg.lower():
+                self.statusBar().showMessage("Export cancelled.")
+                QMessageBox.information(self, "Export Cancelled", "Export was cancelled by user.")
+            else:
+                QMessageBox.critical(
+                    self,
+                    "Export Error",
+                    f"Failed to run parallel export:\n\n{error_msg}"
+                )
+                self.statusBar().showMessage("Export failed.")
+        finally:
+            # Clear state
+            self._parallel_export_worker = None
+            self._parallel_export_config = None
+            self._parallel_export_output_file = None
+            self._parallel_export_n_traces = None
+            self._parallel_export_temp_dir = None
+            self._parallel_export_type = None
 
     # FK Filter handlers
 
@@ -4627,6 +5299,14 @@ class MainWindow(QMainWindow):
             logger.info("Session saved on close")
         except Exception as e:
             logger.error(f"Failed to save session: {e}")
+
+        # Clean up job integration if available
+        if hasattr(self, '_job_integration') and self._job_integration:
+            try:
+                self._job_integration.cleanup()
+                logger.debug("Job integration cleaned up")
+            except Exception as e:
+                logger.debug(f"Job integration cleanup failed: {e}")
 
         # Accept the close event
         event.accept()
